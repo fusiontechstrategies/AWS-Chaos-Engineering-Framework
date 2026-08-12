@@ -1,0 +1,59 @@
+# AWS Chaos Engineering Framework configuration
+# Replace every placeholder before live use. Live mode is enabled only by --live.
+schema_version: 1
+
+global:
+  region: us-gov-west-1
+  account_id: "000000000000"
+  # role_arn: arn:aws-us-gov:iam::000000000000:role/ChaosExperimentOperator
+
+safety:
+  fail_closed: true
+  allowed_hours:
+    start: 13
+    end: 22
+  allowed_days: [MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY]
+  safety_alarms: []
+  block_on_insufficient_data: true
+  guardduty_check: false
+  security_hub_check: false
+  max_concurrent_experiments: 1
+  max_experiments_per_run: 25
+  max_blast_radius: 1
+  monitor_interval_seconds: 15
+  require_temporary_credentials: true
+  allow_long_term_credentials: false
+  allow_live_without_safety_alarms: false
+  required_target_tags:
+    ChaosReady: "true"
+  target_allowlist: []
+  denied_target_patterns:
+    - '(?i)(?:^|[-_/])prod(?:uction)?(?:$|[-_/])'
+  allow_irreversible: false
+  allow_fis_without_stop_conditions: false
+  allow_fis_unbounded_targets: false
+
+reporting:
+  include_identity: false
+  include_resource_ids: false
+  include_diagnostics: false
+
+experiment_suites:
+  tagged_ec2_recovery:
+    description: Stop one tagged test instance, observe recovery, then restart it.
+    max_concurrent: 1
+    delay_between_experiments: 0
+    failure_policy: stop
+    experiments:
+      - type: ec2_stop
+        instance_ids: "@random_discovered"
+        duration_seconds: 60
+        auto_rollback: true
+
+  managed_fis_template:
+    description: Validate and run an existing AWS FIS experiment template.
+    max_concurrent: 1
+    failure_policy: stop
+    experiments:
+      - type: fis_template
+        experiment_template_id: EXTxxxxxxxxxxxxxxxxxx

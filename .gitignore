@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and package output
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local configuration and operational evidence
+chaos.yaml
+chaos-reports/
+*.log
+*.report.json
+
+# Credentials and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials

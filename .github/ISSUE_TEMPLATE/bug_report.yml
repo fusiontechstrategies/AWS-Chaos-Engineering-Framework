@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a reproducible defect that does not expose sensitive data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, account IDs, ARNs, resource names, or generated reports. Report security vulnerabilities privately through the Security tab.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "2.0.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Plan
+        - Live in an isolated test environment
+        - Configuration validation
+        - Catalog or CLI
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: Redact all AWS identifiers and operational details.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Offline reproduction
+      description: Provide the smallest mocked or sanitized reproduction possible.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed all credentials and sensitive AWS identifiers.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

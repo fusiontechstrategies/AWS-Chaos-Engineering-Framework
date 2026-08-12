@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a safe, bounded experiment or framework improvement.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What resilience-testing problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the plan path, live action, target bounds, and expected outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: rollback
+    attributes:
+      label: Recovery model
+      description: Describe exact rollback, FIS-managed recovery, or why the action must be irreversible.
+    validations:
+      required: true
+  - type: textarea
+    id: testing
+    attributes:
+      label: Offline test strategy
+      description: Explain how fake clients can verify the behavior without an AWS account.
+    validations:
+      required: true
