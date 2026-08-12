@@ -42,7 +42,7 @@ except ImportError as exc:  # pragma: no cover - exercised by packaging smoke te
     ) from exc
 
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 TOOL_NAME = "AWS Chaos Engineering Framework"
 MAX_CONFIG_BYTES = 1_048_576
 DEFAULT_REGION = "us-gov-west-1"
@@ -521,20 +521,19 @@ def experiment_metadata(experiment_type: ChaosType) -> ExperimentMetadata:
         return ExperimentMetadata("fis-template", risk, False, "managed", True)
     if experiment_type in UNSUPPORTED_EXPERIMENTS:
         return ExperimentMetadata("extension", RiskLevel.HIGH, False, "none")
+    risk = RiskLevel.MEDIUM
+    rollback = "automatic"
     if experiment_type in IRREVERSIBLE_EXPERIMENTS:
         risk = RiskLevel.IRREVERSIBLE
-        rollback = "none"
     elif experiment_type in HIGH_RISK_EXPERIMENTS:
         risk = RiskLevel.HIGH
-        rollback = "automatic"
     elif experiment_type in LOW_RISK_EXPERIMENTS:
         risk = RiskLevel.LOW
-    else:
-        risk = RiskLevel.MEDIUM
-    if experiment_type in NO_ROLLBACK_REQUIRED_EXPERIMENTS:
+
+    if experiment_type in IRREVERSIBLE_EXPERIMENTS:
+        rollback = "none"
+    elif experiment_type in NO_ROLLBACK_REQUIRED_EXPERIMENTS:
         rollback = "not-required"
-    elif experiment_type not in IRREVERSIBLE_EXPERIMENTS:
-        rollback = "automatic"
     return ExperimentMetadata(
         "extension",
         risk,

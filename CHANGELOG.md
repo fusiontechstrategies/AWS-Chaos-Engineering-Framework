@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## 2.0.1 - 2026-08-12
+
+### Fixed
+
+- initialized rollback metadata explicitly for every supported experiment path
+- removed unnecessary test-double variable deletion flagged by CodeQL
+- added a regression test for complete experiment safety metadata
+
 ## 2.0.0 - 2026-08-12
 
 ### Added

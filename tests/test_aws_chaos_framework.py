@@ -594,9 +594,9 @@ class FakeSafetyController:
         return framework.AwsClientProxy(service, self.aws.client(service), owner)
 
     def log_experiment_to_cloudtrail(
-        self, experiment_type: str, resources: list[str]
+        self, _experiment_type: str, _resources: list[str]
     ) -> None:
-        del experiment_type, resources
+        return None
 
     def check_safety_conditions(self) -> tuple[bool, list[str]]:
         return True, []
@@ -921,6 +921,14 @@ def test_declared_unsupported_actions_are_not_live_supported() -> None:
     gated = framework.UNSUPPORTED_EXPERIMENTS | framework.FIS_TEMPLATE_ONLY_EXPERIMENTS
     assert gated
     assert all(not framework.experiment_metadata(item).live_supported for item in gated)
+
+
+def test_every_experiment_has_complete_safety_metadata() -> None:
+    valid_rollbacks = {"automatic", "managed", "none", "not-required"}
+    for experiment_type in framework.ChaosType:
+        metadata = framework.experiment_metadata(experiment_type)
+        assert metadata.provider
+        assert metadata.rollback in valid_rollbacks
 
 
 def test_sample_configuration_is_valid() -> None:
