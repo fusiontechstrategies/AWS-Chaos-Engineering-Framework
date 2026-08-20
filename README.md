@@ -195,6 +195,12 @@ CI runs the test suite across supported Python versions. CodeQL, dependency audi
 - No secret or target inventory committed to the repository
 - No claim of success when no resource was affected
 
+## Federal cybersecurity discussion
+
+For practitioner discussion about federal cloud, control effectiveness, evidence, incident response, and mission resilience, visit [r/FederalCyber](https://www.reddit.com/r/FederalCyber/).
+
+It is an independent, unofficial community for public-source discussion. Never post CUI, credentials, customer details, active incident data, or nonpublic vulnerabilities.
+
 ## Contributing
 
 Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), keep the runtime application in the single `aws_chaos_framework.py` file, and add offline tests for every behavior change. Pull requests must not require access to a real AWS account.
