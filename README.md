@@ -195,11 +195,6 @@ CI runs the test suite across supported Python versions. CodeQL, dependency audi
 - No secret or target inventory committed to the repository
 - No claim of success when no resource was affected
 
-## Federal cybersecurity discussion
-
-For practitioner discussion about federal cloud, control effectiveness, evidence, incident response, and mission resilience, visit [r/FederalCyber](https://www.reddit.com/r/FederalCyber/).
-
-It is an independent, unofficial community for public-source discussion. Never post CUI, credentials, customer details, active incident data, or nonpublic vulnerabilities.
 
 ## Contributing
 
