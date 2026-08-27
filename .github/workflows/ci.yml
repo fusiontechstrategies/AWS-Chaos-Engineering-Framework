@@ -73,8 +73,11 @@ jobs:
       - name: Static security analysis
         run: python -m bandit -q -r aws_chaos_framework.py
 
-      - name: Dependency vulnerability audit
+      - name: Audit runtime dependencies
         run: python -m pip_audit --requirement requirements.txt
+
+      - name: Audit development dependencies
+        run: python -m pip_audit --requirement requirements-dev.txt
 
       - name: Secret scan
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
