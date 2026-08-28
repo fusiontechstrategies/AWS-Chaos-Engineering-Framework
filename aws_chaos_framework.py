@@ -38,11 +38,11 @@ try:
     from botocore.config import Config as BotocoreConfig
 except ImportError as exc:  # pragma: no cover - exercised by packaging smoke tests
     raise SystemExit(
-        "Missing dependency. Install boto3 and PyYAML before running this tool."
+        "Missing dependency. Install boto3, botocore, and PyYAML before running this tool."
     ) from exc
 
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 TOOL_NAME = "AWS Chaos Engineering Framework"
 MAX_CONFIG_BYTES = 1_048_576
 DEFAULT_REGION = "us-gov-west-1"
@@ -8661,7 +8661,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument(
-        "--version", action="version", version=f"%(prog)s {__version__}"
+        "--version", action="version", version=f"{TOOL_NAME} {__version__}"
     )
     parser.add_argument("--config", "-c", help="YAML configuration file")
     parser.add_argument("--suite", "-s", help="Experiment suite to plan or run")
