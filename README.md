@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/ci.yml/badge.svg)](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/codeql.yml/badge.svg)](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/codeql.yml)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
+[![Python 3.10-3.14](https://img.shields.io/badge/python-3.10--3.14-3776AB.svg)](https://www.python.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 An enterprise-minded, one-file chaos engineering orchestrator for AWS Fault Injection Service and carefully guarded service extensions. It combines AWS FIS templates, strict blast-radius controls, exact account binding, automatic rollback, emergency stops, and privacy-conscious evidence reports in a tool that remains easy to inspect and deploy.
@@ -48,7 +48,7 @@ Safety checks fail closed. Missing alarms, unresolved targets, mismatched identi
 
 ## Requirements
 
-- Python 3.10 or newer
+- Python 3.10 through 3.14
 - An AWS identity with only the permissions needed by the selected experiments
 - AWS FIS experiment templates for FIS-managed actions
 - CloudWatch safety alarms for live extension runs
@@ -64,15 +64,15 @@ Clone the repository and create an isolated Python environment:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install .
 ```
 
 Create and validate a safe starter configuration:
 
 ```powershell
-python .\aws_chaos_framework.py --create-sample-config chaos.yaml
-python .\aws_chaos_framework.py --validate-config chaos.yaml
-python .\aws_chaos_framework.py --list-experiments
+aws-chaos-framework --create-sample-config chaos.yaml
+aws-chaos-framework --validate-config chaos.yaml
+aws-chaos-framework --list-experiments
 ```
 
 Plan a suite. Plan mode is the default:
@@ -183,7 +183,9 @@ python -m bandit -q -r .\aws_chaos_framework.py
 python -m pip_audit -r .\requirements.txt
 ```
 
-CI runs the test suite across supported Python versions. CodeQL, dependency auditing, secret scanning, and Dependabot are configured for the public repository.
+CI runs the test suite across supported Python versions and validates Python 3.12 on Windows and macOS. The release-candidate job builds normalized wheel and source archives twice, requires byte-identical results, installs each package independently, and preserves the exact six-file candidate as workflow evidence. CodeQL, Semgrep, Trivy, dependency auditing, secret scanning, and Dependabot are configured for the public repository.
+
+See [TESTING.md](TESTING.md) for the complete offline gate and [RELEASING.md](RELEASING.md) for the exact asset contract. Tag automation can create only a draft GitHub release and cannot publish to a package registry.
 
 ## Design principles
 
@@ -194,7 +196,6 @@ CI runs the test suite across supported Python versions. CodeQL, dependency audi
 - No swallowed rollback error
 - No secret or target inventory committed to the repository
 - No claim of success when no resource was affected
-
 
 ## Contributing
 

@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## 2.0.2 - 2026-08-28
+
+### Added
+
+- reproducible wheel, source archive, standalone script, SPDX SBOM, checksums, and release evidence
+- tag-only release automation that creates a draft release for human review
+- offline package validation on Linux, Windows, and macOS
+
+### Changed
+
+- pinned runtime, development, and build dependencies for auditable release inputs
+- declared Botocore as a direct runtime dependency because the application imports it directly
+- constrained supported Python versions to the tested 3.10 through 3.14 range
+
+### Security
+
+- release assembly now rejects unsafe archive paths and validates exact package contents
+- distribution builds are normalized and compared byte for byte before release assets are accepted
+
 ## 2.0.1 - 2026-08-12
 
 ### Fixed

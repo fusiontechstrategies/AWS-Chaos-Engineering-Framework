@@ -944,6 +944,15 @@ def test_release_metadata_and_example_are_in_sync() -> None:
     )
 
 
+def test_version_output_is_stable_when_runtime_is_renamed(capsys) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        framework.main(["--version"])
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out == (
+        f"{framework.TOOL_NAME} {framework.__version__}\n"
+    )
+
+
 def test_type_specific_timeout_validation() -> None:
     config = framework.yaml.safe_load(framework.SAMPLE_CONFIG)
     suite = next(iter(config["experiment_suites"].values()))

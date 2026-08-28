@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,7 +18,7 @@ jobs:
   test:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -26,18 +27,29 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-build.txt
 
-      - name: Install test dependencies
-        run: python -m pip install --requirement requirements-dev.txt
+      - name: Install exact validation dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
+          python -m pip install --disable-pip-version-check -r requirements-build.txt
 
-      - name: Check syntax
-        run: python -m compileall -q aws_chaos_framework.py tests
+      - name: Verify dependency installation
+        run: python -m pip check
+
+      - name: Compile source
+        run: python -m compileall -q aws_chaos_framework.py scripts tests
 
       - name: Check formatting
         run: python -m ruff format --check .
@@ -45,10 +57,59 @@ jobs:
       - name: Lint
         run: python -m ruff check .
 
-      - name: Run offline tests
+      - name: Run complete offline regression suite
         env:
           AWS_EC2_METADATA_DISABLED: "true"
         run: python -m pytest -q --cov=aws_chaos_framework --cov-report=term --cov-fail-under=50
+
+      - name: Static security analysis
+        run: python -m bandit -q -r aws_chaos_framework.py scripts
+
+  platform-test:
+    name: Platform test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-build.txt
+
+      - name: Install exact validation dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
+          python -m pip install --disable-pip-version-check -r requirements-build.txt
+
+      - name: Verify dependency installation
+        run: python -m pip check
+
+      - name: Compile source
+        run: python -m compileall -q aws_chaos_framework.py scripts tests
+
+      - name: Run offline platform suite
+        env:
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: python -m pytest -q
+
+      - name: Check formatting and lint
+        run: |
+          python -m ruff format --check .
+          python -m ruff check .
 
   security:
     name: Security checks
@@ -60,26 +121,142 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-build.txt
 
-      - name: Install security dependencies
-        run: python -m pip install --requirement requirements-dev.txt
-
-      - name: Static security analysis
-        run: python -m bandit -q -r aws_chaos_framework.py
+      - name: Install audit tooling
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
 
       - name: Audit runtime dependencies
-        run: python -m pip_audit --requirement requirements.txt
+        run: python -m pip_audit -r requirements.txt --progress-spinner off
 
       - name: Audit development dependencies
-        run: python -m pip_audit --requirement requirements-dev.txt
+        run: python -m pip_audit -r requirements-dev.txt --progress-spinner off
+
+      - name: Audit build dependencies
+        run: python -m pip_audit -r requirements-build.txt --progress-spinner off
+
+      - name: Static security analysis
+        run: python -m bandit -q -r aws_chaos_framework.py scripts
 
       - name: Secret scan
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  package-artifact:
+    name: Release artifact Python 3.12
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-build.txt
+
+      - name: Install exact build and validation dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
+          python -m pip install --disable-pip-version-check -r requirements-build.txt
+
+      - name: Resolve reproducible build epoch
+        id: build-epoch
+        shell: bash
+        run: echo "value=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and inspect distributions
+        env:
+          AWS_EC2_METADATA_DISABLED: "true"
+          SOURCE_DATE_EPOCH: ${{ steps.build-epoch.outputs.value }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m build --no-isolation --wheel --sdist --outdir dist
+          python scripts/normalize_wheel.py --source-date-epoch "$SOURCE_DATE_EPOCH" dist/*.whl
+          python scripts/normalize_sdist.py --source-date-epoch "$SOURCE_DATE_EPOCH" dist/*.tar.gz
+          python -m twine check dist/*
+          python scripts/verify_distribution.py dist
+          python scripts/prepare_release.py \
+            --version 2.0.2 \
+            --tag v2.0.2 \
+            --source-commit "$GITHUB_SHA" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --dist-directory dist \
+            --output-directory release-candidate
+
+      - name: Rebuild and compare every release byte
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.build-epoch.outputs.value }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m build --no-isolation --wheel --sdist --outdir repeat-dist
+          python scripts/normalize_wheel.py --source-date-epoch "$SOURCE_DATE_EPOCH" repeat-dist/*.whl
+          python scripts/normalize_sdist.py --source-date-epoch "$SOURCE_DATE_EPOCH" repeat-dist/*.tar.gz
+          python scripts/prepare_release.py \
+            --version 2.0.2 \
+            --tag v2.0.2 \
+            --source-commit "$GITHUB_SHA" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --dist-directory repeat-dist \
+            --output-directory repeat-candidate
+          test "$(find release-candidate -maxdepth 1 -type f -printf '%f\n' | sort)" = \
+            "$(find repeat-candidate -maxdepth 1 -type f -printf '%f\n' | sort)"
+          for artifact in release-candidate/*; do
+            cmp --silent "$artifact" "repeat-candidate/${artifact##*/}"
+          done
+          test "$(find release-candidate -maxdepth 1 -type f | wc -l)" -eq 6
+
+      - name: Validate wheel in an isolated environment
+        env:
+          AWS_EC2_METADATA_DISABLED: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .wheel-smoke
+          .wheel-smoke/bin/python -m pip install --disable-pip-version-check dist/*.whl
+          test "$(.wheel-smoke/bin/aws-chaos-framework --version)" = "AWS Chaos Engineering Framework 2.0.2"
+          .wheel-smoke/bin/aws-chaos-framework --help >/dev/null
+          .wheel-smoke/bin/aws-chaos-framework --list-experiments >/dev/null
+          .wheel-smoke/bin/python -m pip check
+
+      - name: Validate source distribution in an isolated environment
+        env:
+          AWS_EC2_METADATA_DISABLED: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .sdist-smoke
+          .sdist-smoke/bin/python -m pip install --disable-pip-version-check -r requirements-build.txt
+          .sdist-smoke/bin/python -m pip install --disable-pip-version-check --no-build-isolation dist/*.tar.gz
+          test "$(.sdist-smoke/bin/aws-chaos-framework --version)" = "AWS Chaos Engineering Framework 2.0.2"
+          .sdist-smoke/bin/aws-chaos-framework --help >/dev/null
+          .sdist-smoke/bin/aws-chaos-framework --list-experiments >/dev/null
+          .sdist-smoke/bin/python -m pip check
+
+      - name: Preserve the exact release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aws-chaos-engineering-framework-v2.0.2-candidate-${{ github.sha }}
+          path: release-candidate/
+          if-no-files-found: error
+          retention-days: 30
