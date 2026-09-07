@@ -2,9 +2,9 @@
 
 All repository and release tests are offline. They use deterministic fake AWS clients, synthetic identifiers, and generated package fixtures. Public CI must never require credentials or contact an AWS account.
 
-## 2.0.2 release-readiness gate
+## 2.0.3 release-readiness gate
 
-The 2.0.2 candidate must pass:
+The 2.0.3 candidate must pass:
 
 - the complete framework regression suite on Python 3.10 through 3.14
 - Python 3.12 platform tests on Windows and macOS
@@ -30,9 +30,10 @@ The candidate tree was validated on August 28, 2026, without AWS credentials or 
 - Ruff formatting and linting, Bandit, bytecode compilation, and dependency consistency passed on all three Python versions.
 - Runtime, development, and build dependency audits reported no known vulnerabilities at test time.
 - Two Python 3.12 builds produced the same exact six release files byte for byte.
+- Two Windows builds, a mounted WSL build, and a native Linux clone build produced the same six filenames and bytes after regular source-archive modes were canonicalized.
 - Independent Python 3.10, 3.12, and 3.14 builds produced the same exact six release files byte for byte.
 - Twine, archive safety, package metadata, exact source identity, wheel RECORD, SPDX, checksum, and release-evidence checks passed.
-- The wheel and source distribution installed in separate clean environments, reported 2.0.2, exposed 79 catalog entries with exactly 60 executable modes, and contained runtime bytes identical to source.
+- The wheel and source distribution installed in separate clean environments, reported 2.0.3, exposed 79 catalog entries with exactly 60 executable modes, and contained runtime bytes identical to source.
 - Actionlint, YAML parsing, markdownlint, relative-link checks, and repository ASCII-punctuation checks passed.
 - Release payload scanning found no private local path, maintainer workstation name, or forbidden Unicode dash.
 
