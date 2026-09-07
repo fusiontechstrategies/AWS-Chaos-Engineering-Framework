@@ -1,4 +1,6 @@
 include .markdownlint-cli2.yaml
+recursive-include .github/release-notes *.md
+include .github/workflows/release.yml
 include CHANGELOG.md
 include CODE_OF_CONDUCT.md
 include CONTRIBUTING.md

@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## 2.0.3 - 2026-08-28
+
+### Fixed
+
+- included the active versioned release notes and tag workflow in the source distribution so its bundled release-construction tests pass from an extracted package
+- added an archive-membership regression that verifies both release inputs before any candidate is accepted
+- canonicalized regular source-archive member modes so mounted and native build filesystems produce identical bytes
+
+### Changed
+
+- advanced the recovery candidate to 2.0.3 because the existing public `v2.0.2` tag remains fixed and its draft release was not published
+- replaced the hard-coded current-version manifest entry with a generic release-notes rule so later patch versions inherit the same self-test contract
+
 ## 2.0.2 - 2026-08-28
 
 ### Added

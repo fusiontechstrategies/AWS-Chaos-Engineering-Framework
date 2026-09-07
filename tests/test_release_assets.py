@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +13,7 @@ from pathlib import Path
 from scripts import normalize_sdist, normalize_wheel, prepare_release
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 TAG = f"v{VERSION}"
 SOURCE_COMMIT = "a" * 40
 SOURCE_DATE_EPOCH = 315532800
@@ -65,6 +66,17 @@ class ReleasePreparationTests(unittest.TestCase):
             second_dist.mkdir()
             self.build_distributions(first_dist)
             self.build_distributions(second_dist)
+            expected_sdist_inputs = {
+                f"aws_chaos_engineering_framework-{VERSION}/.github/release-notes/{TAG}.md",
+                f"aws_chaos_engineering_framework-{VERSION}/.github/workflows/release.yml",
+            }
+            for dist in (first_dist, second_dist):
+                with tarfile.open(next(dist.glob("*.tar.gz")), "r:gz") as archive:
+                    self.assertTrue(
+                        expected_sdist_inputs.issubset(
+                            {member.name for member in archive.getmembers()}
+                        )
+                    )
             first = self.prepare(root, "first-release", first_dist)
             second = self.prepare(root, "second-release", second_dist)
             self.assertEqual(
