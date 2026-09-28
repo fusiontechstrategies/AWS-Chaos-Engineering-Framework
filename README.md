@@ -31,6 +31,8 @@ AWS FIS is the preferred execution engine whenever it provides the required faul
 
 The framework does not replace AWS FIS. It makes FIS easier to govern and supplies a guarded extension layer for additional AWS services.
 
+Version 2.0.3 is the current verified release. The [release page](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/releases/tag/v2.0.3) provides the standalone runtime, wheel, source distribution, SPDX SBOM, SHA-256 checksums, release evidence, and GitHub provenance attestations.
+
 ## Safety model
 
 | Guardrail | Enforced behavior |
