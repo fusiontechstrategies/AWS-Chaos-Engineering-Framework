@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">AWS Chaos Engineering Framework guarded experiment flow</title>
+  <desc id="desc">A synthetic control flow showing plan, bind, observe, execute, stop, recover, and preserve evidence.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#07182b"/><stop offset="1" stop-color="#102a43"/></linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#12324b"/><stop offset="1" stop-color="#172f49"/></linearGradient>
+    <filter id="shadow"><feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#020817" flood-opacity=".42"/></filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#62d8ff"/></marker>
+  </defs>
+  <rect width="1200" height="760" fill="url(#bg)"/>
+  <circle cx="1100" cy="40" r="210" fill="#173c58" opacity=".62"/>
+  <text x="70" y="68" fill="#62d8ff" font-family="Segoe UI,Arial,sans-serif" font-size="18" font-weight="700" letter-spacing="3">AWS CHAOS ENGINEERING FRAMEWORK</text>
+  <text x="70" y="122" fill="#ffffff" font-family="Segoe UI,Arial,sans-serif" font-size="42" font-weight="750">Failure is planned. Recovery is proved.</text>
+  <text x="70" y="160" fill="#b9d7ed" font-family="Segoe UI,Arial,sans-serif" font-size="20">A bounded path from a safe plan to honest evidence</text>
+  <g filter="url(#shadow)">
+    <rect x="70" y="198" width="1060" height="82" rx="18" fill="#10253a" stroke="#3d7899" stroke-width="2"/>
+    <text x="100" y="230" fill="#62d8ff" font-family="Segoe UI,Arial,sans-serif" font-size="15" font-weight="700" letter-spacing="1.5">DEFAULT STATE</text>
+    <text x="100" y="260" fill="#ffffff" font-family="Segoe UI,Arial,sans-serif" font-size="23" font-weight="700">Plan and validate only</text>
+    <rect x="855" y="218" width="245" height="42" rx="21" fill="#133f48" stroke="#45d6b0"/>
+    <text x="977" y="245" text-anchor="middle" fill="#78f0cf" font-family="Segoe UI,Arial,sans-serif" font-size="15" font-weight="700">NO AWS MUTATIONS</text>
+  </g>
+  <g filter="url(#shadow)" font-family="Segoe UI,Arial,sans-serif">
+    <rect x="70" y="326" width="240" height="170" rx="20" fill="url(#panel)" stroke="#3e87ac" stroke-width="2"/>
+    <circle cx="110" cy="365" r="22" fill="#1b6f8b" stroke="#74dcff" stroke-width="2"/><text x="110" y="372" text-anchor="middle" fill="#fff" font-size="20" font-weight="700">1</text>
+    <text x="145" y="360" fill="#62d8ff" font-size="14" font-weight="700" letter-spacing="1.2">PLAN</text>
+    <text x="100" y="405" fill="#fff" font-size="24" font-weight="700">Define the fault</text>
+    <text x="100" y="438" fill="#bdd8ea" font-size="16">Suite, account, region,</text><text x="100" y="463" fill="#bdd8ea" font-size="16">targets, limits, rollback</text>
+
+    <rect x="365" y="326" width="240" height="170" rx="20" fill="url(#panel)" stroke="#3e87ac" stroke-width="2"/>
+    <circle cx="405" cy="365" r="22" fill="#1b6f8b" stroke="#74dcff" stroke-width="2"/><text x="405" y="372" text-anchor="middle" fill="#fff" font-size="20" font-weight="700">2</text>
+    <text x="440" y="360" fill="#62d8ff" font-size="14" font-weight="700" letter-spacing="1.2">BIND</text>
+    <text x="395" y="405" fill="#fff" font-size="24" font-weight="700">Lock the scope</text>
+    <text x="395" y="438" fill="#bdd8ea" font-size="16">Exact identity, allowlist,</text><text x="395" y="463" fill="#bdd8ea" font-size="16">alarms, approval token</text>
+
+    <rect x="660" y="326" width="240" height="170" rx="20" fill="#24323b" stroke="#c99731" stroke-width="2"/>
+    <circle cx="700" cy="365" r="22" fill="#8f681c" stroke="#ffd36c" stroke-width="2"/><text x="700" y="372" text-anchor="middle" fill="#fff" font-size="20" font-weight="700">3</text>
+    <text x="735" y="360" fill="#ffd36c" font-size="14" font-weight="700" letter-spacing="1.2">EXECUTE</text>
+    <text x="690" y="405" fill="#fff" font-size="24" font-weight="700">Run one fault</text>
+    <text x="690" y="438" fill="#e8d8ad" font-size="16">Watch alarms and limits.</text><text x="690" y="463" fill="#e8d8ad" font-size="16">Emergency stop stays live.</text>
+
+    <rect x="955" y="326" width="175" height="170" rx="20" fill="#123b36" stroke="#3dbd9a" stroke-width="2"/>
+    <circle cx="995" cy="365" r="22" fill="#14735e" stroke="#79efcc" stroke-width="2"/><text x="995" y="372" text-anchor="middle" fill="#fff" font-size="20" font-weight="700">4</text>
+    <text x="1030" y="360" fill="#79efcc" font-size="14" font-weight="700" letter-spacing="1.2">RECOVER</text>
+    <text x="985" y="405" fill="#fff" font-size="22" font-weight="700">Restore</text>
+    <text x="985" y="438" fill="#bdebdc" font-size="16">Prior state and</text><text x="985" y="463" fill="#bdebdc" font-size="16">recovery outcome</text>
+  </g>
+  <path d="M310 411 H350" stroke="#62d8ff" stroke-width="4" marker-end="url(#arrow)"/><path d="M605 411 H645" stroke="#62d8ff" stroke-width="4" marker-end="url(#arrow)"/><path d="M900 411 H940" stroke="#62d8ff" stroke-width="4" marker-end="url(#arrow)"/>
+  <g filter="url(#shadow)" font-family="Segoe UI,Arial,sans-serif">
+    <rect x="70" y="548" width="1060" height="128" rx="20" fill="#121f33" stroke="#7560b8" stroke-width="2"/>
+    <text x="100" y="584" fill="#b7a3ff" font-size="15" font-weight="700" letter-spacing="1.4">EVIDENCE</text>
+    <text x="100" y="620" fill="#fff" font-size="27" font-weight="700">Record what happened, including uncertainty</text>
+    <text x="100" y="650" fill="#c8d8e8" font-size="16">Mutation attempts, rollback attempts, recovery failures, duration, and redacted identifiers</text>
+    <rect x="873" y="579" width="227" height="56" rx="13" fill="#202239" stroke="#9a85e8"/>
+    <text x="986" y="603" text-anchor="middle" fill="#c9bdff" font-size="13" font-weight="700">ATOMIC JSON REPORT</text>
+    <text x="986" y="624" text-anchor="middle" fill="#fff" font-size="15" font-weight="700">Success, failure, or partial</text>
+  </g>
+  <text x="70" y="724" fill="#7fabc7" font-family="Segoe UI,Arial,sans-serif" font-size="13">SYNTHETIC CONTROL FLOW  |  Live execution requires an isolated, explicitly authorized test environment.</text>
+</svg>
