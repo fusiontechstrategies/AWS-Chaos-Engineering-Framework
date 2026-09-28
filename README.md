@@ -9,6 +9,8 @@
 
 An enterprise-minded, one-file chaos engineering orchestrator for AWS Fault Injection Service and carefully guarded service extensions. It combines AWS FIS templates, strict blast-radius controls, exact account binding, automatic rollback, emergency stops, and privacy-conscious evidence reports in a tool that remains easy to inspect and deploy.
 
+[![Guarded AWS chaos experiment flow](docs/images/aws-chaos-guarded-experiment.png)](docs/images/source/aws-chaos-guarded-experiment.svg)
+
 > [!WARNING]
 > This software intentionally disrupts AWS resources. Use it only in isolated, non-production environments that you own or are explicitly authorized to test. Review every plan, alarm, target, permission, and rollback path before live use.
 
