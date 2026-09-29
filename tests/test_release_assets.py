@@ -13,7 +13,7 @@ from pathlib import Path
 from scripts import normalize_sdist, normalize_wheel, prepare_release
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-VERSION = "2.0.3"
+VERSION = "2.0.4"
 TAG = f"v{VERSION}"
 SOURCE_COMMIT = "a" * 40
 SOURCE_DATE_EPOCH = 315532800

@@ -196,8 +196,8 @@ jobs:
           python -m twine check dist/*
           python scripts/verify_distribution.py dist
           python scripts/prepare_release.py \
-            --version 2.0.3 \
-            --tag v2.0.3 \
+            --version 2.0.4 \
+            --tag v2.0.4 \
             --source-commit "$GITHUB_SHA" \
             --source-date-epoch "$SOURCE_DATE_EPOCH" \
             --dist-directory dist \
@@ -213,8 +213,8 @@ jobs:
           python scripts/normalize_wheel.py --source-date-epoch "$SOURCE_DATE_EPOCH" repeat-dist/*.whl
           python scripts/normalize_sdist.py --source-date-epoch "$SOURCE_DATE_EPOCH" repeat-dist/*.tar.gz
           python scripts/prepare_release.py \
-            --version 2.0.3 \
-            --tag v2.0.3 \
+            --version 2.0.4 \
+            --tag v2.0.4 \
             --source-commit "$GITHUB_SHA" \
             --source-date-epoch "$SOURCE_DATE_EPOCH" \
             --dist-directory repeat-dist \
@@ -234,7 +234,7 @@ jobs:
           set -euo pipefail
           python -m venv .wheel-smoke
           .wheel-smoke/bin/python -m pip install --disable-pip-version-check dist/*.whl
-          test "$(.wheel-smoke/bin/aws-chaos-framework --version)" = "AWS Chaos Engineering Framework 2.0.3"
+          test "$(.wheel-smoke/bin/aws-chaos-framework --version)" = "AWS Chaos Engineering Framework 2.0.4"
           .wheel-smoke/bin/aws-chaos-framework --help >/dev/null
           .wheel-smoke/bin/aws-chaos-framework --list-experiments >/dev/null
           .wheel-smoke/bin/python -m pip check
@@ -248,7 +248,7 @@ jobs:
           python -m venv .sdist-smoke
           .sdist-smoke/bin/python -m pip install --disable-pip-version-check -r requirements-build.txt
           .sdist-smoke/bin/python -m pip install --disable-pip-version-check --no-build-isolation dist/*.tar.gz
-          test "$(.sdist-smoke/bin/aws-chaos-framework --version)" = "AWS Chaos Engineering Framework 2.0.3"
+          test "$(.sdist-smoke/bin/aws-chaos-framework --version)" = "AWS Chaos Engineering Framework 2.0.4"
           .sdist-smoke/bin/aws-chaos-framework --help >/dev/null
           .sdist-smoke/bin/aws-chaos-framework --list-experiments >/dev/null
           .sdist-smoke/bin/python -m pip check
@@ -256,7 +256,7 @@ jobs:
       - name: Preserve the exact release candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: aws-chaos-engineering-framework-v2.0.3-candidate-${{ github.sha }}
+          name: aws-chaos-engineering-framework-v2.0.4-candidate-${{ github.sha }}
           path: release-candidate/
           if-no-files-found: error
           retention-days: 30

@@ -42,7 +42,7 @@ except ImportError as exc:  # pragma: no cover - exercised by packaging smoke te
     ) from exc
 
 
-__version__ = "2.0.3"
+__version__ = "2.0.4"
 TOOL_NAME = "AWS Chaos Engineering Framework"
 MAX_CONFIG_BYTES = 1_048_576
 DEFAULT_REGION = "us-gov-west-1"
