@@ -44,11 +44,11 @@ $env:SOURCE_DATE_EPOCH = $candidateEpoch
 $env:AWS_EC2_METADATA_DISABLED = "true"
 python -m pip install -r requirements-build.txt
 python -m build --no-isolation --wheel --sdist --outdir package-dist
-python scripts\normalize_wheel.py --source-date-epoch $candidateEpoch package-dist\aws_chaos_engineering_framework-2.0.3-py3-none-any.whl
-python scripts\normalize_sdist.py --source-date-epoch $candidateEpoch package-dist\aws_chaos_engineering_framework-2.0.3.tar.gz
+python scripts\normalize_wheel.py --source-date-epoch $candidateEpoch package-dist\aws_chaos_engineering_framework-2.0.4-py3-none-any.whl
+python scripts\normalize_sdist.py --source-date-epoch $candidateEpoch package-dist\aws_chaos_engineering_framework-2.0.4.tar.gz
 python -m twine check package-dist\*
 python scripts\verify_distribution.py package-dist
-python scripts\prepare_release.py --version 2.0.3 --tag v2.0.3 --source-commit $candidateCommit --source-date-epoch $candidateEpoch --dist-directory package-dist --output-directory release-assets
+python scripts\prepare_release.py --version 2.0.4 --tag v2.0.4 --source-commit $candidateCommit --source-date-epoch $candidateEpoch --dist-directory package-dist --output-directory release-assets
 ```
 
 The builder rejects mismatched versions or tags, malformed commit IDs, missing release notes, unpinned runtime dependencies, unexpected distributions, unsafe archive members, incomplete wheel records, existing output directories, and unexpected final assets.

@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 2.0.4 - 2026-09-29
+
+### Corrected
+
+- Removed the unsupported Beta development-status classifier from package metadata. Runtime behavior and live-execution safety gates are unchanged from 2.0.3.
+
 ## 2.0.3 - 2026-08-28
 
 ### Fixed
