@@ -58,3 +58,11 @@ The builder rejects mismatched versions or tags, malformed commit IDs, missing r
 A `vX.Y.Z` tag must point to the approved GitHub-verified commit on protected `main`. The tag workflow rebuilds and compares every byte, attests every asset, and creates a non-prerelease draft with exactly the six approved files.
 
 Before publication, download the draft assets into a clean directory, recompute checksums, verify provenance, inspect the archives and evidence, install both package formats independently, rerun the offline smoke commands, and confirm there are no unresolved security alerts. Publishing the draft remains a manual maintainer decision.
+
+## Separate PyPI publication
+
+The manually dispatched `.github/workflows/publish.yml` workflow accepts an existing public, stable GitHub release tag. It checks the tagged commit and exact six-asset set, release hashes and evidence, distribution contents, and GitHub provenance before uploading only the verified wheel and source distribution. The upload job uses the protected `pypi` environment and a short-lived OpenID Connect credential. No PyPI API token is stored in the repository.
+
+Before the first PyPI publication, recheck that the normalized project name is available, secure the PyPI maintainer account with two-factor authentication, register the exact GitHub repository, `publish.yml`, and `pypi` environment as a pending trusted publisher, require maintainer approval on the environment, and allowlist the pinned PyPA publishing Action. A pending publisher does not reserve a project name.
+
+After separately deciding to publish the reviewed GitHub release on PyPI, dispatch `publish.yml` from protected `main` with the exact public release tag. Review the verification job before approving the `pypi` deployment. Confirm PyPI lists the same version and file hashes, install the exact version in a clean environment, and run offline smoke commands before announcing the registry package.
