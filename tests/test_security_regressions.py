@@ -632,3 +632,71 @@ def test_managed_fis_recovery_is_required_when_auto_rollback_disabled():
     assert result.status == "failed"
     assert result.rollback_successful is False
     assert any("not yet verified" in error for error in result.rollback_errors)
+
+
+def test_waf_ip_set_recovery_preserves_concurrent_addresses_and_description():
+    aws = FakeAWS(reject_writes=False)
+    original = aws.respond("wafv2", "get_ip_set", {})
+    original["IPSet"]["Addresses"] = ["192.0.2.0/24"]
+    original["IPSet"]["Description"] = "original"
+    concurrent = copy.deepcopy(original)
+    concurrent["IPSet"]["Addresses"] += ["198.51.100.0/24", "203.0.113.0/24"]
+    concurrent["IPSet"]["Description"] = "operator update"
+    concurrent["LockToken"] = "operator-lock"
+    restored = copy.deepcopy(concurrent)
+    restored["IPSet"]["Addresses"].remove("198.51.100.0/24")
+    aws.read_overrides[("wafv2", "get_ip_set")] = [original, concurrent, restored]
+    item, values = experiment(framework.ChaosType.WAF_IP_SET_MODIFY, aws)
+    values["addresses_to_add"] = ["192.0.2.0/24", "198.51.100.0/24"]
+    assert item.modify_ip_set(**values).status == "completed"
+    item.run_rollback()
+    writes = [
+        request for _, operation, request in aws.calls if operation == "update_ip_set"
+    ]
+    assert writes[-1]["Addresses"] == ["192.0.2.0/24", "203.0.113.0/24"]
+    assert writes[-1]["Description"] == "operator update"
+    assert writes[-1]["LockToken"] == "operator-lock"
+    assert item.rollback_verified
+
+
+@pytest.mark.parametrize("ipv4", [["192.0.2.10"], []])
+def test_directory_service_restores_and_verifies_dual_stack_targets(ipv4):
+    aws = FakeAWS(reject_writes=False)
+    original = aws.respond("ds", "describe_conditional_forwarders", {})
+    forwarder = original["ConditionalForwarders"][0]
+    forwarder["DnsIpAddrs"] = ipv4
+    forwarder["DnsIpv6Addrs"] = ["2001:db8::10"]
+    aws.read_overrides[("ds", "describe_conditional_forwarders")] = [original, original]
+    item, values = experiment(framework.ChaosType.DS_CONDITIONAL_FORWARDER_DELETE, aws)
+    assert item.delete_conditional_forwarder(**values).status == "completed"
+    item.run_rollback()
+    request = next(
+        request
+        for _, operation, request in aws.calls
+        if operation == "create_conditional_forwarder"
+    )
+    assert request["DnsIpv6Addrs"] == ["2001:db8::10"]
+    assert request.get("DnsIpAddrs", []) == ipv4
+    assert item.rollback_verified
+    missing_ipv6 = copy.deepcopy(original)
+    missing_ipv6["ConditionalForwarders"][0]["DnsIpv6Addrs"] = []
+    aws.read_overrides[("ds", "describe_conditional_forwarders")] = [missing_ipv6]
+    with pytest.raises(framework.SafetyViolation):
+        item._verify_additional_recovery()
+    wrong_scope = copy.deepcopy(original)
+    wrong_scope["ConditionalForwarders"][0]["ReplicationScope"] = "Forest"
+    aws.read_overrides[("ds", "describe_conditional_forwarders")] = [wrong_scope]
+    with pytest.raises(framework.SafetyViolation):
+        item._verify_additional_recovery()
+
+
+def test_directory_service_rejects_unrestorable_replication_scope_before_delete():
+    aws = FakeAWS(reject_writes=False)
+    original = aws.respond("ds", "describe_conditional_forwarders", {})
+    original["ConditionalForwarders"][0]["ReplicationScope"] = "Forest"
+    aws.read_overrides[("ds", "describe_conditional_forwarders")] = [original]
+    item, values = experiment(framework.ChaosType.DS_CONDITIONAL_FORWARDER_DELETE, aws)
+    assert item.delete_conditional_forwarder(**values).status == "failed"
+    assert not any(
+        operation == "delete_conditional_forwarder" for _, operation, _ in aws.calls
+    )

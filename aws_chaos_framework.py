@@ -1107,7 +1107,11 @@ class ChaosExperiment:
                     Scope=self.ip_set_scope, Name=self.ip_set_name, Id=self.ip_set_id
                 )["IPSet"]
                 checks.append(
-                    set(ip_set.get("Addresses", [])) == set(self.original_addresses)
+                    hasattr(self, "rollback_ip_set_state")
+                    and set(ip_set.get("Addresses", []))
+                    == set(self.rollback_ip_set_state["Addresses"])
+                    and ip_set.get("Description")
+                    == self.rollback_ip_set_state.get("Description")
                 )
         elif isinstance(self, KMSChaosExperiment):
             if hasattr(self, "original_enabled"):
@@ -1159,7 +1163,11 @@ class ChaosExperiment:
                 len(forwarders) == 1
                 and forwarders[0].get("RemoteDomainName") == self.remote_domain_name
                 and set(forwarders[0].get("DnsIpAddrs", []))
-                == set(self.forwarder_details["DnsIpAddrs"])
+                == set(self.forwarder_details.get("DnsIpAddrs", []))
+                and set(forwarders[0].get("DnsIpv6Addrs", []))
+                == set(self.forwarder_details.get("DnsIpv6Addrs", []))
+                and forwarders[0].get("ReplicationScope")
+                == self.forwarder_details.get("ReplicationScope")
             )
         elif isinstance(self, AppStreamChaosExperiment) and hasattr(self, "stack_name"):
             checks.append(
@@ -5819,6 +5827,9 @@ class WAFChaosExperiment(ChaosExperiment):
             )
             ip_set = response["IPSet"]
             self.original_addresses = list(ip_set["Addresses"])
+            self.owned_address_additions = set(addresses_to_add) - set(
+                self.original_addresses
+            )
             self.ip_set_id = ip_set_id
             self.ip_set_name = ip_set_name
             self.ip_set_scope = scope
@@ -5907,13 +5918,21 @@ class WAFChaosExperiment(ChaosExperiment):
                     "Scope": self.ip_set_scope,
                     "Name": self.ip_set_name,
                     "Id": self.ip_set_id,
-                    "Addresses": self.original_addresses,
+                    "Addresses": sorted(
+                        set(response["IPSet"]["Addresses"])
+                        - self.owned_address_additions
+                    ),
                     "LockToken": response["LockToken"],
                 }
-                if self.ip_set_description is not None:
-                    request["Description"] = self.ip_set_description
+                current_description = response["IPSet"].get("Description")
+                if current_description is not None:
+                    request["Description"] = current_description
+                self.rollback_ip_set_state = {
+                    "Addresses": request["Addresses"],
+                    "Description": current_description,
+                }
                 self.wafv2.update_ip_set(**request)
-                logger.info("Restored original IP set")
+                logger.info("Removed experiment-owned IP set additions")
 
         except Exception as exc:
             logger.error(f"Error during WAF rollback: {exc}")
@@ -6340,7 +6359,13 @@ class DirectoryServiceChaosExperiment(ChaosExperiment):
                 DirectoryId=directory_id, RemoteDomainNames=[remote_domain_name]
             )
             if forwarders["ConditionalForwarders"]:
-                self.forwarder_details = forwarders["ConditionalForwarders"][0]
+                self.forwarder_details = copy.deepcopy(
+                    forwarders["ConditionalForwarders"][0]
+                )
+                if self.forwarder_details.get("ReplicationScope") != "Domain":
+                    raise SafetyViolation(
+                        "Conditional forwarder replication scope cannot be restored"
+                    )
                 self.directory_id = directory_id
                 self.remote_domain_name = remote_domain_name
 
@@ -6377,11 +6402,14 @@ class DirectoryServiceChaosExperiment(ChaosExperiment):
         try:
             if hasattr(self, "forwarder_details") and hasattr(self, "directory_id"):
                 # Re-create conditional forwarder
-                self.ds.create_conditional_forwarder(
-                    DirectoryId=self.directory_id,
-                    RemoteDomainName=self.remote_domain_name,
-                    DnsIpAddrs=self.forwarder_details["DnsIpAddrs"],
-                )
+                request = {
+                    "DirectoryId": self.directory_id,
+                    "RemoteDomainName": self.remote_domain_name,
+                }
+                for key in ("DnsIpAddrs", "DnsIpv6Addrs"):
+                    if self.forwarder_details.get(key):
+                        request[key] = list(self.forwarder_details[key])
+                self.ds.create_conditional_forwarder(**request)
                 logger.info(
                     f"Re-created conditional forwarder for {self.remote_domain_name}"
                 )
