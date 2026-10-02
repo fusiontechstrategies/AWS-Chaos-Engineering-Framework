@@ -7,7 +7,7 @@
 [![Python 3.10-3.14](https://img.shields.io/badge/python-3.10--3.14-3776AB.svg)](https://www.python.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-An enterprise-minded, one-file chaos engineering orchestrator for AWS Fault Injection Service and carefully guarded service extensions. It combines AWS FIS templates, strict blast-radius controls, exact account binding, automatic rollback, emergency stops, and privacy-conscious evidence reports in a tool that remains easy to inspect and deploy.
+An enterprise-minded, one-file chaos engineering orchestrator for AWS Fault Injection Service and carefully guarded service extensions. It combines read-only AWS FIS template planning, strict blast-radius controls, exact account binding, automatic rollback, emergency stops, and privacy-conscious evidence reports in a tool that remains easy to inspect and deploy.
 
 [![Guarded AWS chaos experiment flow](docs/images/aws-chaos-guarded-experiment.png)](docs/images/source/aws-chaos-guarded-experiment.svg)
 
@@ -16,9 +16,9 @@ An enterprise-minded, one-file chaos engineering orchestrator for AWS Fault Inje
 
 ## Why this framework exists
 
-AWS FIS is the preferred execution engine whenever it provides the required fault. The framework adds a consistent control plane around FIS and extends coverage to service scenarios that FIS does not directly expose.
+AWS FIS can supply managed faults, but this framework currently permits only read-only template planning because StartExperiment cannot bind an immutable reviewed template. Guarded extensions retain their individually declared live support.
 
-- 49 live-supported experiment modes across AWS FIS and guarded extensions, plus 11 planning-only modes
+- Explicit live-support declarations for each guarded extension, plus read-only FIS template planning
 - GovCloud-aware region and ARN validation
 - Plan mode by default, with no AWS mutations
 - Exact account, region, suite, and target binding for live runs
@@ -42,7 +42,7 @@ Version 2.0.4 is available on [PyPI](https://pypi.org/project/aws-chaos-engineer
 | Credentials | Temporary credentials are required by default. Long-term credentials need configuration and CLI approval. |
 | Targets | Live extensions require exact allowlisting. Optional VPC discovery includes only resources with required safety tags. |
 | Blast radius | Per-run and per-experiment limits are enforced before execution. |
-| Stop controls | Extension runs require CloudWatch alarms by default. FIS templates require an alarm stop condition by default. |
+| Stop controls | Extension runs require CloudWatch alarms by default. FIS template inspection checks alarm stop conditions; live FIS starts are disabled. |
 | Confirmation | Live execution requires an exact, non-secret token containing the account, region, and suite. |
 | Irreversible actions | Destructive actions require a stronger token plus two independent approvals. |
 | Rollback | Reversible changes capture prior state, track AWS write attempts, and report recovery failures honestly. |
@@ -89,7 +89,7 @@ python .\aws_chaos_framework.py `
   --profile chaos-test
 ```
 
-The included [example configuration](example-config.yaml) demonstrates tagged EC2 recovery and existing FIS template orchestration. Replace all placeholders before use.
+The included [example configuration](example-config.yaml) demonstrates tagged EC2 recovery and read-only FIS template planning. Replace all placeholders before use.
 
 ## Moving from plan to live execution
 
@@ -130,16 +130,9 @@ Irreversible suites require `safety.allow_irreversible: true`, `--allow-irrevers
 
 ## AWS FIS integration
 
-Use `fis_template` to validate, start, monitor, and stop an existing AWS FIS experiment template. Before a live start, the framework checks:
+Use `fis_template` for read-only template inspection and guardrail validation. Live FIS starts and confirmation tokens are disabled. AWS StartExperiment takes a mutable template ID and provides no conditional version or content digest. Re-reading the template narrows the race but cannot prove that the approved content is what AWS starts. A configuration assertion about an exclusive change window does not prove immutability.
 
-- FIS execution-role partition and account ownership
-- CloudWatch alarm stop conditions
-- target selection modes and configured blast-radius limits
-- exact ARN allowlists for explicit resources
-- required tags for dynamically selected resources
-- unbounded `ALL` or `PERCENT` selections
-
-FIS remains responsible for its managed actions and recovery behavior. The framework monitors the experiment, applies framework safety checks while it runs, and requests a stop if an emergency condition occurs.
+Re-enabling live FIS requires an enforceable and independently verified immutable-template boundary or an AWS API that conditionally starts the reviewed version. Recovery methods remain available for already-started experiments from older versions. FIS planning still checks execution-role ownership, alarm scope, explicit resource allowlists, action support and bounded aggregate targets.
 
 Useful AWS references:
 
@@ -159,7 +152,7 @@ Every catalog entry declares its provider, risk, live support, rollback model, a
 python .\aws_chaos_framework.py --list-experiments
 ```
 
-The catalog intentionally includes some gated entries. An action is not live-supported when it cannot provide a real fault, bounded targeting, or an honest recovery contract. Host-level EC2 faults are represented through `fis_template` so that AWS FIS and SSM-managed actions provide the execution semantics.
+The catalog intentionally includes some gated entries. An action is not live-supported when it cannot provide a real fault, bounded targeting, or an honest recovery contract. Host-level EC2 faults remain represented through read-only `fis_template` planning until an immutable start boundary is available.
 
 EC2 termination approval includes every volume marked for deletion, and EBS detach approval includes the exact instance/device attachment. Eleven temporary network, queue, key, credential, policy, and trigger operations retain dry-run planning while live execution is refused because AWS provides no conditional ownership proof for safe concurrent recovery. See [runtime approval and recovery boundaries](docs/runtime-safety-scope.md) for required fields, affected-resource counting, safety polling, and the complete restriction list.
 

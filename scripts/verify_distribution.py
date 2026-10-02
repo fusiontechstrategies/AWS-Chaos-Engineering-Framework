@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import configparser
+import csv
 import email
+import hashlib
+import io
 import re
 import shlex
 import tarfile
@@ -48,6 +53,75 @@ def _runtime_requirements(requirements_path: Path) -> set[str]:
     }
 
 
+def validate_record(values: dict[str, bytes], record_name: str) -> None:
+    """Bind every canonical wheel member to exactly one safe SHA-256 RECORD row."""
+    try:
+        rows = list(
+            csv.reader(
+                io.StringIO(values[record_name].decode("utf-8"), newline=""),
+                strict=True,
+            )
+        )
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise ValueError("wheel RECORD is malformed") from exc
+    if len(rows) != len(values):
+        raise ValueError("wheel RECORD does not cover the exact member set")
+    recorded = {}
+    for row in rows:
+        if len(row) != 3:
+            raise ValueError("wheel RECORD row is malformed")
+        name, digest, size = row
+        if name not in values or name in recorded:
+            raise ValueError("wheel RECORD has an unsafe, extra or duplicate member")
+        recorded[name] = (digest, size)
+    if set(recorded) != set(values) or recorded[record_name] != ("", ""):
+        raise ValueError(
+            "wheel RECORD must cover every member and leave its own identity empty"
+        )
+    for name, value in values.items():
+        if name == record_name:
+            continue
+        digest = (
+            base64.urlsafe_b64encode(hashlib.sha256(value).digest())
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+        if recorded[name] != ("sha256=" + digest, str(len(value))):
+            raise ValueError("wheel RECORD hash or size does not match member bytes")
+
+
+def validate_entry_points(entry_points: str, repository_root: Path) -> None:
+    """Accept exactly one literal launcher, with no extra installer behavior."""
+    lines = [line for line in entry_points.splitlines() if line.strip()]
+    if (
+        len(lines) != 2
+        or lines[0] != "[console_scripts]"
+        or not re.fullmatch(
+            r"aws-chaos-framework[ ]*=[ ]*aws_chaos_framework:main", lines[1]
+        )
+    ):
+        raise ValueError("wheel entry points do not match the reviewed launcher")
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
+    parser.read_string(entry_points)
+    expected = {"aws-chaos-framework": "aws_chaos_framework:main"}
+    if (
+        parser.defaults()
+        or parser.sections() != ["console_scripts"]
+        or dict(parser["console_scripts"]) != expected
+    ):
+        raise ValueError("wheel entry point metadata is ambiguous")
+    project = (repository_root / "pyproject.toml").read_text(encoding="utf-8")
+    tables = re.findall(r"(?ms)^\[project\.scripts\]\s*\n(.*?)(?=^\[|\Z)", project)
+    if (
+        len(tables) != 1
+        or tables[0].strip() != 'aws-chaos-framework = "aws_chaos_framework:main"'
+    ):
+        raise ValueError(
+            "project.scripts does not contain exactly the reviewed launcher"
+        )
+
+
 def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None:
     with zipfile.ZipFile(wheel_path) as archive:
         names = archive.namelist()
@@ -67,9 +141,19 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
         unexpected = set(names) - allowed
         if unexpected:
             raise ValueError(f"wheel contains unreviewed files: {sorted(unexpected)}")
+        if set(names) != allowed:
+            raise ValueError("wheel is missing canonical metadata members")
+        members = archive.infolist()
+        if (
+            any(member.file_size > 8_388_608 or member.is_dir() for member in members)
+            or sum(member.file_size for member in members) > 33_554_432
+        ):
+            raise ValueError("wheel expanded members exceed the verification budget")
+        values = {name: archive.read(name) for name in names}
+        validate_record(values, info + "RECORD")
         if MODULE_NAME not in names:
             raise ValueError(f"wheel is missing {MODULE_NAME}")
-        if archive.read(MODULE_NAME) != (repository_root / MODULE_NAME).read_bytes():
+        if values[MODULE_NAME] != (repository_root / MODULE_NAME).read_bytes():
             raise ValueError(
                 "wheel runtime module does not match the repository source"
             )
@@ -90,7 +174,7 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
                 "wheel must contain one METADATA file and one entry_points.txt"
             )
 
-        metadata = email.message_from_bytes(archive.read(metadata_names[0]))
+        metadata = email.message_from_bytes(values[metadata_names[0]])
         if metadata.get("Name") != PROJECT_NAME:
             raise ValueError(f"unexpected project name: {metadata.get('Name')}")
         if metadata.get("Version") != version:
@@ -111,10 +195,8 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
                 "wheel dependency metadata does not match requirements.txt"
             )
 
-        entry_points = archive.read(entry_point_names[0]).decode("utf-8")
-        expected_entry_point = "aws-chaos-framework = aws_chaos_framework:main"
-        if expected_entry_point not in entry_points:
-            raise ValueError("wheel is missing the expected console entry point")
+        entry_points = values[entry_point_names[0]].decode("utf-8")
+        validate_entry_points(entry_points, repository_root)
 
 
 def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:

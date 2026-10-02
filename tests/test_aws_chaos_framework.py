@@ -968,10 +968,11 @@ def test_action_matrix_covers_every_live_supported_type() -> None:
         for item in framework.ChaosType
         if framework.experiment_metadata(item).live_supported
     }
-    assert (
-        set(action_configs())
-        == supported | framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS
-    )
+    assert set(
+        action_configs()
+    ) == supported | framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS | {
+        framework.ChaosType.FIS_TEMPLATE
+    }
 
 
 def test_declared_unsupported_actions_are_not_live_supported() -> None:
@@ -1574,7 +1575,7 @@ def test_fis_template_live_guardrails_require_stop_condition() -> None:
     assert not any(call[1] == "start_experiment" for call in fake_aws.calls)
 
 
-def test_fis_template_live_start_and_terminal_completion() -> None:
+def test_fis_template_live_start_is_disabled_without_immutable_binding() -> None:
     fake_aws = FakeAWS(reject_writes=False)
     fake_aws.read_overrides[("fis", "get_experiment")] = [
         {"experiment": {"state": {"status": "completed"}}}
@@ -1603,10 +1604,10 @@ def test_fis_template_live_start_and_terminal_completion() -> None:
 
     result = experiment.run_template(action_config["experiment_template_id"])
 
-    assert result.status == "completed"
-    assert result.additional_info["fis_status"] == "completed"
-    assert experiment.fis_experiment_id == "EXP1234567890abcdef0"
-    assert experiment.mutation_operations == ["fis.start_experiment"]
+    assert result.status == "failed"
+    assert any("immutable reviewed template" in error for error in result.errors)
+    assert not any(call[1] == "start_experiment" for call in fake_aws.calls)
+    assert experiment.mutation_operations == []
 
 
 @pytest.mark.parametrize(

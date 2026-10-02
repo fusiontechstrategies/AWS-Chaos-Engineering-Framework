@@ -373,6 +373,13 @@ def transition_states(aws, case):
         "_wait_for_fleet_state": "STOPPED",
     }[method]
     if method in {"_wait_for_cluster_available", "_wait_for_db_instance_available"}:
+        identity_key = (
+            "DBClusterIdentifier"
+            if method == "_wait_for_cluster_available"
+            else "DBInstanceIdentifier"
+        )
+        leaf(pending)[identity_key] = args[0]
+        leaf(ready)[identity_key] = args[0]
         leaf(pending)[field] = "modifying"
     elif method == "_wait_for_configuration":
         leaf(pending)[field] = "InProgress"
