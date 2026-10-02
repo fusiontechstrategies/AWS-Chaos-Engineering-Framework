@@ -37,6 +37,7 @@ try:
     import boto3
     import yaml
     from botocore.config import Config as BotocoreConfig
+    from botocore.exceptions import ClientError
 except ImportError as exc:  # pragma: no cover - exercised by packaging smoke tests
     raise SystemExit(
         "Missing dependency. Install boto3, botocore, and PyYAML before running this tool."
@@ -985,11 +986,226 @@ class ChaosExperiment:
         self._in_rollback = True
         try:
             self.rollback()
+            self._verify_additional_recovery()
         except Exception as exc:
             self.rollback_errors.append(str(exc))
             raise
         finally:
             self._in_rollback = False
+
+    def _verify_additional_recovery(self) -> None:
+        """Read back extension recovery state independently of successful writes."""
+        checks: list[bool] = []
+        if isinstance(self, VPCChaosExperiment):
+            if hasattr(self, "route_table_id"):
+                routes = self.ec2.describe_route_tables(
+                    RouteTableIds=[self.route_table_id]
+                )["RouteTables"][0].get("Routes", [])
+                checks.append(
+                    any(
+                        route.get("DestinationCidrBlock") == self.destination_cidr
+                        and all(
+                            route.get(key) == value
+                            for key, value in self.original_route_target.items()
+                        )
+                        for route in routes
+                    )
+                )
+            if hasattr(self, "removed_rule"):
+                groups = self.ec2.describe_security_groups(GroupIds=[self.group_id])[
+                    "SecurityGroups"
+                ]
+                checks.append(
+                    len(groups) == 1
+                    and self.removed_rule in groups[0].get("IpPermissions", [])
+                )
+            if hasattr(self, "rule_number"):
+                acls = self.ec2.describe_network_acls(NetworkAclIds=[self.nacl_id])[
+                    "NetworkAcls"
+                ]
+                checks.append(
+                    len(acls) == 1
+                    and not any(
+                        entry.get("RuleNumber") == self.rule_number
+                        and not entry.get("Egress", False)
+                        for entry in acls[0].get("Entries", [])
+                    )
+                )
+        elif isinstance(self, SQSChaosExperiment) and hasattr(self, "queue_url"):
+            expected = {}
+            for attribute, field in (
+                ("original_policy", "Policy"),
+                ("original_delay", "DelaySeconds"),
+                ("original_timeout", "VisibilityTimeout"),
+            ):
+                if hasattr(self, attribute):
+                    expected[field] = getattr(self, attribute) or ""
+            if expected:
+                actual = self.sqs.get_queue_attributes(
+                    QueueUrl=self.queue_url, AttributeNames=list(expected)
+                )["Attributes"]
+                checks.append(
+                    all(actual.get(key, "") == value for key, value in expected.items())
+                )
+        elif isinstance(self, ELBChaosExperiment):
+            if hasattr(self, "original_attributes"):
+                actual = {
+                    item["Key"]: item["Value"]
+                    for item in self.elbv2.describe_target_group_attributes(
+                        TargetGroupArn=self.target_group_arn
+                    )["Attributes"]
+                }
+                key = "deregistration_delay.timeout_seconds"
+                checks.append(actual.get(key) == self.original_attributes.get(key))
+            if hasattr(self, "original_health_check"):
+                groups = self.elbv2.describe_target_groups(
+                    TargetGroupArns=[self.target_group_arn]
+                )["TargetGroups"]
+                checks.append(
+                    len(groups) == 1
+                    and all(
+                        groups[0].get(key) == value
+                        for key, value in self.original_health_check.items()
+                    )
+                )
+            if hasattr(self, "original_actions"):
+                rules = self.elbv2.describe_rules(RuleArns=[self.rule_arn])["Rules"]
+                checks.append(
+                    len(rules) == 1 and rules[0].get("Actions") == self.original_actions
+                )
+        elif isinstance(self, ECSChaosExperiment) and hasattr(self, "original_status"):
+            instances = self.ecs.describe_container_instances(
+                cluster=self.cluster, containerInstances=[self.container_instance_arn]
+            )["containerInstances"]
+            checks.append(
+                len(instances) == 1
+                and instances[0].get("status") == self.original_status
+            )
+        elif isinstance(self, WAFChaosExperiment):
+            if hasattr(self, "changed_rule_name"):
+                acl = self.wafv2.get_web_acl(
+                    Scope=self.web_acl_scope, Name=self.web_acl_name, Id=self.web_acl_id
+                )["WebACL"]
+                matches = [
+                    rule
+                    for rule in acl.get("Rules", [])
+                    if rule.get("Name") == self.changed_rule_name
+                ]
+                restored = None
+                if len(matches) == 1:
+                    restored = (
+                        matches[0]
+                        .get("Statement", {})
+                        .get("RateBasedStatement", {})
+                        .get("Limit")
+                        if self.changed_rule_field == "RateBasedStatement.Limit"
+                        else matches[0].get("Action")
+                    )
+                checks.append(restored == self.original_rule_value)
+            if hasattr(self, "original_addresses"):
+                ip_set = self.wafv2.get_ip_set(
+                    Scope=self.ip_set_scope, Name=self.ip_set_name, Id=self.ip_set_id
+                )["IPSet"]
+                checks.append(
+                    set(ip_set.get("Addresses", [])) == set(self.original_addresses)
+                )
+        elif isinstance(self, KMSChaosExperiment):
+            if hasattr(self, "original_enabled"):
+                checks.append(
+                    self.kms.describe_key(KeyId=self.key_id)["KeyMetadata"].get(
+                        "Enabled"
+                    )
+                    == self.original_enabled
+                )
+            if hasattr(self, "original_policy"):
+                actual = self.kms.get_key_policy(
+                    KeyId=self.key_id, PolicyName="default"
+                )["Policy"]
+                checks.append(json.loads(actual) == json.loads(self.original_policy))
+        elif isinstance(self, IAMChaosExperiment):
+            if hasattr(self, "policy_arn"):
+                policies = self.iam.list_attached_role_policies(
+                    RoleName=self.role_name
+                )["AttachedPolicies"]
+                checks.append(
+                    any(item.get("PolicyArn") == self.policy_arn for item in policies)
+                )
+            if hasattr(self, "original_max_session"):
+                checks.append(
+                    self.iam.get_role(RoleName=self.role_name)["Role"].get(
+                        "MaxSessionDuration"
+                    )
+                    == self.original_max_session
+                )
+            if hasattr(self, "access_key_id"):
+                keys = self.iam.list_access_keys(UserName=self.user_name)[
+                    "AccessKeyMetadata"
+                ]
+                checks.append(
+                    any(
+                        item.get("AccessKeyId") == self.access_key_id
+                        and item.get("Status") == "Active"
+                        for item in keys
+                    )
+                )
+        elif isinstance(self, DirectoryServiceChaosExperiment) and hasattr(
+            self, "forwarder_details"
+        ):
+            forwarders = self.ds.describe_conditional_forwarders(
+                DirectoryId=self.directory_id,
+                RemoteDomainNames=[self.remote_domain_name],
+            )["ConditionalForwarders"]
+            checks.append(
+                len(forwarders) == 1
+                and forwarders[0].get("RemoteDomainName") == self.remote_domain_name
+                and set(forwarders[0].get("DnsIpAddrs", []))
+                == set(self.forwarder_details["DnsIpAddrs"])
+            )
+        elif isinstance(self, AppStreamChaosExperiment) and hasattr(self, "stack_name"):
+            checks.append(
+                self.fleet_name
+                in self.appstream.list_associated_fleets(StackName=self.stack_name).get(
+                    "Names", []
+                )
+            )
+        elif isinstance(self, ECRChaosExperiment) and hasattr(self, "had_policy"):
+            try:
+                actual = self.ecr.get_repository_policy(
+                    repositoryName=self.repository_name
+                )["policyText"]
+            except ClientError as exc:
+                if (
+                    exc.response.get("Error", {}).get("Code")
+                    != "RepositoryPolicyNotFoundException"
+                ):
+                    raise
+                checks.append(not self.had_policy)
+            else:
+                checks.append(
+                    self.had_policy
+                    and json.loads(actual) == json.loads(self.original_policy)
+                )
+        elif isinstance(self, CodeCommitChaosExperiment) and hasattr(
+            self, "deleted_trigger"
+        ):
+            triggers = self.codecommit.get_repository_triggers(
+                repositoryName=self.repository_name
+            )["triggers"]
+            checks.append(
+                sum(item == self.deleted_trigger for item in triggers) == 1
+                and sum(
+                    item.get("name") == self.deleted_trigger["name"]
+                    for item in triggers
+                )
+                == 1
+            )
+        if checks:
+            if not all(checks):
+                self.rollback_verified = False
+                raise SafetyViolation(
+                    "Recovery read-back did not match the expected original state"
+                )
+            self.rollback_verified = True
 
     def run(self) -> ExperimentResult:
         """Run the experiment"""
@@ -2640,7 +2856,7 @@ class RDSChaosExperiment(ChaosExperiment):
             for name, value in expected.items():
                 current = self.rds.describe_db_parameters(
                     DBParameterGroupName=parameter_group_name,
-                    Filters=[{"Name": "ParameterName", "Values": [name]}],
+                    Filters=[{"Name": "parameter-name", "Values": [name]}],
                 ).get("Parameters", [])
                 if len(current) != 1 or str(current[0].get("ParameterValue")) != value:
                     matched = False
@@ -2834,7 +3050,7 @@ class RDSChaosExperiment(ChaosExperiment):
                 current = self.rds.describe_db_parameters(
                     DBParameterGroupName=parameter_group_name,
                     Filters=[
-                        {"Name": "ParameterName", "Values": [param["ParameterName"]]}
+                        {"Name": "parameter-name", "Values": [param["ParameterName"]]}
                     ],
                 )
                 if current["Parameters"]:
@@ -3008,7 +3224,7 @@ class RDSChaosExperiment(ChaosExperiment):
                         DBParameterGroupName=self.parameter_group_name,
                         Filters=[
                             {
-                                "Name": "ParameterName",
+                                "Name": "parameter-name",
                                 "Values": [original["ParameterName"]],
                             }
                         ],
@@ -3197,7 +3413,9 @@ class LambdaChaosExperiment(ChaosExperiment):
 
             if not self.dry_run:
                 self.lambda_client.update_function_configuration(
-                    FunctionName=function_name, Timeout=timeout_seconds
+                    FunctionName=function_name,
+                    Timeout=timeout_seconds,
+                    RevisionId=response["RevisionId"],
                 )
                 self._wait_for_configuration(function_name, True)
                 result.affected_resources = [function_name]
@@ -3244,7 +3462,9 @@ class LambdaChaosExperiment(ChaosExperiment):
 
             if not self.dry_run:
                 self.lambda_client.update_function_configuration(
-                    FunctionName=function_name, MemorySize=memory_mb
+                    FunctionName=function_name,
+                    MemorySize=memory_mb,
+                    RevisionId=response["RevisionId"],
                 )
                 self._wait_for_configuration(function_name, True)
                 result.affected_resources = [function_name]
@@ -7089,10 +7309,15 @@ class ChaosOrchestrator:
         # Deterministic selection supports reproducible plans; this is not cryptography.
         self.random = random.Random(seed)  # nosec B311
         self.seed = seed
-        global_config["dry_run"] = self.dry_run
 
         session = boto3.Session(profile_name=profile, region_name=self.region)
         requested_role = role_arn or global_config.get("role_arn")
+        self.approval_scope = {
+            "profile": profile,
+            "role_arn": requested_role,
+            "vpc_id": vpc_id,
+            "seed": seed,
+        }
         if requested_role:
             sts = session.client(
                 "sts",
@@ -7233,7 +7458,7 @@ class ChaosOrchestrator:
         reviewed = copy.deepcopy(self.config)
         reviewed["global"]["account_id"] = self.expected_account
         reviewed["global"]["region"] = self.region
-        return confirmation_token(reviewed, suite_name)
+        return confirmation_token(reviewed, suite_name, self.approval_scope)
 
     def _signal_handler(self, signum: int, frame: Any) -> None:
         """Request cooperative shutdown and rollback."""
@@ -7416,6 +7641,16 @@ class ChaosOrchestrator:
             for item in experiment_types
         )
         if self.live:
+            for item in suite["experiments"]:
+                if any(
+                    value in {"@discovered", "@random_discovered"}
+                    for value in item.values()
+                    if isinstance(value, str)
+                ):
+                    raise SafetyViolation(
+                        "Live approval requires concrete targets. Materialize discovered "
+                        "IDs into the reviewed configuration and exact target allowlist."
+                    )
             contains_extension = any(
                 item != ChaosType.FIS_TEMPLATE for item in experiment_types
             )
@@ -7544,6 +7779,10 @@ class ChaosOrchestrator:
                 continue
             if value not in {"@random_discovered", "@discovered"}:
                 continue
+            if self.live:
+                raise SafetyViolation(
+                    "Live execution requires reviewed concrete target IDs"
+                )
             if not self.vpc_id:
                 raise ConfigurationError(
                     f"{value} for {key} requires --vpc-id resource discovery"
@@ -7684,7 +7923,7 @@ class ChaosOrchestrator:
                 "S3 max_objects exceeds the configured max_blast_radius"
             )
         allowlist = {str(item) for item in safety.get("target_allowlist", [])}
-        allowed = allowlist | self._discovered_target_values
+        allowed = allowlist if self.live else allowlist | self._discovered_target_values
         unapproved = targets - allowed
         if unapproved:
             raise SafetyViolation(
@@ -7811,10 +8050,12 @@ class ChaosOrchestrator:
 
             should_rollback = (
                 self.live
-                and experiment_config.get("auto_rollback", True)
                 and bool(experiment.mutation_attempts)
                 and (
-                    metadata.rollback == "automatic"
+                    (
+                        metadata.rollback == "automatic"
+                        and experiment_config.get("auto_rollback", True)
+                    )
                     or (
                         metadata.rollback == "managed"
                         and result.status in {"completed", "failed", "aborted"}
@@ -8510,6 +8751,8 @@ class ChaosOrchestrator:
 
         for result in self.results:
             collect_derived(result.additional_info)
+            collect_derived(result.metrics_before)
+            collect_derived(result.metrics_after)
 
         def redact(value: Any) -> Any:
             """Redact credentials and known target identifiers from report details."""
@@ -9279,12 +9522,25 @@ def list_experiment_types() -> None:
         print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
 
 
-def confirmation_token(config: dict[str, Any], suite_name: str) -> str:
+def confirmation_token(
+    config: dict[str, Any],
+    suite_name: str,
+    execution_scope: dict[str, Any] | None = None,
+) -> str:
     """Build the exact live confirmation token without contacting AWS."""
     validate_config_data(config)
     suites = config["experiment_suites"]
     if suite_name not in suites:
         raise ConfigurationError(f"Suite {suite_name} not found in configuration")
+    if any(
+        value in {"@discovered", "@random_discovered"}
+        for item in suites[suite_name]["experiments"]
+        for value in item.values()
+        if isinstance(value, str)
+    ):
+        raise ConfigurationError(
+            "Materialize concrete targets before generating live approval"
+        )
     experiment_types = [
         ChaosType(item["type"]) for item in suites[suite_name]["experiments"]
     ]
@@ -9305,6 +9561,12 @@ def confirmation_token(config: dict[str, Any], suite_name: str) -> str:
         key: value
         for key, value in reviewed.get("safety", {}).items()
         if not key.startswith("_runtime_")
+    }
+    reviewed["execution_scope"] = execution_scope or {
+        "profile": None,
+        "role_arn": global_config.get("role_arn"),
+        "vpc_id": None,
+        "seed": None,
     }
     digest = hashlib.sha256(
         json.dumps(
@@ -9450,7 +9712,18 @@ def main(argv: list[str] | None = None) -> int:
         config = load_yaml_config(args.config)
         validate_config_data(config)
         if args.show_live_token:
-            print(confirmation_token(config, args.suite))
+            print(
+                confirmation_token(
+                    config,
+                    args.suite,
+                    {
+                        "profile": args.profile,
+                        "role_arn": args.role_arn or config["global"].get("role_arn"),
+                        "vpc_id": args.vpc_id,
+                        "seed": args.seed,
+                    },
+                )
+            )
             return 0
         if args.show_target_selectors:
             if args.suite not in config["experiment_suites"]:

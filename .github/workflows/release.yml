@@ -139,8 +139,10 @@ jobs:
           install -m 0444 "$candidate" "$RUNNER_TEMP/chaos-candidate-smoke.py"
           cmp --silent "$candidate" "$RUNNER_TEMP/chaos-candidate-smoke.py"
           candidate="$RUNNER_TEMP/chaos-candidate-smoke.py"
-          runtime="$(command -v python)"
-          isolated=(sudo bwrap --unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try --die-with-parent --new-session --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --ro-bind "$candidate" /tmp/candidate.py --chdir /tmp --clearenv --setenv AWS_EC2_METADATA_DISABLED true --setenv PYTHONDONTWRITEBYTECODE 1 --cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID --cap-add CAP_SETPCAP /usr/bin/setpriv --reuid=65534 --regid=65534 --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs "$runtime" /tmp/candidate.py)
+          python -m venv "$RUNNER_TEMP/chaos-hashed-runtime"
+          "$RUNNER_TEMP/chaos-hashed-runtime/bin/python" -m pip install --disable-pip-version-check --require-hashes -r requirements-runtime-lock.txt
+          runtime="/tmp/runtime/bin/python"
+          isolated=(sudo bwrap --unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try --die-with-parent --new-session --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --ro-bind "$candidate" /tmp/candidate.py --ro-bind "$RUNNER_TEMP/chaos-hashed-runtime" /tmp/runtime --chdir /tmp --clearenv --setenv AWS_EC2_METADATA_DISABLED true --setenv PYTHONDONTWRITEBYTECODE 1 --cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID --cap-add CAP_SETPCAP /usr/bin/setpriv --reuid=65534 --regid=65534 --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs "$runtime" /tmp/candidate.py)
           version_output="$("${isolated[@]}" --version)"
           test "$version_output" = "AWS Chaos Engineering Framework $RELEASE_VERSION"
           "${isolated[@]}" --help >/dev/null

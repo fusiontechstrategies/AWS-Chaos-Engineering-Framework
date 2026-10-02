@@ -1066,6 +1066,8 @@ def test_evidence_report_redacts_identity_and_targets_by_default(
                 "writer_endpoint": "derived-database.internal.invalid",
                 "invalidation_id": "DERIVEDCF123",
             },
+            metrics_before={"endpoint": "metrics-db.internal.invalid"},
+            metrics_after={"members": ["metrics-derived-reader"]},
         )
     ]
     orchestrator.run_id = "offline-test-run"
@@ -1094,6 +1096,8 @@ def test_evidence_report_redacts_identity_and_targets_by_default(
         "snap-derived-not-configured",
         "derived-database.internal.invalid",
         "DERIVEDCF123",
+        "metrics-db.internal.invalid",
+        "metrics-derived-reader",
     ):
         assert derived not in report_text
     assert "affected_resources" not in report["experiments"][0]

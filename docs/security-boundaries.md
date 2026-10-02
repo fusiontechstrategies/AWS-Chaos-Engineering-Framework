@@ -84,3 +84,17 @@ isolation and a read-only host filesystem. Artifact hashes are captured before
 execution and checked afterward. Isolation failure blocks publication. CI exercises
 this exact Linux boundary; mocked AWS tests do not demonstrate deployed AWS IAM,
 alarm or recovery behavior.
+
+
+Live approval requires concrete resource IDs in YAML and in the exact target
+allowlist. Discovery placeholders are planning aids and cannot authorize a live
+write. The full approval digest binds the configuration, CLI profile, selected
+role, VPC scope and random seed. Generate the token with the same options used
+for execution. Discovered resources do not become implicitly approved targets.
+Managed FIS recovery checks run even when auto_rollback is false.
+
+All extension recovery handlers read back the intended original state before
+claiming verified recovery. These are control-plane observations and do not
+prove application health. Eventual consistency or a failed read may require
+manual reconciliation. The exact standalone smoke runtime comes from a new
+virtual environment populated only from the reviewed, hashed runtime lock.

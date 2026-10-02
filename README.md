@@ -111,6 +111,10 @@ python .\aws_chaos_framework.py `
   --show-live-token
 ```
 
+Materialize discovery placeholders into explicit resource IDs before generating
+this token. Add those IDs to the exact target allowlist. Use the same profile,
+role, VPC and seed options when generating the token and running the suite.
+
 Then provide that exact token with `--live`:
 
 ```powershell
@@ -119,7 +123,7 @@ python .\aws_chaos_framework.py `
   --suite tagged_ec2_recovery `
   --profile chaos-test `
   --live `
-  --confirm "LIVE:000000000000:us-gov-west-1:tagged_ec2_recovery"
+  --confirm "<paste the complete token including its SHA256 digest>"
 ```
 
 Irreversible suites require `safety.allow_irreversible: true`, `--allow-irreversible`, and a token beginning with `LIVE-IRREVERSIBLE`. Safety bypasses also require matching approval in both configuration and the CLI.
