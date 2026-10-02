@@ -73,16 +73,17 @@ All live experiments are serialized from pre-state capture through verified
 recovery, including direct worker calls and separate orchestrators in the same
 process. Plan mode may still use configured concurrency. Separate processes and
 external operators must honor the exclusive change window; this lock is not a
-distributed AWS resource lock. Failed or unverified recovery must be reconciled
-before another experiment uses that resource.
+distributed AWS resource lock. Failed or unverified recovery latches a process-wide
+stop regardless of failure_policy. Reconcile the resource before starting a new
+process. Live automatic recovery cannot be disabled, and the configured delay
+between live experiments starts after the preceding experiment finishes recovery.
 
 RDS backup-retention changes and S3 lifecycle expiration are irreversible actions.
 They require both irreversible approvals and the LIVE-IRREVERSIBLE confirmation,
 and cannot claim automatic recovery. Restoring settings cannot recover backups
-or objects already deleted. EC2 termination creates no implicit snapshots of
-attached volumes. Arrange and approve any required backups separately before
-approving termination; the termination action authorizes only its selected
-instances and does not create persistent data copies.
+or objects already deleted. EC2 termination and EBS detach create no implicit
+snapshots. Arrange and approve any required backups separately before approving
+these actions; neither action creates persistent data copies.
 
 A recovery API attempt never counts as verified recovery. Automatic or managed
 recovery must set rollback_verified only after a state read proves the intended

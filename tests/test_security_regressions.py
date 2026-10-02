@@ -257,9 +257,12 @@ def test_worker_failure_sets_emergency_stop_before_scheduler_reaps():
     from types import SimpleNamespace
 
     orchestrator = object.__new__(framework.ChaosOrchestrator)
+    orchestrator.live = False
     stop = threading.Event()
     orchestrator.safety_controller = SimpleNamespace(emergency_stop_all=stop.set)
-    orchestrator._run_single_experiment = lambda _: SimpleNamespace(status="failed")
+    orchestrator._run_single_experiment = lambda _: SimpleNamespace(
+        status="failed", rollback_successful=None
+    )
     result = orchestrator._run_with_failure_policy({}, True)
     assert result.status == "failed"
     assert stop.is_set()

@@ -220,7 +220,126 @@ def test_staggered_same_queue_workers_restore_the_authoritative_pre_state():
     assert captures[0] == "0"
 
 
-@pytest.mark.parametrize("target", ["a", "ab", "abc", "test", "error"])
+def synthetic_live_suite(item, experiments, delay=0):
+    item.config = {
+        "global": {"account_id": ACCOUNT_ID, "region": REGION},
+        "safety": {"safety_alarms": ["synthetic-alarm"]},
+        "experiment_suites": {
+            "synthetic": {
+                "experiments": experiments,
+                "max_concurrent": 3,
+                "failure_policy": "continue",
+                "delay_between_experiments": delay,
+            }
+        },
+    }
+    item.expected_account = ACCOUNT_ID
+    item.approval_scope = {}
+    item.vpc_id = None
+    item.results = []
+    item._failed_future_count = 0
+    item._generate_report = lambda: None
+    item.confirmation = framework.confirmation_token(item.config, "synthetic", {})
+
+
+def test_failed_recovery_blocks_continue_policy_and_separate_orchestrators():
+    aws = FakeAWS(reject_writes=False)
+    state = aws.respond("sqs", "get_queue_attributes", {})
+    state["Attributes"]["DelaySeconds"] = "0"
+    original = aws.respond
+    writes = []
+
+    def model(service, operation, request):
+        if service == "sqs" and operation == "get_queue_attributes":
+            aws.calls.append((service, operation, request))
+            return copy.deepcopy(state)
+        if service == "sqs" and operation == "set_queue_attributes":
+            aws.calls.append((service, operation, request))
+            value = request["Attributes"]["DelaySeconds"]
+            writes.append(value)
+            if value == "0":
+                raise RuntimeError("Synthetic recovery failed before restoration")
+            state["Attributes"]["DelaySeconds"] = value
+            return {}
+        return original(service, operation, request)
+
+    aws.respond = model
+    configs = [
+        {
+            "type": "sqs_message_delay",
+            "queue_url": "https://sqs.us-gov-west-1.amazonaws.com/111122223333/synthetic",
+            "delay_seconds": value,
+            "auto_rollback": True,
+        }
+        for value in (5, 9)
+    ]
+    first = worker(aws)
+    synthetic_live_suite(first, configs)
+    assert not first.run_experiment_suite("synthetic")
+    assert writes == ["5", "0"]
+    assert state["Attributes"]["DelaySeconds"] == "5"
+    assert len(first.results) == 1
+    assert first.results[0].rollback_successful is False
+    assert first.safety_controller.emergency_stop.is_set()
+    second = worker(aws)
+    calls = list(aws.calls)
+    with pytest.raises(framework.SafetyViolation, match="blocked after unverified"):
+        second._run_single_experiment(configs[1])
+    assert aws.calls == calls
+    assert not second.active_experiments
+
+
+def test_disabled_live_automatic_recovery_is_rejected_before_sdk_calls():
+    aws = FakeAWS(reject_writes=False)
+    item = worker(aws)
+    calls = list(aws.calls)
+    with pytest.raises(framework.SafetyViolation, match="cannot be disabled"):
+        item._run_single_experiment(
+            {
+                "type": "sqs_message_delay",
+                "queue_url": "synthetic-queue",
+                "delay_seconds": 5,
+                "auto_rollback": False,
+            }
+        )
+    assert aws.calls == calls
+    assert not item.active_experiments
+
+
+def test_live_interexperiment_delay_starts_after_recovery_completes():
+    item = worker(FakeAWS())
+    configs = [
+        {
+            "type": "sqs_message_delay",
+            "queue_url": "synthetic-queue",
+            "delay_seconds": value,
+        }
+        for value in (5, 9)
+    ]
+    synthetic_live_suite(item, configs, delay=7)
+    trace = []
+
+    def run(config):
+        trace.append(f"recovered-{config['delay_seconds']}")
+        return framework.ExperimentResult(
+            "synthetic",
+            framework.ChaosType.SQS_MESSAGE_DELAY,
+            framework.utc_now(),
+            status="completed",
+            rollback_successful=True,
+        )
+
+    item._run_single_experiment = run
+    item.safety_controller.emergency_stop.wait = lambda seconds: (
+        trace.append(f"delay-{seconds}") or False
+    )
+    assert item.run_experiment_suite("synthetic")
+    assert trace == ["recovered-5", "delay-7", "recovered-9"]
+
+
+@pytest.mark.parametrize(
+    "target", ["a", "ab", "abc", "test", "error", "RESOURCE", "ARN"]
+)
 def test_short_targets_are_exactly_redacted_without_substring_corruption(target):
     with framework.sensitive_log_scope([target]):
         record = logging.LogRecord(
@@ -236,6 +355,22 @@ def test_short_targets_are_exactly_redacted_without_substring_corruption(target)
         assert f"'{target}'" not in text
         assert "target='[RESOURCE]'" in text
         assert "testing contest terrorism" in text
+
+
+@pytest.mark.parametrize("target", ["x", "test", "ARN", "RESOURCE"])
+def test_formatter_redacts_bracketed_names_without_rewriting_emitted_markers(target):
+    with framework.sensitive_log_scope([target]):
+        record = logging.LogRecord(
+            "synthetic",
+            logging.ERROR,
+            __file__,
+            1,
+            "targets=[%s] (%s); %s",
+            (target, target, BREAK_GLASS_ARN),
+            None,
+        )
+        text = framework.PrivacyFormatter("%(message)s").format(record)
+        assert text == "targets=[[RESOURCE]] ([RESOURCE]); [ARN]"
 
 
 def test_redaction_registry_is_bounded_and_scoped_across_runs_and_threads():

@@ -6,6 +6,8 @@
   refuse claims that deleted data was recovered.
 - Remove unapproved implicit EC2 termination snapshots and serialize complete live
   experiment lifecycles, including recovery.
+- Remove implicit EBS detach snapshots, block later live execution after any
+  unverified recovery, and reject disabled live automatic recovery.
 - Scope exact target redaction per run, escape console controls, and keep report
   identity filtering independent of resource disclosure.
 - Verify distributions with trusted workflow-source tools and bind the final

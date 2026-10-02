@@ -178,8 +178,9 @@ Reports and logs may still be operationally sensitive. Keep them out of source c
 
 Disclosure flags affect the typed run-identity and affected-resource fields.
 Errors and diagnostics remain filtered under every flag combination. Live
-experiments execute serially through recovery. Retention changes are irreversible,
-and EC2 termination does not create implicit backups. See
+experiments execute serially through recovery; unverified recovery blocks later
+live execution in the process. Retention changes are irreversible, and EC2
+termination and EBS detach do not create implicit backups. See
 [the security boundaries](docs/security-boundaries.md) before preparing approval.
 
 ## Testing and release assurance

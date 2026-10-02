@@ -84,6 +84,9 @@ MAX_SENSITIVE_LOG_VALUES = 4096
 # No live baseline capture may overlap another live mutation or recovery in this
 # process, even when callers use different orchestrators or target aliases.
 _LIVE_EXPERIMENT_LOCK = threading.RLock()
+# Recovery uncertainty persists across orchestrators. Only reconciliation and a
+# new process may permit another live baseline after this latch is set.
+_LIVE_RECOVERY_BLOCKED = threading.Event()
 
 
 class ConfigurationError(ValueError):
@@ -620,19 +623,27 @@ def redact_runtime_text(
     value: Any, protected_values: Iterable[str] | None = None
 ) -> str:
     """Redact common AWS identifiers and registered target values from text."""
-    text_value = str(value)
-    text_value = ARN_PATTERN.sub("[ARN]", text_value)
-    text_value = ACCESS_KEY_PATTERN.sub("[ACCESS_KEY]", text_value)
-    text_value = ACCOUNT_IN_TEXT_PATTERN.sub("[ACCOUNT]", text_value)
     protected = (
         _SENSITIVE_LOG_VALUES.get() if protected_values is None else protected_values
     )
-    for item in sorted(set(protected), key=len, reverse=True):
-        if item:
-            # Exact identifier boundaries retain words such as 'testing' when
-            # the target is 'test', and do not rewrite redaction placeholders.
-            pattern = rf"(?<![\w\[])({re.escape(item)})(?![\w\]])"
-            text_value = re.sub(pattern, "[RESOURCE]", text_value)
+    values = sorted({item for item in protected if item}, key=len, reverse=True)
+    alternatives = [
+        f"(?P<ARN>{ARN_PATTERN.pattern})",
+        f"(?P<ACCESS_KEY>{ACCESS_KEY_PATTERN.pattern})",
+        f"(?P<ACCOUNT>{ACCOUNT_IN_TEXT_PATTERN.pattern})",
+    ]
+    if values:
+        alternatives.append(
+            r"(?P<RESOURCE>(?<!\w)(?:"
+            + "|".join(re.escape(item) for item in values)
+            + r")(?!\w))"
+        )
+    # One pass protects only markers we emit. Raw bracketed names and marker-
+    # shaped target names remain eligible, while generated markers are never
+    # reprocessed by another target replacement.
+    text_value = re.sub(
+        "|".join(alternatives), lambda match: f"[{match.lastgroup}]", str(value)
+    )
     return safe_display(text_value)
 
 
@@ -1915,27 +1926,6 @@ class EBSChaosExperiment(ChaosExperiment):
                 time.sleep(wait_seconds)
         raise TimeoutError(f"Timed out waiting for EBS state {desired_state}")
 
-    def _wait_for_snapshot(self, snapshot_id: str) -> None:
-        """Wait cooperatively for a safety snapshot to complete."""
-        deadline = time.monotonic() + int(
-            self.config.get("snapshot_timeout_seconds", 3600)
-        )
-        while time.monotonic() < deadline:
-            snapshots = self.ec2.describe_snapshots(SnapshotIds=[snapshot_id]).get(
-                "Snapshots", []
-            )
-            if len(snapshots) != 1:
-                raise RuntimeError("EC2 did not return the safety snapshot")
-            state = snapshots[0].get("State")
-            if state == "completed":
-                return
-            if state == "error":
-                raise RuntimeError("The EBS safety snapshot failed")
-            wait_seconds = min(10.0, max(0.1, deadline - time.monotonic()))
-            if self.safety_controller.emergency_stop.wait(wait_seconds):
-                raise EmergencyStop("Emergency stop requested")
-        raise TimeoutError("Timed out waiting for the EBS safety snapshot")
-
     def _wait_for_iops(
         self, volume_id: str, expected_iops: int, interruptible: bool
     ) -> None:
@@ -1992,17 +1982,6 @@ class EBSChaosExperiment(ChaosExperiment):
                 self.volume_id = volume_id
 
                 if not self.dry_run:
-                    # Create snapshot before detaching
-                    snapshot = self.ec2.create_snapshot(
-                        VolumeId=volume_id,
-                        Description="Chaos experiment snapshot before detach",
-                    )
-                    snapshot_id = snapshot.get("SnapshotId")
-                    if not snapshot_id:
-                        raise RuntimeError("EC2 did not return a snapshot ID")
-                    self._wait_for_snapshot(snapshot_id)
-                    result.additional_info["safety_snapshot_id"] = snapshot_id
-
                     # Detach volume
                     self.ec2.detach_volume(VolumeId=volume_id)
                     self._wait_for_volume_state(volume_id, "available", True)
@@ -7480,7 +7459,12 @@ class ChaosOrchestrator:
                     continue
                 try:
                     experiment.run_rollback()
+                    if not experiment.rollback_verified or experiment.rollback_errors:
+                        _LIVE_RECOVERY_BLOCKED.set()
+                        self.safety_controller.emergency_stop_all()
                 except Exception as exc:
+                    _LIVE_RECOVERY_BLOCKED.set()
+                    self.safety_controller.emergency_stop_all()
                     logger.error("Error during cleanup rollback: %s", exc)
             self._cleanup_done = True
 
@@ -7726,6 +7710,7 @@ class ChaosOrchestrator:
                     scheduled += 1
                     if (
                         delay
+                        and not self.live
                         and next_index < len(experiment_configs)
                         and self.safety_controller.emergency_stop.wait(delay)
                     ):
@@ -7747,6 +7732,13 @@ class ChaosOrchestrator:
                     if failed and stop_on_failure:
                         logger.error("Suite failure policy requested an emergency stop")
                         self.safety_controller.emergency_stop_all()
+                if (
+                    self.live
+                    and delay
+                    and next_index < len(experiment_configs)
+                    and not self.safety_controller.emergency_stop.is_set()
+                ):
+                    self.safety_controller.emergency_stop.wait(delay)
 
         self.results.sort(key=lambda item: (item.start_time, item.experiment_id))
 
@@ -7984,7 +7976,10 @@ class ChaosOrchestrator:
             if stop_on_failure:
                 self.safety_controller.emergency_stop_all()
             raise
-        if stop_on_failure and result.status in {"failed", "aborted"}:
+        if self.live and result.rollback_successful is False:
+            _LIVE_RECOVERY_BLOCKED.set()
+            self.safety_controller.emergency_stop_all()
+        elif stop_on_failure and result.status in {"failed", "aborted"}:
             self.safety_controller.emergency_stop_all()
         return result
 
@@ -7995,7 +7990,29 @@ class ChaosOrchestrator:
         with sensitive_log_scope(getattr(self, "_log_sensitive_values", ())):
             if self.live:
                 with _LIVE_EXPERIMENT_LOCK:
-                    return self._run_single_experiment_locked(experiment_config)
+                    if _LIVE_RECOVERY_BLOCKED.is_set():
+                        raise SafetyViolation(
+                            "Live execution is blocked after unverified recovery; "
+                            "reconcile the resource and start a new process"
+                        )
+                    result = self._run_single_experiment_locked(experiment_config)
+                    metadata = experiment_metadata(result.experiment_type)
+                    if metadata.rollback in {"automatic", "managed"} and (
+                        result.rollback_successful is False
+                        or (
+                            result.mutation_attempts
+                            and result.rollback_successful is not True
+                        )
+                    ):
+                        _LIVE_RECOVERY_BLOCKED.set()
+                        self.safety_controller.emergency_stop_all()
+                        result.rollback_successful = False
+                        result.status = "failed"
+                        result.errors.append(
+                            "Unverified recovery blocks all later live experiments "
+                            "in this process"
+                        )
+                    return result
             return self._run_single_experiment_locked(experiment_config)
 
     def _run_single_experiment_locked(
@@ -8016,6 +8033,12 @@ class ChaosOrchestrator:
             self._report_sensitive_values.update(target_values)
         experiment_type = ChaosType(experiment_config["type"])
         metadata = experiment_metadata(experiment_type)
+        if (
+            self.live
+            and metadata.rollback == "automatic"
+            and not experiment_config.get("auto_rollback", True)
+        ):
+            raise SafetyViolation("Live automatic recovery cannot be disabled")
         self._validate_target_scope(experiment_type, experiment_config)
         if self.live:
             safe, violations = self.safety_controller.check_safety_conditions()

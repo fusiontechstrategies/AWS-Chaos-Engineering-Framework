@@ -1229,7 +1229,7 @@ def test_live_route_removal_restores_exact_route() -> None:
     assert create_call[2]["DestinationCidrBlock"] == "10.20.0.0/16"
 
 
-def test_live_ebs_detach_waits_for_snapshot_and_restores_attachment() -> None:
+def test_live_ebs_detach_creates_no_snapshot_and_restores_attachment() -> None:
     fake_aws = FakeAWS(reject_writes=False)
     initial_volume = fake_aws.respond("ec2", "describe_volumes", {})
     available_volume = {
@@ -1271,8 +1271,7 @@ def test_live_ebs_detach_waits_for_snapshot_and_restores_attachment() -> None:
 
     def respond(service: str, operation: str, request: dict[str, Any]) -> Any:
         if service == "ec2" and operation == "create_snapshot":
-            fake_aws.calls.append((service, operation, request))
-            return {"SnapshotId": "snap-0123456789abcdef0"}
+            raise AssertionError("An approved detach must not create data copies")
         return original_respond(service, operation, request)
 
     fake_aws.respond = respond  # type: ignore[method-assign]
@@ -1288,11 +1287,10 @@ def test_live_ebs_detach_waits_for_snapshot_and_restores_attachment() -> None:
     experiment.run_rollback()
 
     assert result.status == "completed"
-    assert result.additional_info["safety_snapshot_id"] == "snap-0123456789abcdef0"
+    assert "safety_snapshot_id" not in result.additional_info
     operation_names = [operation for _service, operation, _request in fake_aws.calls]
-    assert operation_names.index("create_snapshot") < operation_names.index(
-        "detach_volume"
-    )
+    assert "create_snapshot" not in operation_names
+    assert "detach_volume" in operation_names
     assert "attach_volume" in operation_names
     assert experiment.rollback_verified is True
 
