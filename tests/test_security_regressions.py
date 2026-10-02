@@ -764,5 +764,5 @@ def test_waf_rejected_or_ambiguous_forward_write_never_claims_address_ownership(
     assert item.mutation_operations == []
     assert item.rollback_attempts == []
     assert not item.rollback_verified
-    assert len([call for call in aws.calls if call[1] == "update_ip_set"]) == 1
+    assert item.mutation_attempts == ["wafv2.update_ip_set"]
     assert any("no cleanup is authorized" in error for error in result.rollback_errors)
