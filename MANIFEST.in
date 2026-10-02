@@ -13,5 +13,6 @@ include example-config.yaml
 include requirements.txt
 include requirements-dev.txt
 include requirements-build.txt
+include requirements-build-lock.txt
 recursive-include scripts *.py
 recursive-include tests *.py

@@ -443,6 +443,19 @@ REQUIRED_PARAMETERS: dict[ChaosType, tuple[str, ...]] = {
 
 TARGET_PARAMETER_KEYS = frozenset(
     {
+        "web_acl_name",
+        "rule_name",
+        "ip_set_name",
+        "route_table_id",
+        "destination_cidr",
+        "remote_domain_name",
+        "trigger_name",
+        "shard_to_merge",
+        "shard_to_split",
+        "adjacent_shard",
+        "image_ids",
+        "objects",
+        "prefix",
         "access_key_id",
         "branch_name",
         "bucket_name",
@@ -674,6 +687,11 @@ class AwsClientProxy:
 
         def invoke(*args: Any, **kwargs: Any) -> Any:
             if self._owner is not None:
+                if (
+                    not self._owner._in_rollback
+                    and self._owner.safety_controller.emergency_stop.is_set()
+                ):
+                    raise EmergencyStop("Emergency stop prevents further AWS mutations")
                 self._owner._record_mutation_attempt(f"{self._service}.{name}")
             response = attribute(*args, **kwargs)
             if self._owner is not None:
@@ -2019,11 +2037,20 @@ class EFSChaosExperiment(ChaosExperiment):
                     raise SafetyViolation(
                         "The selected EFS file system is not available"
                     )
-                self.original_throughput_mode = fs.get("ThroughputMode", "bursting")
-                self.original_provisioned_throughput = fs.get(
-                    "ProvisionedThroughputInMibps"
-                )
+                original_mode = fs.get("ThroughputMode", "bursting")
+                original_throughput = fs.get("ProvisionedThroughputInMibps")
+                if (
+                    original_mode != "provisioned"
+                    or throughput_mode != "provisioned"
+                    or not original_throughput
+                    or not 0 < provisioned_throughput < original_throughput
+                ):
+                    raise SafetyViolation(
+                        "EFS throttle requires a reduction in existing provisioned throughput"
+                    )
                 self.file_system_id = file_system_id
+                self.original_throughput_mode = original_mode
+                self.original_provisioned_throughput = original_throughput
                 if throughput_mode not in {"bursting", "provisioned", "elastic"}:
                     raise ConfigurationError("Unsupported EFS throughput mode")
                 if throughput_mode == self.original_throughput_mode and (
@@ -2145,6 +2172,7 @@ class VPCChaosExperiment(ChaosExperiment):
             )
             if associations["NetworkAcls"]:
                 self.original_nacl_id = associations["NetworkAcls"][0]["NetworkAclId"]
+                self.subnet_id = subnet_id
                 self.original_association_id = None
                 for assoc in associations["NetworkAcls"][0]["Associations"]:
                     if assoc["SubnetId"] == subnet_id:
@@ -2153,9 +2181,10 @@ class VPCChaosExperiment(ChaosExperiment):
 
                 if not self.dry_run and self.original_association_id:
                     # Replace NACL association
-                    self.ec2.replace_network_acl_association(
+                    response = self.ec2.replace_network_acl_association(
                         AssociationId=self.original_association_id, NetworkAclId=nacl_id
                     )
+                    self.current_association_id = response.get("NewAssociationId")
                     result.affected_resources = [subnet_id]
                     logger.info(f"Modified subnet {subnet_id} to use NACL {nacl_id}")
                 else:
@@ -2258,13 +2287,61 @@ class VPCChaosExperiment(ChaosExperiment):
 
         try:
             self.group_id = group_id
-            self.removed_rule = remove_rule
+            groups = self.ec2.describe_security_groups(GroupIds=[group_id]).get(
+                "SecurityGroups", []
+            )
+            if len(groups) != 1:
+                raise SafetyViolation("Security group pre-state is unavailable")
+
+            def permission_identity(value: Any) -> Any:
+                if isinstance(value, dict):
+                    return {
+                        key: permission_identity(item)
+                        for key, item in value.items()
+                        if key != "Description" and item != []
+                    }
+                if isinstance(value, list):
+                    return sorted(
+                        (permission_identity(item) for item in value),
+                        key=lambda item: json.dumps(item, sort_keys=True),
+                    )
+                if isinstance(value, str) and "/" in value:
+                    try:
+                        return str(ipaddress.ip_network(value, strict=False))
+                    except ValueError:
+                        pass
+                return value
+
+            wanted = permission_identity(remove_rule)
+            matches = [
+                rule
+                for rule in groups[0].get("IpPermissions", [])
+                if permission_identity(rule) == wanted
+            ]
+            if len(matches) != 1:
+                raise SafetyViolation(
+                    "The exact ingress rule is absent from security group pre-state"
+                )
+            actual_rule = copy.deepcopy(matches[0])
 
             if not self.dry_run:
-                # Remove the specified rule
-                self.ec2.revoke_security_group_ingress(
-                    GroupId=group_id, IpPermissions=[remove_rule]
-                )
+                try:
+                    response = self.ec2.revoke_security_group_ingress(
+                        GroupId=group_id, IpPermissions=[actual_rule]
+                    )
+                finally:
+                    remaining = self.ec2.describe_security_groups(
+                        GroupIds=[group_id]
+                    ).get("SecurityGroups", [])
+                    if len(remaining) == 1 and not any(
+                        permission_identity(rule) == wanted
+                        for rule in remaining[0].get("IpPermissions", [])
+                    ):
+                        self.removed_rule = actual_rule
+                if not hasattr(self, "removed_rule") or response.get(
+                    "UnknownIpPermissions"
+                ):
+                    raise SafetyViolation("Ingress revoke could not be verified")
                 result.affected_resources = [group_id]
                 logger.info(f"Removed rule from security group: {group_id}")
             else:
@@ -2434,11 +2511,40 @@ class VPCChaosExperiment(ChaosExperiment):
             if hasattr(self, "original_association_id") and hasattr(
                 self, "original_nacl_id"
             ):
-                # Restore original NACL association
+                associations = self.ec2.describe_network_acls(
+                    Filters=[
+                        {"Name": "association.subnet-id", "Values": [self.subnet_id]}
+                    ]
+                )["NetworkAcls"]
+                current_ids = [
+                    assoc["NetworkAclAssociationId"]
+                    for acl in associations
+                    for assoc in acl.get("Associations", [])
+                    if assoc.get("SubnetId") == self.subnet_id
+                ]
+                if len(current_ids) != 1:
+                    raise SafetyViolation(
+                        "Cannot uniquely resolve the current subnet NACL association"
+                    )
                 self.ec2.replace_network_acl_association(
-                    AssociationId=self.original_association_id,
+                    AssociationId=current_ids[0],
                     NetworkAclId=self.original_nacl_id,
                 )
+                restored = self.ec2.describe_network_acls(
+                    Filters=[
+                        {"Name": "association.subnet-id", "Values": [self.subnet_id]}
+                    ]
+                )["NetworkAcls"]
+                if not any(
+                    acl.get("NetworkAclId") == self.original_nacl_id
+                    and any(
+                        a.get("SubnetId") == self.subnet_id
+                        for a in acl.get("Associations", [])
+                    )
+                    for acl in restored
+                ):
+                    raise SafetyViolation("Subnet NACL rollback was not verified")
+                self.rollback_verified = True
                 logger.info("Restored original NACL association")
 
             if hasattr(self, "route_table_id") and hasattr(self, "destination_cidr"):
@@ -2891,7 +2997,21 @@ class LambdaChaosExperiment(ChaosExperiment):
             response = self.lambda_client.get_function_concurrency(
                 FunctionName=function_name
             )
-            self.original_concurrency = response.get("ReservedConcurrentExecutions")
+            original_concurrency = response.get("ReservedConcurrentExecutions")
+            if (
+                reserved_concurrent_executions < 0
+                or (
+                    original_concurrency is None and reserved_concurrent_executions != 0
+                )
+                or (
+                    original_concurrency is not None
+                    and reserved_concurrent_executions >= original_concurrency
+                )
+            ):
+                raise SafetyViolation(
+                    "Lambda throttle must reduce concurrency; unreserved functions may only be paused"
+                )
+            self.original_concurrency = original_concurrency
             self.function_name = function_name
 
             if not self.dry_run:
@@ -3910,18 +4030,23 @@ class ELBChaosExperiment(ChaosExperiment):
         )
 
         try:
-            targets = [{"Id": target_id} for target_id in target_ids]
             current = self.elbv2.describe_target_health(
                 TargetGroupArn=target_group_arn,
-                Targets=targets,
             ).get("TargetHealthDescriptions", [])
+            selected = [
+                item
+                for item in current
+                if item.get("Target", {}).get("Id") in target_ids
+            ]
+            current = selected
+            targets = [copy.deepcopy(item["Target"]) for item in selected]
             returned_ids = {str(item.get("Target", {}).get("Id")) for item in current}
             if returned_ids != set(target_ids):
                 raise ConfigurationError(
                     "The target group does not contain every selected target"
                 )
             # Store original targets for rollback
-            self.original_targets = target_ids
+            self.original_targets = targets
             self.target_group_arn = target_group_arn
 
             if not self.dry_run:
@@ -4106,10 +4231,23 @@ class ELBChaosExperiment(ChaosExperiment):
         try:
             if hasattr(self, "original_targets") and hasattr(self, "target_group_arn"):
                 # Re-register targets
-                targets = [{"Id": target_id} for target_id in self.original_targets]
+                targets = copy.deepcopy(self.original_targets)
                 self.elbv2.register_targets(
                     TargetGroupArn=self.target_group_arn, Targets=targets
                 )
+                restored = self.elbv2.describe_target_health(
+                    TargetGroupArn=self.target_group_arn, Targets=targets
+                ).get("TargetHealthDescriptions", [])
+                for target in targets:
+                    if not any(
+                        item.get("Target") == target
+                        and item.get("TargetHealth", {}).get("State") == "healthy"
+                        for item in restored
+                    ):
+                        raise SafetyViolation(
+                            "ELB target registration and health were not verified"
+                        )
+                self.rollback_verified = True
                 logger.info(f"Re-registered targets: {self.original_targets}")
 
             if hasattr(self, "original_attributes") and hasattr(
@@ -4170,7 +4308,29 @@ class ECSChaosExperiment(ChaosExperiment):
             services = response.get("services", [])
             if response.get("failures") or len(services) != 1:
                 raise RuntimeError("ECS did not return the selected service")
-            if services[0].get("desiredCount") == desired_count:
+            service_state = services[0]
+            unhealthy = any(
+                deployment.get("rolloutState") == "FAILED"
+                for deployment in service_state.get("deployments", [])
+            )
+            if unhealthy:
+                raise SafetyViolation("ECS service has a failed deployment")
+            if service_state.get("desiredCount") == desired_count and (
+                interruptible
+                or (
+                    service_state.get("runningCount") == desired_count
+                    and service_state.get("pendingCount") == 0
+                    and all(
+                        deployment.get("rolloutState") in {None, "COMPLETED"}
+                        for deployment in service_state.get("deployments", [])
+                    )
+                )
+            ):
+                if not interruptible:
+                    if len(service_state.get("deployments", [])) != 1:
+                        time.sleep(min(2, max(0.1, deadline - time.monotonic())))
+                        continue
+                    self.rollback_verified = True
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
@@ -4278,15 +4438,14 @@ class ECSChaosExperiment(ChaosExperiment):
             ):
                 raise ConfigurationError(f"ECS service not found: {service}")
             if service_info["services"]:
-                self.original_desired_count = service_info["services"][0][
-                    "desiredCount"
-                ]
+                original_desired_count = service_info["services"][0]["desiredCount"]
+                if desired_count < 0 or desired_count >= original_desired_count:
+                    raise SafetyViolation(
+                        "ECS throttle must reduce the current desired count"
+                    )
+                self.original_desired_count = original_desired_count
                 self.cluster = cluster
                 self.service = service
-                if desired_count == self.original_desired_count:
-                    raise ConfigurationError(
-                        "The requested ECS desired count matches the current count"
-                    )
 
                 if not self.dry_run:
                     self.ecs.update_service(
@@ -5105,6 +5264,10 @@ class WAFChaosExperiment(ChaosExperiment):
                     "The selected WAF rule uses OverrideAction and cannot use this experiment"
                 )
             if not self.dry_run:
+                self.changed_rule_name = rule_name
+                self.changed_rule_field = "Action"
+                self.original_rule_value = copy.deepcopy(matching_rule["Action"])
+                self.changed_rule_value = {action_key: {}}
                 matching_rule["Action"] = {action_key: {}}
                 self._web_acl_update(web_acl, lock_token)
                 result.affected_resources = [web_acl_id]
@@ -5159,6 +5322,10 @@ class WAFChaosExperiment(ChaosExperiment):
             if not isinstance(rate_statement, dict):
                 raise ConfigurationError("The selected WAF rule is not rate based")
             if not self.dry_run:
+                self.changed_rule_name = rule_name
+                self.changed_rule_field = "RateBasedStatement.Limit"
+                self.original_rule_value = rate_statement["Limit"]
+                self.changed_rule_value = limit
                 rate_statement["Limit"] = limit
                 self._web_acl_update(web_acl, lock_token)
             result.affected_resources = [web_acl_id]
@@ -5242,15 +5409,37 @@ class WAFChaosExperiment(ChaosExperiment):
     def rollback(self):
         """Rollback WAF experiments"""
         try:
-            if hasattr(self, "original_web_acl") and hasattr(self, "web_acl_id"):
+            if hasattr(self, "changed_rule_name") and hasattr(self, "web_acl_id"):
                 response = self.wafv2.get_web_acl(
                     Scope=self.web_acl_scope,
                     Name=self.web_acl_name,
                     Id=self.web_acl_id,
                 )
-                self._web_acl_update(
-                    copy.deepcopy(self.original_web_acl), response["LockToken"]
-                )
+                current_acl = copy.deepcopy(response["WebACL"])
+                matches = [
+                    rule
+                    for rule in current_acl.get("Rules", [])
+                    if rule.get("Name") == self.changed_rule_name
+                ]
+                if len(matches) != 1:
+                    raise SafetyViolation("WAF rollback rule was removed or duplicated")
+                container = matches[0]
+                field = "Action"
+                if self.changed_rule_field == "RateBasedStatement.Limit":
+                    container = container.get("Statement", {}).get(
+                        "RateBasedStatement", {}
+                    )
+                    field = "Limit"
+                if container.get(field) not in (
+                    self.original_rule_value,
+                    self.changed_rule_value,
+                ):
+                    raise SafetyViolation(
+                        "WAF rollback conflicts with a concurrent change"
+                    )
+                if container.get(field) != self.original_rule_value:
+                    container[field] = copy.deepcopy(self.original_rule_value)
+                    self._web_acl_update(current_acl, response["LockToken"])
                 logger.info("Restored original WebACL configuration")
 
             if hasattr(self, "original_addresses") and hasattr(self, "ip_set_id"):
@@ -6293,10 +6482,49 @@ class FISTemplateExperiment(ChaosExperiment):
         safety = self.safety_controller.config
         live = not self.dry_run
         stop_conditions = template.get("stopConditions", [])
-        has_alarm_stop = any(
-            item.get("source") == "aws:cloudwatch:alarm" and item.get("value")
-            for item in stop_conditions
-        )
+        has_alarm_stop = False
+        for item in stop_conditions:
+            arn = str(item.get("value", ""))
+            prefix = f"arn:{'aws-us-gov' if self.region in GOVCLOUD_REGIONS else 'aws'}:cloudwatch:{self.region}:{self.config.get('account_id', '')}:alarm:"
+            if (
+                item.get("source") != "aws:cloudwatch:alarm"
+                or not arn.startswith(prefix)
+                or not arn[len(prefix) :]
+            ):
+                continue
+            if not live:
+                has_alarm_stop = True
+                continue
+            if arn[len(prefix) :] not in safety.get("safety_alarms", []):
+                continue
+            alarms = self.client("cloudwatch").describe_alarms(
+                AlarmNames=[arn[len(prefix) :]]
+            )
+            candidates = alarms.get("MetricAlarms", []) + alarms.get(
+                "CompositeAlarms", []
+            )
+            if any(
+                alarm.get("AlarmArn") == arn and alarm.get("StateValue") == "OK"
+                for alarm in candidates
+            ):
+                has_alarm_stop = True
+        if live:
+            actions = template.get("actions", {})
+            if not actions:
+                violations.append("FIS template contains no reviewed actions")
+            for action in actions.values():
+                action_id = action.get("actionId")
+                parameters = action.get("parameters", {})
+                if action_id == "aws:ec2:reboot-instances":
+                    continue
+                duration = str(parameters.get("startInstancesAfterDuration", ""))
+                if action_id == "aws:ec2:stop-instances" and re.fullmatch(
+                    r"PT(?:[1-9]|[1-5][0-9])M", duration
+                ):
+                    continue
+                violations.append(
+                    f"FIS action {action_id!r} lacks reviewed automatic recovery; live execution is disabled"
+                )
         if (
             live
             and not has_alarm_stop
@@ -6327,11 +6555,22 @@ class FISTemplateExperiment(ChaosExperiment):
         )
         required_tags = safety.get("required_target_tags", {"ChaosReady": "true"})
         allowlist = set(str(item) for item in safety.get("target_allowlist", []))
+        total_targets = 0
         for target_name, target in template.get("targets", {}).items():
             selection = str(target.get("selectionMode", ""))
             match = re.fullmatch(r"COUNT\(([0-9]+)\)", selection)
             percent_match = re.fullmatch(r"PERCENT\(([0-9]+)\)", selection)
             resource_arns = [str(item) for item in target.get("resourceArns", [])]
+            if match:
+                total_targets += (
+                    min(int(match.group(1)), len(resource_arns))
+                    if resource_arns
+                    else int(match.group(1))
+                )
+            elif resource_arns:
+                total_targets += len(resource_arns)
+            else:
+                total_targets += max_blast_radius + 1
             explicitly_bounded = (
                 bool(resource_arns) and len(resource_arns) <= max_blast_radius
             )
@@ -6361,6 +6600,21 @@ class FISTemplateExperiment(ChaosExperiment):
                     violations.append(
                         f"FIS target {target_name} contains ARNs not in target_allowlist"
                     )
+                prefix = f"arn:{expected_partition}:ec2:{self.region}:{expected_account}:instance/"
+                if any(
+                    not arn.startswith(prefix)
+                    or not re.fullmatch(
+                        r"i-[0-9a-f]{8}(?:[0-9a-f]{9})?", arn[len(prefix) :]
+                    )
+                    for arn in resource_arns
+                ):
+                    violations.append(
+                        "Reviewed FIS actions require exact local EC2 instance ARNs"
+                    )
+            elif live:
+                violations.append(
+                    "Live FIS recovery verification requires explicit instance ARNs"
+                )
 
             resource_tags = target.get("resourceTags", {})
             if live and not resource_arns and required_tags:
@@ -6373,6 +6627,8 @@ class FISTemplateExperiment(ChaosExperiment):
                     violations.append(
                         f"FIS target {target_name} is missing required target tags"
                     )
+        if total_targets > max_blast_radius:
+            violations.append("FIS template aggregate targets exceed max_blast_radius")
         return violations
 
     def run_template(self, experiment_template_id: str) -> ExperimentResult:
@@ -6405,12 +6661,42 @@ class FISTemplateExperiment(ChaosExperiment):
             if self.dry_run:
                 result.status = "planned"
                 return result
-
-            started = self.fis.start_experiment(
-                clientToken=str(uuid.uuid4()),
-                experimentTemplateId=experiment_template_id,
-                tags={"StartedBy": TOOL_NAME, "FrameworkVersion": __version__},
+            self.recovery_instance_ids = sorted(
+                {
+                    arn.rsplit("/", 1)[1]
+                    for target in template.get("targets", {}).values()
+                    for arn in target.get("resourceArns", [])
+                }
             )
+            instances = self.client("ec2").describe_instances(
+                InstanceIds=self.recovery_instance_ids
+            )
+            states = {
+                instance["InstanceId"]: instance.get("State", {}).get("Name")
+                for reservation in instances.get("Reservations", [])
+                for instance in reservation.get("Instances", [])
+            }
+            if set(states) != set(self.recovery_instance_ids) or any(
+                state != "running" for state in states.values()
+            ):
+                raise SafetyViolation(
+                    "FIS pre-state must contain all selected running instances"
+                )
+            latest = self.fis.get_experiment_template(id=experiment_template_id).get(
+                "experimentTemplate"
+            )
+            if latest != template:
+                raise SafetyViolation("FIS template changed after validation")
+            start_request = {
+                "clientToken": str(uuid.uuid4()),
+                "experimentTemplateId": experiment_template_id,
+                "tags": {"StartedBy": TOOL_NAME, "FrameworkVersion": __version__},
+            }
+            try:
+                started = self.fis.start_experiment(**start_request)
+            except Exception:
+                # The identical token reconciles a lost response without creating a second experiment.
+                started = self.fis.start_experiment(**start_request)
             experiment = started.get("experiment", {})
             self.fis_experiment_id = experiment.get("id")
             if not self.fis_experiment_id:
@@ -6460,6 +6746,10 @@ class FISTemplateExperiment(ChaosExperiment):
     def rollback(self) -> None:
         """Stop an active FIS experiment. FIS manages action recovery."""
         if not self.fis_experiment_id:
+            if self.mutation_attempts:
+                raise SafetyViolation(
+                    "FIS start outcome is unknown; operator reconciliation is required"
+                )
             return
         response = self.fis.get_experiment(id=self.fis_experiment_id)
         status = response.get("experiment", {}).get("state", {}).get("status")
@@ -6472,13 +6762,28 @@ class FISTemplateExperiment(ChaosExperiment):
                 response = self.fis.get_experiment(id=self.fis_experiment_id)
                 status = response.get("experiment", {}).get("state", {}).get("status")
                 if status in self.TERMINAL_STATES:
-                    return
+                    break
                 time.sleep(min(2, max(0.1, deadline - time.monotonic())))
-            raise RuntimeError("Timed out waiting for the FIS experiment to stop")
+            if status not in self.TERMINAL_STATES:
+                raise RuntimeError("Timed out waiting for the FIS experiment to stop")
         if status not in self.TERMINAL_STATES:
             raise RuntimeError(
                 f"AWS FIS returned an unknown experiment status: {status}"
             )
+        ids = getattr(self, "recovery_instance_ids", [])
+        if not ids:
+            raise SafetyViolation("FIS resource recovery cannot be verified")
+        response = self.client("ec2").describe_instances(InstanceIds=ids)
+        states = {
+            instance["InstanceId"]: instance.get("State", {}).get("Name")
+            for reservation in response.get("Reservations", [])
+            for instance in reservation.get("Instances", [])
+        }
+        if set(states) != set(ids) or any(
+            state != "running" for state in states.values()
+        ):
+            raise SafetyViolation("FIS resource recovery is not yet verified")
+        self.rollback_verified = True
 
 
 class ChaosOrchestrator:
@@ -7014,9 +7319,25 @@ class ChaosOrchestrator:
             if isinstance(value, str) and value:
                 targets.add(value)
             elif isinstance(value, list):
-                targets.update(
-                    str(item) for item in value if isinstance(item, str) and item
-                )
+                for item in value:
+                    if isinstance(item, str) and item:
+                        targets.add(item)
+                    elif isinstance(item, dict):
+                        for child_key, child_value in item.items():
+                            if child_key not in {
+                                "Key",
+                                "VersionId",
+                                "imageTag",
+                                "imageDigest",
+                            }:
+                                raise SafetyViolation(
+                                    "Unsupported nested target selector"
+                                )
+                            if not isinstance(child_value, str) or not child_value:
+                                raise SafetyViolation("Invalid nested target selector")
+                            targets.add(child_value)
+                    else:
+                        raise SafetyViolation("Invalid target selector")
         return targets
 
     @staticmethod
@@ -7114,7 +7435,7 @@ class ChaosOrchestrator:
         if experiment.rollback_errors:
             return False
         return not (
-            metadata.rollback == "automatic"
+            metadata.rollback in {"automatic", "managed"}
             and not experiment.rollback_attempts
             and not experiment.rollback_verified
         )
@@ -7858,7 +8179,13 @@ class ChaosOrchestrator:
             if include_resource_ids:
                 return sanitized
             if isinstance(sanitized, dict):
-                return {str(key): redact(item) for key, item in sanitized.items()}
+                redacted_mapping = {}
+                for index, (key, item) in enumerate(sanitized.items()):
+                    safe_key = redact(str(key))
+                    if safe_key in redacted_mapping:
+                        safe_key = f"{safe_key}_{index}"
+                    redacted_mapping[safe_key] = redact(item)
+                return redacted_mapping
             if isinstance(sanitized, list):
                 return [redact(item) for item in sanitized]
             if isinstance(sanitized, tuple):

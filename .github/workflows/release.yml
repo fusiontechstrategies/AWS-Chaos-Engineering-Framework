@@ -67,7 +67,7 @@ jobs:
 
       - name: Install pinned build tools and runtime dependencies
         run: |
-          python -m pip install --disable-pip-version-check -r requirements-build.txt
+          python -m pip install --disable-pip-version-check --require-hashes -r requirements-build-lock.txt
           python -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Build exact release assets
