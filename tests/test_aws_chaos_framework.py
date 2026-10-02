@@ -1051,7 +1051,7 @@ def test_evidence_report_redacts_identity_and_targets_by_default(
     tmp_path: Path,
 ) -> None:
     orchestrator = object.__new__(framework.ChaosOrchestrator)
-    orchestrator.config = {"reporting": {}}
+    orchestrator.config = {"reporting": {"include_diagnostics": True}}
     orchestrator.results = [
         framework.ExperimentResult(
             experiment_id="test-result",
@@ -1061,6 +1061,13 @@ def test_evidence_report_redacts_identity_and_targets_by_default(
             status="planned",
             affected_resources=[INSTANCE_ID],
             errors=[f"target {INSTANCE_ID} in account {ACCOUNT_ID}"],
+            additional_info={
+                "snapshot_id": "snap-derived-not-configured",
+                "writer_endpoint": "derived-database.internal.invalid",
+                "invalidation_id": "DERIVEDCF123",
+            },
+            metrics_before={"endpoint": "metrics-db.internal.invalid"},
+            metrics_after={"members": ["metrics-derived-reader"]},
         )
     ]
     orchestrator.run_id = "offline-test-run"
@@ -1085,6 +1092,14 @@ def test_evidence_report_redacts_identity_and_targets_by_default(
     assert INSTANCE_ID not in report_text
     assert ACCOUNT_ID not in report_text
     assert BREAK_GLASS_ARN not in report_text
+    for derived in (
+        "snap-derived-not-configured",
+        "derived-database.internal.invalid",
+        "DERIVEDCF123",
+        "metrics-db.internal.invalid",
+        "metrics-derived-reader",
+    ):
+        assert derived not in report_text
     assert "affected_resources" not in report["experiments"][0]
     assert report["experiments"][0]["affected_resource_count"] == 1
 
@@ -1153,6 +1168,16 @@ def test_configuration_rejects_gated_action() -> None:
 
 def test_live_s3_policy_preserves_policy_and_rolls_back_exactly() -> None:
     fake_aws = FakeAWS(reject_writes=False)
+    respond = fake_aws.respond
+
+    def current_policy(service, operation, request):
+        writes = [call for call in fake_aws.calls if call[1] == "put_bucket_policy"]
+        if operation == "get_bucket_policy" and writes:
+            fake_aws.calls.append((service, operation, request))
+            return {"Policy": writes[-1][2]["Policy"]}
+        return respond(service, operation, request)
+
+    fake_aws.respond = current_policy
     action_config = action_configs()[framework.ChaosType.S3_BUCKET_POLICY_DENY]
     experiment = make_experiment(
         framework.ChaosType.S3_BUCKET_POLICY_DENY,
@@ -1173,7 +1198,7 @@ def test_live_s3_policy_preserves_policy_and_rolls_back_exactly() -> None:
         item for item in applied["Statement"] if item.get("Sid") == "ChaosFrameworkDeny"
     )
     assert deny["Condition"]["ArnNotEquals"]["aws:PrincipalArn"] == BREAK_GLASS_ARN
-    assert writes[1][2]["Policy"] == experiment.original_policy
+    assert json.loads(writes[1][2]["Policy"]) == json.loads(experiment.original_policy)
     assert experiment.mutation_attempts == ["s3.put_bucket_policy"]
     assert experiment.rollback_attempts == ["s3.put_bucket_policy"]
 
@@ -1297,6 +1322,7 @@ def test_live_efs_throughput_waits_and_restores_original_mode() -> None:
     }
     fake_aws.read_overrides[("efs", "describe_file_systems")] = [
         initial,
+        changed,
         changed,
         restored,
     ]

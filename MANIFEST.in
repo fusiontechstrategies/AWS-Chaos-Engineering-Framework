@@ -14,5 +14,7 @@ include requirements.txt
 include requirements-dev.txt
 include requirements-build.txt
 include requirements-build-lock.txt
+include requirements-runtime-lock.txt
+include docs/security-boundaries.md
 recursive-include scripts *.py
 recursive-include tests *.py
