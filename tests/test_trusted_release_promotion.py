@@ -28,7 +28,7 @@ class TrustedPromotionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fixture = tempfile.TemporaryDirectory()
-        cls.directory = Path(cls.fixture.name)
+        cls.directory = Path(cls.fixture.name).resolve()
         cls.source = cls.directory / "source"
         cls.source.mkdir()
         # Archive the immutable checkout commit, available even in depth-one CI.
@@ -361,7 +361,7 @@ class TrustedPromotionTests(unittest.TestCase):
 
     def test_oversized_notes_are_rejected_before_creation(self):
         with tempfile.TemporaryDirectory() as directory:
-            notes = Path(directory) / "notes.md"
+            notes = Path(directory).resolve() / "notes.md"
             notes.write_bytes(b"a" * (1024 * 1024 + 1))
             with (
                 patch.object(draft, "load_integrity", return_value=MagicMock()),
@@ -380,7 +380,7 @@ class TrustedPromotionTests(unittest.TestCase):
 
     def test_symlinked_notes_ancestor_is_rejected_before_creation(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             target = root / "target"
             target.mkdir()
             (target / "notes.md").write_text("Reviewed notes", encoding="utf-8")
