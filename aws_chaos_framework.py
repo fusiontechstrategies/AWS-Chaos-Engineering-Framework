@@ -368,9 +368,45 @@ FIS_PREFERRED_EXPERIMENTS = frozenset(
     }
 )
 
+CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
+    {
+        ChaosType.VPC_NACL_BLOCK_TRAFFIC,
+        ChaosType.SQS_QUEUE_POLICY_RESTRICT,
+        ChaosType.SQS_MESSAGE_DELAY,
+        ChaosType.SQS_VISIBILITY_TIMEOUT,
+        ChaosType.KMS_KEY_DISABLE,
+        ChaosType.KMS_KEY_POLICY_RESTRICT,
+        ChaosType.IAM_POLICY_DETACH,
+        ChaosType.IAM_ROLE_MODIFY,
+        ChaosType.IAM_USER_ACCESS_KEY_DEACTIVATE,
+        ChaosType.ECR_REPOSITORY_POLICY_RESTRICT,
+        ChaosType.CODECOMMIT_TRIGGER_DELETE,
+    }
+)
+# These APIs have no conditional ownership/revision argument. A local lock or
+# reread cannot distinguish another principal's identical change or close the
+# read/write race. Keep planning, but do not create a fault requiring this recovery.
+CONCURRENCY_UNSAFE_MUTATIONS = frozenset(
+    {
+        "ec2.create_network_acl_entry",
+        "ec2.delete_network_acl_entry",
+        "sqs.set_queue_attributes",
+        "kms.disable_key",
+        "kms.enable_key",
+        "kms.put_key_policy",
+        "iam.detach_role_policy",
+        "iam.attach_role_policy",
+        "iam.update_role",
+        "iam.update_access_key",
+        "ecr.set_repository_policy",
+        "ecr.delete_repository_policy",
+        "codecommit.put_repository_triggers",
+    }
+)
+
 REQUIRED_PARAMETERS: dict[ChaosType, tuple[str, ...]] = {
     ChaosType.FIS_TEMPLATE: ("experiment_template_id",),
-    ChaosType.EC2_TERMINATE: ("instance_ids",),
+    ChaosType.EC2_TERMINATE: ("instance_ids", "delete_on_termination_volumes"),
     ChaosType.EC2_STOP: ("instance_ids",),
     ChaosType.EC2_REBOOT: ("instance_ids",),
     ChaosType.EC2_NETWORK_LATENCY: ("instance_ids",),
@@ -379,7 +415,7 @@ REQUIRED_PARAMETERS: dict[ChaosType, tuple[str, ...]] = {
     ChaosType.EC2_MEMORY_STRESS: ("instance_ids",),
     ChaosType.EC2_DISK_STRESS: ("instance_ids",),
     ChaosType.EC2_DISK_FILL: ("instance_ids",),
-    ChaosType.EBS_DETACH_VOLUME: ("volume_id",),
+    ChaosType.EBS_DETACH_VOLUME: ("volume_id", "attachment"),
     ChaosType.EBS_THROTTLE_IOPS: ("volume_id",),
     ChaosType.EFS_MOUNT_TARGET_DELETE: ("mount_target_id",),
     ChaosType.EFS_THROTTLE_THROUGHPUT: ("file_system_id",),
@@ -547,6 +583,8 @@ def experiment_metadata(experiment_type: ChaosType) -> ExperimentMetadata:
         return ExperimentMetadata("fis-template", risk, False, "managed", True)
     if experiment_type in UNSUPPORTED_EXPERIMENTS:
         return ExperimentMetadata("extension", RiskLevel.HIGH, False, "none")
+    if experiment_type in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS:
+        return ExperimentMetadata("extension", RiskLevel.HIGH, False, "none")
     risk = RiskLevel.MEDIUM
     rollback = "automatic"
     if experiment_type in IRREVERSIBLE_EXPERIMENTS:
@@ -567,6 +605,60 @@ def experiment_metadata(experiment_type: ChaosType) -> ExperimentMetadata:
         rollback,
         experiment_type in FIS_PREFERRED_EXPERIMENTS,
     )
+
+
+def derived_target_scope(
+    experiment_type: ChaosType, config: dict[str, Any]
+) -> set[str]:
+    """Validate the explicit, digest-bound child resources and attachment tuple."""
+    if experiment_type == ChaosType.EC2_TERMINATE:
+        expected = config.get("delete_on_termination_volumes")
+        instances = config.get("instance_ids")
+        if (
+            not isinstance(instances, list)
+            or not instances
+            or not isinstance(expected, dict)
+            or set(expected) != set(instances)
+        ):
+            raise ConfigurationError(
+                "EC2 termination needs an exact delete_on_termination_volumes mapping for every instance"
+            )
+        volumes: list[str] = []
+        for instance, children in expected.items():
+            if (
+                not isinstance(instance, str)
+                or not re.fullmatch(r"i-[0-9a-f]{8,17}", instance)
+                or not isinstance(children, list)
+            ):
+                raise ConfigurationError("Invalid EC2 derived resource approval")
+            if any(
+                not isinstance(child, str)
+                or not re.fullmatch(r"vol-[0-9a-f]{8,17}", child)
+                for child in children
+            ):
+                raise ConfigurationError(
+                    "Invalid EC2 DeleteOnTermination volume approval"
+                )
+            volumes.extend(children)
+        if len(volumes) != len(set(volumes)):
+            raise ConfigurationError("EC2 derived volume approvals must be unique")
+        return set(volumes)
+    if experiment_type == ChaosType.EBS_DETACH_VOLUME:
+        expected = config.get("attachment")
+        if not isinstance(expected, dict) or set(expected) != {"instance_id", "device"}:
+            raise ConfigurationError(
+                "EBS detach needs the exact approved instance/device attachment"
+            )
+        instance, device = expected["instance_id"], expected["device"]
+        if (
+            not isinstance(instance, str)
+            or not re.fullmatch(r"i-[0-9a-f]{8,17}", instance)
+            or not isinstance(device, str)
+            or not re.fullmatch(r"/dev/[A-Za-z0-9_./-]{1,100}", device)
+        ):
+            raise ConfigurationError("Invalid approved EBS attachment tuple")
+        return {instance, f"attachment:{instance}:{device}"}
+    return set()
 
 
 def utc_now() -> datetime:
@@ -668,8 +760,41 @@ class PrivacyFormatter(logging.Formatter):
         return redact_runtime_text(super().format(record))
 
 
+class StrictConfigLoader(yaml.SafeLoader):
+    """Reject ambiguous configuration mappings and alias/merge expansion."""
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            event = self.peek_event()
+            raise yaml.constructor.ConstructorError(
+                None, None, "Configuration aliases are forbidden", event.start_mark
+            )
+        return super().compose_node(parent, index)
+
+    def construct_mapping(self, node: Any, deep: bool = False) -> dict[str, Any]:
+        mapping: dict[str, Any] = {}
+        for key_node, value_node in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                raise yaml.constructor.ConstructorError(
+                    None,
+                    None,
+                    "Configuration merge keys are forbidden",
+                    key_node.start_mark,
+                )
+            key = self.construct_object(key_node, deep=deep)
+            if not isinstance(key, str) or key in mapping:
+                raise yaml.constructor.ConstructorError(
+                    None,
+                    None,
+                    "Ambiguous configuration mapping key",
+                    key_node.start_mark,
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
+
+
 def load_yaml_config(config_file: str) -> dict[str, Any]:
-    """Load a bounded YAML mapping with PyYAML's safe loader."""
+    """Load one bounded, unambiguous YAML mapping without source diagnostics."""
     path = Path(config_file).expanduser().resolve()
     if not path.is_file():
         raise ConfigurationError(f"Configuration file not found: {path}")
@@ -679,11 +804,22 @@ def load_yaml_config(config_file: str) -> dict[str, Any]:
             f"Configuration file is {size} bytes; maximum is {MAX_CONFIG_BYTES}."
         )
     try:
-        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        loader = StrictConfigLoader(path.read_text(encoding="utf-8"))
+        try:
+            config = loader.get_single_data()
+        finally:
+            loader.dispose()
     except UnicodeDecodeError as exc:
         raise ConfigurationError("Configuration must be UTF-8 encoded.") from exc
     except yaml.YAMLError as exc:
-        raise ConfigurationError(f"Invalid YAML: {exc}") from exc
+        mark = getattr(exc, "problem_mark", None)
+        location = (
+            f" at line {mark.line + 1}, column {mark.column + 1}"
+            if mark is not None
+            else ""
+        )
+        # Never include the exception, problem text, context, or Mark.buffer.
+        raise ConfigurationError(f"Invalid YAML configuration{location}.") from None
     if not isinstance(config, dict):
         raise ConfigurationError("Configuration root must be a mapping.")
     return config
@@ -739,6 +875,14 @@ class AwsClientProxy:
 
         def invoke(*args: Any, **kwargs: Any) -> Any:
             if self._owner is not None:
+                if (
+                    not self._owner.dry_run
+                    and f"{self._service}.{name}" in CONCURRENCY_UNSAFE_MUTATIONS
+                ):
+                    raise SafetyViolation(
+                        "Live mutation is disabled: AWS provides no conditional ownership proof for safe concurrent recovery"
+                    )
+                self._owner._check_forward_safety()
                 if (
                     not self._owner._in_rollback
                     and self._owner.safety_controller.emergency_stop.is_set()
@@ -1277,6 +1421,55 @@ class ChaosExperiment:
         """Collect metrics before/after experiment"""
         return {}
 
+    def _check_forward_safety(self) -> None:
+        """Poll all configured guards during forward work; recovery is exempt."""
+        if self.dry_run or self._in_rollback:
+            return
+        if self.safety_controller.emergency_stop.is_set():
+            raise EmergencyStop("Emergency stop requested")
+        try:
+            safe, violations = self.safety_controller.check_safety_conditions()
+        except Exception:
+            self.safety_controller.emergency_stop_all()
+            raise EmergencyStop("Runtime safety evaluation failed") from None
+        if not safe:
+            self.safety_controller.emergency_stop_all()
+            raise EmergencyStop("Runtime safety check failed: " + "; ".join(violations))
+
+    def _wait_forward(self, seconds: float) -> None:
+        """Wake and poll no later than the configured monitor interval."""
+        interval = max(
+            1, int(self.safety_controller.config.get("monitor_interval_seconds", 15))
+        )
+        deadline = time.monotonic() + seconds
+        self._check_forward_safety()
+        while time.monotonic() < deadline:
+            if self.safety_controller.emergency_stop.wait(
+                min(interval, deadline - time.monotonic())
+            ):
+                raise EmergencyStop("Emergency stop requested")
+            self._check_forward_safety()
+
+    def _require_derived_scope(
+        self, kind: ChaosType, config: dict[str, Any]
+    ) -> set[str]:
+        """Require child IDs and tuple approval even for direct class callers."""
+        targets = ChaosOrchestrator._target_values({"type": kind.value, **config})
+        if not self.dry_run:
+            safety = self.safety_controller.config
+            if targets - set(safety.get("target_allowlist", [])):
+                raise SafetyViolation(
+                    "Derived resources are absent from the exact target allowlist"
+                )
+            if ChaosOrchestrator._blast_radius(kind, config) > int(
+                safety.get("max_blast_radius", 1)
+            ):
+                raise SafetyViolation("Derived resources exceed max_blast_radius")
+            for pattern in safety.get("denied_target_patterns", []):
+                if any(re.search(str(pattern), target) for target in targets):
+                    raise SafetyViolation("A derived target matches a denied pattern")
+        return targets
+
 
 class EC2ChaosExperiment(ChaosExperiment):
     """EC2-based chaos experiments"""
@@ -1287,14 +1480,51 @@ class EC2ChaosExperiment(ChaosExperiment):
         self.ssm = self.client("ssm")
         self.cloudwatch = self.client("cloudwatch")
 
-    def _instance_states(self, instance_ids: list[str]) -> dict[str, str]:
-        """Return current state for every selected instance."""
+    def _instance_details(self, instance_ids: list[str]) -> list[dict[str, Any]]:
+        """Require an exact, nonduplicated response for the requested instances."""
         response = self.ec2.describe_instances(InstanceIds=instance_ids)
-        return {
-            instance["InstanceId"]: instance["State"]["Name"]
+        instances = [
+            instance
             for reservation in response.get("Reservations", [])
             for instance in reservation.get("Instances", [])
+        ]
+        if len(instances) != len(instance_ids) or {
+            item.get("InstanceId") for item in instances
+        } != set(instance_ids):
+            raise SafetyViolation("EC2 did not return the exact selected instance set")
+        return instances
+
+    def _instance_states(self, instance_ids: list[str]) -> dict[str, str]:
+        """Return current state for every selected instance."""
+        return {
+            instance["InstanceId"]: instance["State"]["Name"]
+            for instance in self._instance_details(instance_ids)
         }
+
+    def _termination_children(self, instance_ids: list[str]) -> dict[str, list[str]]:
+        """Read the exact deletion relationships immediately before termination."""
+        children: dict[str, list[str]] = {}
+        for instance in self._instance_details(instance_ids):
+            mappings = instance.get("BlockDeviceMappings")
+            if not isinstance(mappings, list):
+                raise SafetyViolation(
+                    "EC2 did not return complete block-device mappings"
+                )
+            volumes = []
+            for mapping in mappings:
+                ebs = mapping.get("Ebs")
+                if ebs is None:
+                    continue
+                if not isinstance(ebs.get("DeleteOnTermination"), bool) or not ebs.get(
+                    "VolumeId"
+                ):
+                    raise SafetyViolation(
+                        "EC2 returned an incomplete EBS deletion relationship"
+                    )
+                if ebs["DeleteOnTermination"]:
+                    volumes.append(ebs["VolumeId"])
+            children[instance["InstanceId"]] = sorted(volumes)
+        return children
 
     def _wait_for_instance_state(
         self,
@@ -1306,6 +1536,8 @@ class EC2ChaosExperiment(ChaosExperiment):
         timeout_seconds = int(self.config.get("state_timeout_seconds", 600))
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             states = self._instance_states(instance_ids)
             if set(states) != set(instance_ids):
                 raise RuntimeError("EC2 did not return every selected instance")
@@ -1313,13 +1545,16 @@ class EC2ChaosExperiment(ChaosExperiment):
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError(f"Timed out waiting for EC2 state {desired_state}")
 
-    def terminate_instances(self, instance_ids: list[str]) -> ExperimentResult:
+    def terminate_instances(
+        self,
+        instance_ids: list[str],
+        delete_on_termination_volumes: dict[str, list[str]] | None = None,
+    ) -> ExperimentResult:
         """Terminate EC2 instances"""
         experiment_id = _experiment_id("ec2-terminate")
         result = ExperimentResult(
@@ -1337,15 +1572,34 @@ class EC2ChaosExperiment(ChaosExperiment):
             # Collect metrics before
             result.metrics_before = self._collect_instance_metrics(instance_ids)
 
+            config = {**self.config, "instance_ids": instance_ids}
+            if delete_on_termination_volumes is not None:
+                config["delete_on_termination_volumes"] = delete_on_termination_volumes
+            approved = config.get("delete_on_termination_volumes")
+            self._require_derived_scope(ChaosType.EC2_TERMINATE, config)
+            observed = self._termination_children(instance_ids)
+            expected = {
+                instance: sorted(volumes) for instance, volumes in approved.items()
+            }
+            if observed != expected:
+                raise SafetyViolation(
+                    "EC2 DeleteOnTermination relationships differ from the reviewed approval"
+                )
+            affected = sorted(
+                set(instance_ids)
+                | {volume for volumes in observed.values() for volume in volumes}
+            )
+            result.additional_info["delete_on_termination_volumes"] = observed
+
             if not self.dry_run:
                 # Termination is irreversible. Backups must be approved and
                 # created separately; do not copy attached volumes implicitly.
                 self.ec2.terminate_instances(InstanceIds=instance_ids)
-                result.affected_resources = instance_ids
+                result.affected_resources = affected
                 logger.info(f"Terminated instances: {instance_ids}")
             else:
                 logger.info(f"DRY RUN: Would terminate instances: {instance_ids}")
-                result.affected_resources = instance_ids
+                result.affected_resources = affected
 
             result.status = "completed"
 
@@ -1793,6 +2047,10 @@ class EC2ChaosExperiment(ChaosExperiment):
         try:
             if hasattr(self, "stopped_instances"):
                 states = self._instance_states(self.stopped_instances)
+                if set(states) != set(self.stopped_instances):
+                    raise SafetyViolation(
+                        "EC2 recovery did not return the exact selected instance set"
+                    )
                 if all(state == "running" for state in states.values()):
                     self.rollback_verified = True
                 else:
@@ -1911,6 +2169,8 @@ class EBSChaosExperiment(ChaosExperiment):
         """Wait cooperatively for one EBS volume state."""
         deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             volumes = self.ec2.describe_volumes(VolumeIds=[volume_id]).get(
                 "Volumes", []
             )
@@ -1920,8 +2180,7 @@ class EBSChaosExperiment(ChaosExperiment):
                 return volumes[0]
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError(f"Timed out waiting for EBS state {desired_state}")
@@ -1932,6 +2191,8 @@ class EBSChaosExperiment(ChaosExperiment):
         """Wait for the EBS control plane to expose the requested IOPS value."""
         deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             volumes = self.ec2.describe_volumes(VolumeIds=[volume_id]).get(
                 "Volumes", []
             )
@@ -1941,13 +2202,14 @@ class EBSChaosExperiment(ChaosExperiment):
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError("Timed out waiting for the EBS IOPS update")
 
-    def detach_volume(self, volume_id: str) -> ExperimentResult:
+    def detach_volume(
+        self, volume_id: str, attachment: dict[str, str] | None = None
+    ) -> ExperimentResult:
         """Detach EBS volume"""
         experiment_id = _experiment_id("ebs-detach")
         result = ExperimentResult(
@@ -1957,10 +2219,31 @@ class EBSChaosExperiment(ChaosExperiment):
         )
 
         try:
+            config = {**self.config, "volume_id": volume_id}
+            if attachment is not None:
+                config["attachment"] = attachment
+            self._require_derived_scope(ChaosType.EBS_DETACH_VOLUME, config)
+            expected = config["attachment"]
             # Get volume details before detaching
             volume_info = self.ec2.describe_volumes(VolumeIds=[volume_id])
+            volumes = volume_info.get("Volumes", [])
+            if (
+                len(volumes) != 1
+                or volumes[0].get("VolumeId") != volume_id
+                or len(volumes[0].get("Attachments", [])) != 1
+            ):
+                raise SafetyViolation(
+                    "EBS detach requires exactly one matching volume and attachment"
+                )
             if volume_info["Volumes"] and volume_info["Volumes"][0]["Attachments"]:
                 attachment = volume_info["Volumes"][0]["Attachments"][0]
+                if (
+                    attachment.get("InstanceId") != expected["instance_id"]
+                    or attachment.get("Device") != expected["device"]
+                ):
+                    raise SafetyViolation(
+                        "The EBS attachment differs from the reviewed approval"
+                    )
                 if attachment.get("State") != "attached":
                     raise SafetyViolation("The selected EBS volume is not attached")
                 instance_response = self.ec2.describe_instances(
@@ -1971,7 +2254,11 @@ class EBSChaosExperiment(ChaosExperiment):
                     for reservation in instance_response.get("Reservations", [])
                     for instance in reservation.get("Instances", [])
                 ]
-                if len(instances) != 1 or not instances[0].get("RootDeviceName"):
+                if (
+                    len(instances) != 1
+                    or instances[0].get("InstanceId") != expected["instance_id"]
+                    or not instances[0].get("RootDeviceName")
+                ):
                     raise SafetyViolation(
                         "Could not verify the root device for the EBS attachment"
                     )
@@ -1982,14 +2269,33 @@ class EBSChaosExperiment(ChaosExperiment):
                 self.volume_id = volume_id
 
                 if not self.dry_run:
+                    # Recheck after all other reads, then constrain the write to
+                    # the approved tuple so a changed attachment is not detached.
+                    current = self.ec2.describe_volumes(VolumeIds=[volume_id]).get(
+                        "Volumes", []
+                    )
+                    if (
+                        len(current) != 1
+                        or current[0].get("VolumeId") != volume_id
+                        or current[0].get("Attachments", [])
+                        != volumes[0]["Attachments"]
+                    ):
+                        raise SafetyViolation(
+                            "The EBS attachment changed before the mutation"
+                        )
                     # Detach volume
-                    self.ec2.detach_volume(VolumeId=volume_id)
+                    self.ec2.detach_volume(
+                        VolumeId=volume_id,
+                        InstanceId=expected["instance_id"],
+                        Device=expected["device"],
+                    )
                     self._wait_for_volume_state(volume_id, "available", True)
-                    result.affected_resources = [volume_id]
+                    result.affected_resources = [volume_id, expected["instance_id"]]
                     logger.info(f"Detached volume: {volume_id}")
                 else:
                     logger.info(f"DRY RUN: Would detach volume: {volume_id}")
-                    result.affected_resources = [volume_id]
+                    result.affected_resources = [volume_id, expected["instance_id"]]
+                result.additional_info["attachment"] = expected
             else:
                 raise ConfigurationError(f"Volume {volume_id} is not attached")
 
@@ -2146,6 +2452,8 @@ class EFSChaosExperiment(ChaosExperiment):
         """Wait for an EFS throughput update to become available."""
         deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             systems = self.efs.describe_file_systems(FileSystemId=file_system_id).get(
                 "FileSystems", []
             )
@@ -2164,8 +2472,7 @@ class EFSChaosExperiment(ChaosExperiment):
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError("Timed out waiting for the EFS throughput update")
@@ -2394,6 +2701,26 @@ class VPCChaosExperiment(ChaosExperiment):
             associations = self.ec2.describe_network_acls(
                 Filters=[{"Name": "association.subnet-id", "Values": [subnet_id]}]
             )
+            acls = associations.get("NetworkAcls", [])
+            matching = [
+                assoc
+                for acl in acls
+                for assoc in acl.get("Associations", [])
+                if assoc.get("SubnetId") == subnet_id
+            ]
+            if (
+                len(acls) != 1
+                or len(matching) != 1
+                or not matching[0].get("NetworkAclAssociationId")
+                or not acls[0].get("NetworkAclId")
+            ):
+                raise ConfigurationError(
+                    "The selected subnet needs one exact NACL association"
+                )
+            if acls[0]["NetworkAclId"] == nacl_id:
+                raise ConfigurationError(
+                    "The selected NACL is already associated; no fault would be applied"
+                )
             if associations["NetworkAcls"]:
                 self.original_nacl_id = associations["NetworkAcls"][0]["NetworkAclId"]
                 self.subnet_id = subnet_id
@@ -2409,6 +2736,11 @@ class VPCChaosExperiment(ChaosExperiment):
                         AssociationId=self.original_association_id, NetworkAclId=nacl_id
                     )
                     self.current_association_id = response.get("NewAssociationId")
+                    self.applied_nacl_id = nacl_id
+                    if not self.current_association_id:
+                        raise SafetyViolation(
+                            "AWS did not confirm the new owned NACL association"
+                        )
                     result.affected_resources = [subnet_id]
                     logger.info(f"Modified subnet {subnet_id} to use NACL {nacl_id}")
                 else:
@@ -2735,6 +3067,10 @@ class VPCChaosExperiment(ChaosExperiment):
             if hasattr(self, "original_association_id") and hasattr(
                 self, "original_nacl_id"
             ):
+                if not getattr(self, "current_association_id", None):
+                    raise SafetyViolation(
+                        "An unconfirmed NACL write cannot authorize recovery"
+                    )
                 associations = self.ec2.describe_network_acls(
                     Filters=[
                         {"Name": "association.subnet-id", "Values": [self.subnet_id]}
@@ -2746,7 +3082,12 @@ class VPCChaosExperiment(ChaosExperiment):
                     for assoc in acl.get("Associations", [])
                     if assoc.get("SubnetId") == self.subnet_id
                 ]
-                if len(current_ids) != 1:
+                if (
+                    len(current_ids) != 1
+                    or current_ids[0] != self.current_association_id
+                    or len(associations) != 1
+                    or associations[0].get("NetworkAclId") != self.applied_nacl_id
+                ):
                     raise SafetyViolation(
                         "Cannot uniquely resolve the current subnet NACL association"
                     )
@@ -2837,6 +3178,8 @@ class RDSChaosExperiment(ChaosExperiment):
         }
         deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             matched = True
             for name, value in expected.items():
                 current = self.rds.describe_db_parameters(
@@ -2850,8 +3193,7 @@ class RDSChaosExperiment(ChaosExperiment):
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError("Timed out waiting for RDS parameter values")
@@ -3117,13 +3459,14 @@ class RDSChaosExperiment(ChaosExperiment):
         timeout = int(self.config.get("state_timeout_seconds", 600))
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             metrics = self._get_cluster_metrics(cluster_identifier)
             if metrics["status"] == "available":
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError("Timed out waiting for the RDS cluster to become available")
@@ -3138,6 +3481,8 @@ class RDSChaosExperiment(ChaosExperiment):
         timeout = int(self.config.get("state_timeout_seconds", 600))
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             instances = self.rds.describe_db_instances(
                 DBInstanceIdentifier=db_instance_identifier
             ).get("DBInstances", [])
@@ -3154,8 +3499,7 @@ class RDSChaosExperiment(ChaosExperiment):
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError(
@@ -3222,6 +3566,8 @@ class LambdaChaosExperiment(ChaosExperiment):
         """Wait for a Lambda configuration update to reach a successful terminal state."""
         deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             current = self.lambda_client.get_function_configuration(
                 FunctionName=function_name
             )
@@ -3232,8 +3578,7 @@ class LambdaChaosExperiment(ChaosExperiment):
                 raise RuntimeError("Lambda configuration update failed")
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError("Timed out waiting for Lambda configuration update")
@@ -4532,6 +4877,11 @@ class ELBChaosExperiment(ChaosExperiment):
             response = self.elbv2.describe_target_groups(
                 TargetGroupArns=[target_group_arn]
             )
+            groups = response.get("TargetGroups", [])
+            if len(groups) != 1 or groups[0].get("TargetGroupArn") != target_group_arn:
+                raise ConfigurationError(
+                    "ELB did not return the exact selected target group"
+                )
             if response["TargetGroups"]:
                 tg = response["TargetGroups"][0]
                 self.original_health_check = {
@@ -4583,6 +4933,15 @@ class ELBChaosExperiment(ChaosExperiment):
         try:
             # Get current rule
             response = self.elbv2.describe_rules(RuleArns=[rule_arn])
+            rules = response.get("Rules", [])
+            if (
+                len(rules) != 1
+                or rules[0].get("RuleArn") != rule_arn
+                or not rules[0].get("Actions")
+            ):
+                raise ConfigurationError(
+                    "ELB did not return one matching rule with actions"
+                )
             if response["Rules"]:
                 self.original_actions = response["Rules"][0]["Actions"]
                 self.rule_arn = rule_arn
@@ -4698,6 +5057,8 @@ class ECSChaosExperiment(ChaosExperiment):
         """Wait for the ECS service control plane to expose a desired count."""
         deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             response = self.ecs.describe_services(cluster=cluster, services=[service])
             services = response.get("services", [])
             if response.get("failures") or len(services) != 1:
@@ -4728,8 +5089,7 @@ class ECSChaosExperiment(ChaosExperiment):
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError("Timed out waiting for the ECS service desired count")
@@ -4744,6 +5104,8 @@ class ECSChaosExperiment(ChaosExperiment):
         """Wait for an ECS container instance status change."""
         deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             response = self.ecs.describe_container_instances(
                 cluster=cluster,
                 containerInstances=[container_instance_arn],
@@ -4755,8 +5117,7 @@ class ECSChaosExperiment(ChaosExperiment):
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError("Timed out waiting for the ECS container instance status")
@@ -5049,6 +5410,8 @@ class KinesisChaosExperiment(ChaosExperiment):
         """Wait for a Kinesis retention decrease to become active."""
         deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             description = self.kinesis.describe_stream(StreamName=stream_name).get(
                 "StreamDescription", {}
             )
@@ -5059,8 +5422,7 @@ class KinesisChaosExperiment(ChaosExperiment):
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError("Timed out waiting for the Kinesis retention update")
@@ -5257,6 +5619,8 @@ class OpenSearchChaosExperiment(ChaosExperiment):
             self.config.get("state_timeout_seconds", 7_200)
         )
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             status = self.opensearch.describe_domain(DomainName=domain_name).get(
                 "DomainStatus", {}
             )
@@ -5264,8 +5628,7 @@ class OpenSearchChaosExperiment(ChaosExperiment):
                 return status
             wait_seconds = min(15.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError("Timed out waiting for the OpenSearch domain update")
@@ -6379,12 +6742,13 @@ class AppStreamChaosExperiment(ChaosExperiment):
             self.config.get("state_timeout_seconds", 1_800)
         )
         while time.monotonic() < deadline:
+            if interruptible:
+                self._check_forward_safety()
             if self._fleet_state(fleet_name) == expected_state:
                 return
             wait_seconds = min(10.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
-                if self.safety_controller.emergency_stop.wait(wait_seconds):
-                    raise EmergencyStop("Emergency stop requested")
+                self._wait_forward(wait_seconds)
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError(
@@ -7617,6 +7981,7 @@ class ChaosOrchestrator:
             item.value
             for item in experiment_types
             if not experiment_metadata(item).live_supported
+            and (self.live or item not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS)
         ]
         if unsupported:
             raise ConfigurationError(
@@ -7814,7 +8179,11 @@ class ChaosOrchestrator:
     @staticmethod
     def _target_values(config: dict[str, Any]) -> set[str]:
         """Extract explicit target identifiers without exposing config values."""
-        targets: set[str] = set()
+        targets: set[str] = (
+            derived_target_scope(ChaosType(config["type"]), config)
+            if "type" in config
+            else set()
+        )
         selector_fields = {
             ChaosType.VPC_SECURITY_GROUP_MODIFY.value: ("remove_rule",),
             ChaosType.RDS_PARAMETER_GROUP_MODIFY.value: ("parameters",),
@@ -7870,7 +8239,15 @@ class ChaosOrchestrator:
 
     @staticmethod
     def _blast_radius(experiment_type: ChaosType, config: dict[str, Any]) -> int:
-        """Count primary resources affected, excluding supporting identifiers."""
+        """Count materially affected primary and explicitly approved child resources."""
+        if experiment_type == ChaosType.EC2_TERMINATE:
+            return len(
+                set(config["instance_ids"])
+                | derived_target_scope(experiment_type, config)
+            )
+        if experiment_type == ChaosType.EBS_DETACH_VOLUME:
+            derived_target_scope(experiment_type, config)
+            return 2
         primary_keys = PRIMARY_TARGET_KEYS.get(experiment_type)
         if primary_keys is None:
             primary_keys = tuple(
@@ -8064,6 +8441,15 @@ class ChaosOrchestrator:
             result = self._execute_experiment(
                 experiment, experiment_type, experiment_config
             )
+            if (
+                self.live
+                and result.status == "completed"
+                and (not experiment.mutation_attempts or not result.affected_resources)
+            ):
+                result.status = "failed"
+                result.errors.append(
+                    "Live completion requires a mutation attempt and explicit affected-resource evidence"
+                )
             result.provider = metadata.provider
             result.risk_level = metadata.risk.value
             if self.dry_run and result.status == "completed":
@@ -8180,7 +8566,10 @@ class ChaosOrchestrator:
     ) -> ExperimentResult:
         """Execute specific experiment based on type"""
         metadata = experiment_metadata(experiment_type)
-        if not metadata.live_supported:
+        if not metadata.live_supported and (
+            not experiment.dry_run
+            or experiment_type not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS
+        ):
             raise ConfigurationError(
                 f"Experiment type is not safely executable: {experiment_type.value}"
             )
@@ -8545,7 +8934,10 @@ class ChaosOrchestrator:
         self, experiment_type: ChaosType, config: dict[str, Any]
     ) -> ChaosExperiment:
         """Create experiment instance based on type"""
-        if not experiment_metadata(experiment_type).live_supported:
+        if (
+            not experiment_metadata(experiment_type).live_supported
+            and experiment_type not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS
+        ):
             raise ConfigurationError(
                 f"Experiment type is not safely executable: {experiment_type.value}"
             )
@@ -9271,8 +9663,12 @@ def validate_config_data(config: dict[str, Any]) -> None:
             if type_name not in valid_type_names:
                 raise ConfigurationError(f"{location}.type is invalid: {type_name!r}")
             experiment_type = ChaosType(type_name)
+            derived_target_scope(experiment_type, experiment)
             metadata = experiment_metadata(experiment_type)
-            if not metadata.live_supported:
+            if (
+                not metadata.live_supported
+                and experiment_type not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS
+            ):
                 if metadata.provider == "fis-template":
                     raise ConfigurationError(
                         f"{location}.type must be expressed in an AWS FIS template and "
@@ -9586,6 +9982,10 @@ def confirmation_token(
     experiment_types = [
         ChaosType(item["type"]) for item in suites[suite_name]["experiments"]
     ]
+    if any(item in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS for item in experiment_types):
+        raise ConfigurationError(
+            "Live approval is unavailable for experiments without conditional recovery ownership proof"
+        )
     irreversible = any(
         experiment_metadata(item).risk == RiskLevel.IRREVERSIBLE
         for item in experiment_types

@@ -18,7 +18,7 @@ An enterprise-minded, one-file chaos engineering orchestrator for AWS Fault Inje
 
 AWS FIS is the preferred execution engine whenever it provides the required fault. The framework adds a consistent control plane around FIS and extends coverage to service scenarios that FIS does not directly expose.
 
-- 60 executable experiment modes across AWS FIS and guarded extensions
+- 49 live-supported experiment modes across AWS FIS and guarded extensions, plus 11 planning-only modes
 - GovCloud-aware region and ARN validation
 - Plan mode by default, with no AWS mutations
 - Exact account, region, suite, and target binding for live runs
@@ -160,6 +160,8 @@ python .\aws_chaos_framework.py --list-experiments
 ```
 
 The catalog intentionally includes some gated entries. An action is not live-supported when it cannot provide a real fault, bounded targeting, or an honest recovery contract. Host-level EC2 faults are represented through `fis_template` so that AWS FIS and SSM-managed actions provide the execution semantics.
+
+EC2 termination approval includes every volume marked for deletion, and EBS detach approval includes the exact instance/device attachment. Eleven temporary network, queue, key, credential, policy, and trigger operations retain dry-run planning while live execution is refused because AWS provides no conditional ownership proof for safe concurrent recovery. See [runtime approval and recovery boundaries](docs/runtime-safety-scope.md) for required fields, affected-resource counting, safety polling, and the complete restriction list.
 
 ## Evidence and privacy
 

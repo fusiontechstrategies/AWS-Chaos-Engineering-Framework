@@ -143,11 +143,22 @@ def test_nacl_recovery_uses_replacement_association_id():
     aws = FakeAWS(reject_writes=False)
     original = aws.respond("ec2", "describe_network_acls", {})
     changed = copy.deepcopy(original)
-    changed["NetworkAcls"][0]["NetworkAclId"] = "acl-new"
+    changed["NetworkAcls"][0]["NetworkAclId"] = action_configs()[
+        framework.ChaosType.VPC_SUBNET_ACL_MODIFY
+    ]["nacl_id"]
     changed["NetworkAcls"][0]["Associations"][0]["NetworkAclAssociationId"] = (
         "aclassoc-new"
     )
     aws.read_overrides[("ec2", "describe_network_acls")] = [original, changed, original]
+    original_respond = aws.respond
+
+    def response(service, operation, request):
+        value = original_respond(service, operation, request)
+        if operation == "replace_network_acl_association":
+            return {"NewAssociationId": "aclassoc-new"}
+        return value
+
+    aws.respond = response
     item, values = experiment(framework.ChaosType.VPC_SUBNET_ACL_MODIFY, aws)
     assert item.modify_subnet_acl(**values).status == "completed"
     item.run_rollback()
@@ -447,6 +458,15 @@ def test_extension_recovery_requires_original_post_state(action):
         aws.read_overrides[("ecs", "describe_container_instances")] = [before, owned]
     item, values = experiment(kind, aws)
     orchestrator = object.__new__(framework.ChaosOrchestrator)
+    if kind in framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS:
+        with pytest.raises(framework.ConfigurationError, match="not safely executable"):
+            orchestrator._execute_experiment(item, kind, values)
+        assert not item.mutation_attempts
+        assert all(
+            operation.startswith(framework.READ_ONLY_OPERATION_PREFIXES)
+            for _, operation, _ in aws.calls
+        )
+        return
     result = orchestrator._execute_experiment(item, kind, values)
     assert result.status == "completed", result.errors
     item.run_rollback()
