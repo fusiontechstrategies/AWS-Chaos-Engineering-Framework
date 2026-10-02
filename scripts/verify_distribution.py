@@ -259,8 +259,11 @@ def verify_distribution(dist_dir: Path, repository_root: Path) -> tuple[Path, Pa
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dist_dir", type=Path)
+    parser.add_argument("--repository-root", type=Path)
     args = parser.parse_args()
-    repository_root = Path(__file__).resolve().parents[1]
+    repository_root = (
+        args.repository_root or Path(__file__).resolve().parents[1]
+    ).resolve()
     wheel, sdist = verify_distribution(args.dist_dir.resolve(), repository_root)
     print(f"Verified {wheel.name}")
     print(f"Verified {sdist.name}")

@@ -1,5 +1,12 @@
 # Testing
 
+The final scan regression suite uses only synthetic resources. It covers both
+irreversible approval gates, absence of implicit EC2 volume copies, a staggered
+SQS rollback race across two real worker lifecycles, short and scoped target
+redaction, control-character output, all eight report-disclosure combinations,
+and actual post-verification package replacement and isolated-import probes.
+These offline checks do not establish deployed AWS permissions or service behavior.
+
 All repository and release tests are offline. They use deterministic fake AWS clients, synthetic identifiers, and generated package fixtures. Public CI must never require credentials or contact an AWS account.
 
 ## 2.0.3 release-readiness gate

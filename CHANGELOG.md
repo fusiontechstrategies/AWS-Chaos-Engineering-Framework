@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased security follow-ups
+
+- Require irreversible approval for RDS retention and S3 lifecycle changes and
+  refuse claims that deleted data was recovered.
+- Remove unapproved implicit EC2 termination snapshots and serialize complete live
+  experiment lifecycles, including recovery.
+- Remove implicit EBS detach snapshots, block later live execution after any
+  unverified recovery, and reject disabled live automatic recovery.
+- Scope exact target redaction per run, escape console controls, and keep report
+  identity filtering independent of resource disclosure.
+- Verify distributions with trusted workflow-source tools and bind the final
+  publish payload to a digest manifest rechecked in the protected publish job.
+
 All notable changes to this project are documented here.
 
 ## 2.0.4 - 2026-09-29
