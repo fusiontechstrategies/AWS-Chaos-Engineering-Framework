@@ -176,6 +176,12 @@ reporting:
 
 Reports and logs may still be operationally sensitive. Keep them out of source control and handle them according to your organization's data-classification rules. AWS API activity is recorded by CloudTrail when CloudTrail is configured for the account. The framework's local audit events are not a substitute for CloudTrail.
 
+Disclosure flags affect the typed run-identity and affected-resource fields.
+Errors and diagnostics remain filtered under every flag combination. Live
+experiments execute serially through recovery. Retention changes are irreversible,
+and EC2 termination does not create implicit backups. See
+[the security boundaries](docs/security-boundaries.md) before preparing approval.
+
 ## Testing and release assurance
 
 The release gate is fully offline and never contacts an AWS account. Deterministic fake clients exercise every advertised executable mode and fail immediately if plan mode attempts a write. Focused simulations also cover live policy rollback, route restoration and conflict refusal, WAF optimistic locking, IAM self-protection, FIS start guardrails, report no-overwrite behavior, redaction, configuration validation, and Botocore API request shapes.

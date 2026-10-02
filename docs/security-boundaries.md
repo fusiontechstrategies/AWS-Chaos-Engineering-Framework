@@ -58,8 +58,8 @@ not supported by that action.
 
 ## Concurrent changes and recovery evidence
 
-Recovery for EFS throughput, RDS retention/parameters, S3 versioning/encryption/
-lifecycle and Lambda fields checks current state against original or
+Recovery for EFS throughput, RDS parameters, S3 versioning/encryption
+and Lambda fields checks current state against original or
 experiment-owned state before restoring. Conflicting operator changes fail closed.
 Lambda writes also use RevisionId and preserve unrelated environment variables.
 S3/SNS policy recovery removes only the exact experiment-owned statement and keeps
@@ -68,6 +68,21 @@ parameter still require an exclusive change window: read-before-write checks do
 not make those AWS APIs atomic. FIS template modification must remain denied to
 other principals throughout validation, start and execution. The second read
 narrows the race but cannot replace that IAM deployment prerequisite.
+
+All live experiments are serialized from pre-state capture through verified
+recovery, including direct worker calls and separate orchestrators in the same
+process. Plan mode may still use configured concurrency. Separate processes and
+external operators must honor the exclusive change window; this lock is not a
+distributed AWS resource lock. Failed or unverified recovery must be reconciled
+before another experiment uses that resource.
+
+RDS backup-retention changes and S3 lifecycle expiration are irreversible actions.
+They require both irreversible approvals and the LIVE-IRREVERSIBLE confirmation,
+and cannot claim automatic recovery. Restoring settings cannot recover backups
+or objects already deleted. EC2 termination creates no implicit snapshots of
+attached volumes. Arrange and approve any required backups separately before
+approving termination; the termination action authorizes only its selected
+instances and does not create persistent data copies.
 
 A recovery API attempt never counts as verified recovery. Automatic or managed
 recovery must set rollback_verified only after a state read proves the intended
@@ -101,3 +116,23 @@ virtual environment populated only from the reviewed, hashed runtime lock.
 
 
 WAF IP-set recovery removes only addresses introduced by a confirmed successful experiment update. A rejected or transport-ambiguous forward update does not establish ownership; automatic cleanup is refused and recovery remains unverified until operator reconciliation. This conservative behavior can leave an experiment addition in place after a lost success response, but never authorizes deleting an operator-owned address based on an attempted write.
+
+## Console privacy and publish payloads
+
+Console target registries are scoped to a run and worker, bounded to 4,096 values,
+and include identifiers of every length. Exact identifier boundaries preserve
+unrelated words. CR, LF, tabs, terminal escapes, and Unicode control characters
+are displayed as visible escapes in operator messages.
+
+Report disclosure flags apply to typed fields: include_resource_ids exposes the
+affected-resource list, and include_identity exposes run identity. ARN/account
+identity inside resource fields still requires include_identity. Errors and
+diagnostics retain identity and resource filtering under every flag combination;
+credential fields are always redacted.
+
+The publish workflow executes verification tools from the immutable workflow
+commit with Python isolated mode, never from the release tag. Verified public
+distribution bytes are copied into a fresh payload with a tag, source commit,
+size, and SHA-256 manifest. The protected publish job independently checks that
+manifest and the exact distribution set immediately before publishing. No
+tag-controlled code executes after the verified payload is captured.

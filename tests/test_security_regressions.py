@@ -370,7 +370,7 @@ def test_owned_policy_removal_preserves_concurrent_unrelated_statement():
         )
 
 
-def test_rds_retention_rollback_refuses_concurrent_change():
+def test_rds_retention_cannot_claim_data_recovery_even_without_concurrent_change():
     aws = FakeAWS(reject_writes=False)
     original = aws.respond("rds", "describe_db_instances", {})
     owned = copy.deepcopy(original)
@@ -380,7 +380,7 @@ def test_rds_retention_rollback_refuses_concurrent_change():
     aws.read_overrides[("rds", "describe_db_instances")] = [original, owned, operator]
     item, values = experiment(framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY, aws)
     assert item.modify_backup_retention(**values).status == "completed"
-    with pytest.raises(framework.SafetyViolation, match="concurrent"):
+    with pytest.raises(framework.SafetyViolation, match="irreversible"):
         item.run_rollback()
     assert len([call for call in aws.calls if call[1] == "modify_db_instance"]) == 1
     assert not item.rollback_verified
@@ -396,7 +396,7 @@ def test_rds_original_retention_with_pending_change_is_not_verified():
     current = aws.respond("rds", "describe_db_instances", {})
     current["DBInstances"][0]["PendingModifiedValues"] = {"BackupRetentionPeriod": 0}
     aws.read_overrides[("rds", "describe_db_instances")] = [current]
-    with pytest.raises(framework.SafetyViolation, match="pending"):
+    with pytest.raises(framework.SafetyViolation, match="irreversible"):
         item.run_rollback()
     assert not item.rollback_verified
 

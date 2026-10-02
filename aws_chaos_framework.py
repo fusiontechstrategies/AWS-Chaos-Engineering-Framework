@@ -24,9 +24,12 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Iterable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -74,8 +77,13 @@ ACCESS_KEY_PATTERN = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 ACCOUNT_IN_TEXT_PATTERN = re.compile(r"(?<![0-9])[0-9]{12}(?![0-9])")
 
 logger = logging.getLogger("aws_chaos_framework")
-_SENSITIVE_LOG_VALUES: set[str] = set()
-_SENSITIVE_LOG_LOCK = threading.Lock()
+_SENSITIVE_LOG_VALUES: ContextVar[frozenset[str]] = ContextVar(
+    "chaos_sensitive_log_values", default=frozenset()
+)
+MAX_SENSITIVE_LOG_VALUES = 4096
+# No live baseline capture may overlap another live mutation or recovery in this
+# process, even when callers use different orchestrators or target aliases.
+_LIVE_EXPERIMENT_LOCK = threading.RLock()
 
 
 class ConfigurationError(ValueError):
@@ -276,6 +284,8 @@ FIS_TEMPLATE_ONLY_EXPERIMENTS = frozenset(
 IRREVERSIBLE_EXPERIMENTS = frozenset(
     {
         ChaosType.EC2_TERMINATE,
+        ChaosType.RDS_BACKUP_RETENTION_MODIFY,
+        ChaosType.S3_LIFECYCLE_MODIFY,
         ChaosType.EFS_MOUNT_TARGET_DELETE,
         ChaosType.VPC_PEERING_DELETE,
         ChaosType.VPC_ENDPOINT_DELETE,
@@ -299,13 +309,11 @@ HIGH_RISK_EXPERIMENTS = frozenset(
         ChaosType.VPC_ROUTE_TABLE_MODIFY,
         ChaosType.VPC_SECURITY_GROUP_MODIFY,
         ChaosType.VPC_NACL_BLOCK_TRAFFIC,
-        ChaosType.RDS_BACKUP_RETENTION_MODIFY,
         ChaosType.RDS_PARAMETER_GROUP_MODIFY,
         ChaosType.LAMBDA_ENVIRONMENT_CORRUPT,
         ChaosType.S3_BUCKET_POLICY_DENY,
         ChaosType.S3_BUCKET_VERSIONING_SUSPEND,
         ChaosType.S3_BUCKET_ENCRYPTION_DISABLE,
-        ChaosType.S3_LIFECYCLE_MODIFY,
         ChaosType.SQS_QUEUE_POLICY_RESTRICT,
         ChaosType.SNS_TOPIC_POLICY_RESTRICT,
         ChaosType.WAF_RULE_MODIFY,
@@ -577,24 +585,55 @@ def sanitize_for_log(value: Any, key: str = "") -> Any:
 
 
 def register_sensitive_log_values(values: Iterable[Any]) -> None:
-    """Register exact runtime values that must be removed from console logs."""
-    candidates = {
-        str(value) for value in values if value is not None and len(str(value)) >= 4
-    }
-    with _SENSITIVE_LOG_LOCK:
-        _SENSITIVE_LOG_VALUES.update(candidates)
+    """Register exact values in the current run/worker context, including short IDs."""
+    candidates = _SENSITIVE_LOG_VALUES.get() | frozenset(
+        str(value) for value in values if value is not None and str(value)
+    )
+    if len(candidates) > MAX_SENSITIVE_LOG_VALUES:
+        raise ConfigurationError("Too many sensitive log values in one run")
+    _SENSITIVE_LOG_VALUES.set(candidates)
 
 
-def redact_runtime_text(value: Any) -> str:
+@contextmanager
+def sensitive_log_scope(values: Iterable[Any]):
+    """Give one run or worker a fresh registry and restore its caller on exit."""
+    token = _SENSITIVE_LOG_VALUES.set(frozenset())
+    try:
+        register_sensitive_log_values(values)
+        yield
+    finally:
+        _SENSITIVE_LOG_VALUES.reset(token)
+
+
+def safe_display(value: Any) -> str:
+    """Escape record separators, terminal controls, and Unicode format controls."""
+    return "".join(
+        json.dumps(char, ensure_ascii=True)[1:-1]
+        if unicodedata.category(char).startswith("C")
+        or unicodedata.category(char) in {"Zl", "Zp"}
+        else char
+        for char in str(value)
+    )
+
+
+def redact_runtime_text(
+    value: Any, protected_values: Iterable[str] | None = None
+) -> str:
     """Redact common AWS identifiers and registered target values from text."""
     text_value = str(value)
-    with _SENSITIVE_LOG_LOCK:
-        protected = sorted(_SENSITIVE_LOG_VALUES, key=len, reverse=True)
-    for item in protected:
-        text_value = text_value.replace(item, "[RESOURCE]")
     text_value = ARN_PATTERN.sub("[ARN]", text_value)
     text_value = ACCESS_KEY_PATTERN.sub("[ACCESS_KEY]", text_value)
-    return ACCOUNT_IN_TEXT_PATTERN.sub("[ACCOUNT]", text_value)
+    text_value = ACCOUNT_IN_TEXT_PATTERN.sub("[ACCOUNT]", text_value)
+    protected = (
+        _SENSITIVE_LOG_VALUES.get() if protected_values is None else protected_values
+    )
+    for item in sorted(set(protected), key=len, reverse=True):
+        if item:
+            # Exact identifier boundaries retain words such as 'testing' when
+            # the target is 'test', and do not rewrite redaction placeholders.
+            pattern = rf"(?<![\w\[])({re.escape(item)})(?![\w\]])"
+            text_value = re.sub(pattern, "[RESOURCE]", text_value)
+    return safe_display(text_value)
 
 
 def canonical_caller_principal(caller_arn: str | None) -> str | None:
@@ -1288,10 +1327,8 @@ class EC2ChaosExperiment(ChaosExperiment):
             result.metrics_before = self._collect_instance_metrics(instance_ids)
 
             if not self.dry_run:
-                # Create snapshots before termination
-                self._create_instance_snapshots(instance_ids)
-
-                # Terminate instances
+                # Termination is irreversible. Backups must be approved and
+                # created separately; do not copy attached volumes implicitly.
                 self.ec2.terminate_instances(InstanceIds=instance_ids)
                 result.affected_resources = instance_ids
                 logger.info(f"Terminated instances: {instance_ids}")
@@ -1723,45 +1760,6 @@ class EC2ChaosExperiment(ChaosExperiment):
             raise
 
         return metrics
-
-    def _create_instance_snapshots(self, instance_ids: list[str]):
-        """Create snapshots of instance volumes before termination"""
-        try:
-            snapshot_ids: list[str] = []
-            for instance_id in instance_ids:
-                volumes = self._get_instance_volumes(instance_id)
-                if not volumes:
-                    raise SafetyViolation(
-                        "An EC2 termination target has no EBS volumes"
-                    )
-                for volume_id in volumes:
-                    snapshot = self.ec2.create_snapshot(
-                        VolumeId=volume_id,
-                        Description="AWS Chaos Framework safety snapshot",
-                    )
-                    snapshot_ids.append(snapshot["SnapshotId"])
-            timeout_seconds = int(self.config.get("snapshot_timeout_seconds", 1800))
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
-                snapshots = self.ec2.describe_snapshots(SnapshotIds=snapshot_ids).get(
-                    "Snapshots", []
-                )
-                states = {item.get("State") for item in snapshots}
-                if len(snapshots) == len(snapshot_ids) and states == {"completed"}:
-                    break
-                if "error" in states:
-                    raise RuntimeError("An EC2 safety snapshot entered the error state")
-                if self.safety_controller.emergency_stop.wait(
-                    min(15.0, max(0.1, deadline - time.monotonic()))
-                ):
-                    raise EmergencyStop("Emergency stop requested")
-            else:
-                raise TimeoutError("Timed out waiting for EC2 safety snapshots")
-            self.created_snapshot_ids = snapshot_ids
-            logger.info("Completed %d safety snapshots", len(snapshot_ids))
-        except Exception as e:
-            logger.error(f"Error creating snapshots: {e}")
-            raise
 
     def _get_instance_volumes(self, instance_id: str) -> list[str]:
         """Get volumes attached to an instance"""
@@ -2982,12 +2980,18 @@ class RDSChaosExperiment(ChaosExperiment):
     def modify_backup_retention(
         self, db_identifier: str, retention_period: int = 0
     ) -> ExperimentResult:
-        """Modify backup retention period"""
+        """Change retention with an explicit irreversible data-loss classification."""
+        logger.warning(
+            "Backup retention changes can permanently delete backups; settings restoration cannot recover them"
+        )
         experiment_id = _experiment_id("rds-backup-modify")
         result = ExperimentResult(
             experiment_id=experiment_id,
             experiment_type=ChaosType.RDS_BACKUP_RETENTION_MODIFY,
             start_time=utc_now(),
+        )
+        result.additional_info["data_loss_warning"] = (
+            "Retention changes may permanently delete backups; restoring settings does not recover deleted data."
         )
 
         try:
@@ -3183,43 +3187,9 @@ class RDSChaosExperiment(ChaosExperiment):
         """Rollback RDS experiments"""
         try:
             if hasattr(self, "original_retention") and hasattr(self, "db_identifier"):
-                current = self.rds.describe_db_instances(
-                    DBInstanceIdentifier=self.db_identifier
-                )["DBInstances"][0]
-                if "BackupRetentionPeriod" in current.get("PendingModifiedValues", {}):
-                    raise SafetyViolation("RDS retention still has a pending change")
-                if not restoration_required(
-                    current.get("BackupRetentionPeriod"),
-                    self.original_retention,
-                    self.owned_retention,
-                ):
-                    self.rollback_verified = True
-                    return
-                # Restore original backup retention
-                self.rds.modify_db_instance(
-                    DBInstanceIdentifier=self.db_identifier,
-                    BackupRetentionPeriod=self.original_retention,
-                    ApplyImmediately=True,
+                raise SafetyViolation(
+                    "Backup retention is irreversible; settings restoration cannot recover deleted backups"
                 )
-                self._wait_for_db_instance_available(
-                    self.db_identifier,
-                    False,
-                    expected_retention=self.original_retention,
-                )
-                restored = self.rds.describe_db_instances(
-                    DBInstanceIdentifier=self.db_identifier
-                )["DBInstances"][0]
-                if restored.get("BackupRetentionPeriod") != self.original_retention or (
-                    "BackupRetentionPeriod" in restored.get("PendingModifiedValues", {})
-                ):
-                    raise SafetyViolation(
-                        "RDS backup retention recovery is not verified"
-                    )
-                self.rollback_verified = True
-                logger.info(
-                    f"Restored backup retention to {self.original_retention} days"
-                )
-
             if (
                 hasattr(self, "original_parameters")
                 and hasattr(self, "parameter_group_name")
@@ -3885,12 +3855,18 @@ class S3ChaosExperiment(ChaosExperiment):
     def modify_lifecycle(
         self, bucket_name: str, expire_days: int = 1
     ) -> ExperimentResult:
-        """Modify bucket lifecycle to expire objects quickly"""
+        """Apply expiration with an explicit irreversible data-loss classification."""
+        logger.warning(
+            "Lifecycle expiration can permanently delete objects; settings restoration cannot recover them"
+        )
         experiment_id = _experiment_id("s3-lifecycle-modify")
         result = ExperimentResult(
             experiment_id=experiment_id,
             experiment_type=ChaosType.S3_LIFECYCLE_MODIFY,
             start_time=utc_now(),
+        )
+        result.additional_info["data_loss_warning"] = (
+            "Lifecycle expiration may permanently delete objects; restoring settings does not recover deleted data."
         )
 
         try:
@@ -3950,6 +3926,10 @@ class S3ChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Restore only owned S3 changes, refusing conflicting concurrent state."""
+        if hasattr(self, "owned_lifecycle"):
+            raise SafetyViolation(
+                "Lifecycle expiration is irreversible; settings restoration cannot recover deleted objects"
+            )
         if not hasattr(self, "bucket_name") or not self.mutation_attempts:
             return
         bucket = self.bucket_name
@@ -4015,34 +3995,6 @@ class S3ChaosExperiment(ChaosExperiment):
                 != self.original_encryption
             ):
                 raise SafetyViolation("S3 encryption recovery is not verified")
-            self.rollback_verified = True
-        if hasattr(self, "owned_lifecycle"):
-            try:
-                current = self.s3.get_bucket_lifecycle_configuration(Bucket=bucket)[
-                    "Rules"
-                ]
-            except self.s3.exceptions.ClientError as error:
-                if error.response["Error"]["Code"] != "NoSuchLifecycleConfiguration":
-                    raise
-                current = []
-            original = getattr(self, "original_lifecycle", [])
-            if restoration_required(current, original, self.owned_lifecycle):
-                if original:
-                    self.s3.put_bucket_lifecycle_configuration(
-                        Bucket=bucket, LifecycleConfiguration={"Rules": original}
-                    )
-                else:
-                    self.s3.delete_bucket_lifecycle(Bucket=bucket)
-            try:
-                observed = self.s3.get_bucket_lifecycle_configuration(Bucket=bucket)[
-                    "Rules"
-                ]
-            except self.s3.exceptions.ClientError as error:
-                if error.response["Error"]["Code"] != "NoSuchLifecycleConfiguration":
-                    raise
-                observed = []
-            if observed != original:
-                raise SafetyViolation("S3 lifecycle recovery is not verified")
             self.rollback_verified = True
 
 
@@ -7460,9 +7412,6 @@ class ChaosOrchestrator:
         self._active_experiments_lock = threading.Lock()
         self.active_experiments: list[ChaosExperiment] = []
         self.vpc_id = vpc_id
-        register_sensitive_log_values(
-            [self.expected_account, self.actual_account, self.caller_arn, self.vpc_id]
-        )
         self.discovered_resources: dict[str, list[str]] = {}
         self._discovered_target_values: set[str] = set()
         self._report_sensitive_values: set[str] = set()
@@ -7476,7 +7425,16 @@ class ChaosOrchestrator:
             if item
         }
         self._report_sensitive_values.update(configured_sensitive_values)
-        register_sensitive_log_values(configured_sensitive_values)
+        self._log_sensitive_values = configured_sensitive_values | {
+            value
+            for value in (
+                self.expected_account,
+                self.actual_account,
+                self.caller_arn,
+                self.vpc_id,
+            )
+            if value
+        }
         self._failed_future_count = 0
         self.suite_name: str | None = None
         self.report_path: Path | None = None
@@ -7501,6 +7459,11 @@ class ChaosOrchestrator:
         self.safety_controller.emergency_stop_all()
 
     def _cleanup(self) -> None:
+        """Wait for live execution to finish before fallback recovery."""
+        with _LIVE_EXPERIMENT_LOCK:
+            self._cleanup_locked()
+
+    def _cleanup_locked(self) -> None:
         """Clean up and rollback all active experiments"""
         with self._cleanup_lock:
             if self._cleanup_done:
@@ -7652,6 +7615,11 @@ class ChaosOrchestrator:
             raise
 
     def run_experiment_suite(self, suite_name: str) -> bool:
+        """Run a suite with its own console privacy registry."""
+        with sensitive_log_scope(getattr(self, "_log_sensitive_values", ())):
+            return self._run_experiment_suite(suite_name)
+
+    def _run_experiment_suite(self, suite_name: str) -> bool:
         """Run a suite of experiments. Returns True if all experiments succeeded."""
         self.suite_name = suite_name
         suites = self.config.get("experiment_suites", {})
@@ -7732,7 +7700,7 @@ class ChaosOrchestrator:
             self.config.get("safety", {}).get("max_concurrent_experiments", 1)
         )
         workers = min(suite_concurrency, global_concurrency)
-        if self.live and contains_irreversible:
+        if self.live:
             workers = 1
         scheduled = 0
         experiment_configs = [item.copy() for item in suite["experiments"]]
@@ -8021,6 +7989,16 @@ class ChaosOrchestrator:
         return result
 
     def _run_single_experiment(
+        self, experiment_config: dict[str, Any]
+    ) -> ExperimentResult:
+        """Serialize live capture, mutation, verification and recovery as one unit."""
+        with sensitive_log_scope(getattr(self, "_log_sensitive_values", ())):
+            if self.live:
+                with _LIVE_EXPERIMENT_LOCK:
+                    return self._run_single_experiment_locked(experiment_config)
+            return self._run_single_experiment_locked(experiment_config)
+
+    def _run_single_experiment_locked(
         self, experiment_config: dict[str, Any]
     ) -> ExperimentResult:
         """Run a single experiment"""
@@ -8792,8 +8770,6 @@ class ChaosOrchestrator:
         def redact(value: Any) -> Any:
             """Redact credentials and known target identifiers from report details."""
             sanitized = sanitize_for_log(value)
-            if include_resource_ids:
-                return sanitized
             if isinstance(sanitized, dict):
                 redacted_mapping = {}
                 for index, (key, item) in enumerate(sanitized.items()):
@@ -8808,9 +8784,9 @@ class ChaosOrchestrator:
                 return [redact(item) for item in sanitized]
             if isinstance(sanitized, str):
                 redacted = sanitized
-                for protected in sorted(protected_values, key=len, reverse=True):
-                    redacted = redacted.replace(protected, "[RESOURCE]")
-                return redact_runtime_text(redacted)
+                # Disclosure flags apply only to the typed fields below. Free
+                # text and diagnostics retain identity and target filtering.
+                return redact_runtime_text(redacted, protected_values)
             return sanitized
 
         status_counts = {
@@ -8827,7 +8803,7 @@ class ChaosOrchestrator:
             "run": {
                 "id": self.run_id,
                 "generated_at": utc_now().isoformat(),
-                "suite": getattr(self, "suite_name", None),
+                "suite": redact(getattr(self, "suite_name", None)),
                 "mode": "live" if self.live else "plan",
                 "region": self.region,
                 "seed": self.seed,
@@ -8885,7 +8861,10 @@ class ChaosOrchestrator:
                 "rollback_attempts": sorted(set(result.rollback_attempts)),
             }
             if include_resource_ids:
-                experiment_report["affected_resources"] = result.affected_resources
+                experiment_report["affected_resources"] = [
+                    value if include_identity else redact_runtime_text(value, ())
+                    for value in result.affected_resources
+                ]
             if include_diagnostics:
                 experiment_report["metrics_before"] = redact(result.metrics_before)
                 experiment_report["metrics_after"] = redact(result.metrics_after)
@@ -8899,13 +8878,13 @@ class ChaosOrchestrator:
 
         print("\nCHAOS EXPERIMENT SUMMARY")
         print(f"Mode: {report['run']['mode']}")
-        print(f"Suite: {report['run']['suite']}")
+        print(f"Suite: {safe_display(report['run']['suite'])}")
         print(f"Total: {report['summary']['total']}")
         print(f"Completed: {report['summary']['completed']}")
         print(f"Planned: {report['summary']['planned']}")
         print(f"Failed: {report['summary']['failed']}")
         print(f"Aborted: {report['summary']['aborted']}")
-        print(f"Report: {report_file}")
+        print(f"Report: {safe_display(report_file)}")
         return report_file
 
 
@@ -8982,7 +8961,7 @@ def create_sample_config(output_file: str = "chaos-config.example.yaml") -> Path
         raise ConfigurationError(
             f"Refusing to overwrite existing file: {path}"
         ) from exc
-    print(f"Sample configuration created: {path}")
+    print(f"Sample configuration created: {safe_display(path)}")
     print(
         "Live execution remains disabled until --live and the exact token are supplied."
     )
@@ -9525,10 +9504,15 @@ def validate_config(config_file: str, quiet: bool = False) -> bool:
         validate_config_data(config)
     except (ConfigurationError, OSError) as exc:
         if not quiet:
-            print(f"Configuration validation failed: {exc}", file=sys.stderr)
+            print(
+                f"Configuration validation failed: {redact_runtime_text(exc)}",
+                file=sys.stderr,
+            )
         return False
     if not quiet:
-        print(f"Configuration is valid: {Path(config_file).expanduser().resolve()}")
+        print(
+            f"Configuration is valid: {safe_display(Path(config_file).expanduser().resolve())}"
+        )
     return True
 
 
@@ -9748,15 +9732,18 @@ def main(argv: list[str] | None = None) -> int:
         validate_config_data(config)
         if args.show_live_token:
             print(
-                confirmation_token(
-                    config,
-                    args.suite,
-                    {
-                        "profile": args.profile,
-                        "role_arn": args.role_arn or config["global"].get("role_arn"),
-                        "vpc_id": args.vpc_id,
-                        "seed": args.seed,
-                    },
+                safe_display(
+                    confirmation_token(
+                        config,
+                        args.suite,
+                        {
+                            "profile": args.profile,
+                            "role_arn": args.role_arn
+                            or config["global"].get("role_arn"),
+                            "vpc_id": args.vpc_id,
+                            "seed": args.seed,
+                        },
+                    )
                 )
             )
             return 0
@@ -9777,7 +9764,7 @@ def main(argv: list[str] | None = None) -> int:
         mode = "LIVE" if args.live else "PLAN"
         print(f"{TOOL_NAME} {__version__}")
         print(f"Mode: {mode}")
-        print(f"Suite: {args.suite}")
+        print(f"Suite: {safe_display(args.suite)}")
         if args.vpc_id:
             print("Scope: one VPC with exact tag filtering")
         if args.live:
