@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import email
 import re
+import shlex
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -26,6 +27,8 @@ def _project_version(pyproject_path: Path) -> str:
 
 
 def _assert_safe_names(names: list[str]) -> None:
+    if len(names) != len(set(names)):
+        raise ValueError("archive contains duplicate paths")
     for name in names:
         path = PurePosixPath(name)
         if path.is_absolute() or ".." in path.parts:
@@ -49,6 +52,21 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
     with zipfile.ZipFile(wheel_path) as archive:
         names = archive.namelist()
         _assert_safe_names(names)
+        info = f"aws_chaos_engineering_framework-{version}.dist-info/"
+        allowed = {MODULE_NAME} | {
+            info + name
+            for name in (
+                "METADATA",
+                "WHEEL",
+                "entry_points.txt",
+                "top_level.txt",
+                "RECORD",
+                "licenses/LICENSE",
+            )
+        }
+        unexpected = set(names) - allowed
+        if unexpected:
+            raise ValueError(f"wheel contains unreviewed files: {sorted(unexpected)}")
         if MODULE_NAME not in names:
             raise ValueError(f"wheel is missing {MODULE_NAME}")
         if archive.read(MODULE_NAME) != (repository_root / MODULE_NAME).read_bytes():
@@ -108,6 +126,70 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
         if links:
             raise ValueError(f"source distribution contains archive links: {links}")
         relative_names = {"/".join(PurePosixPath(name).parts[1:]) for name in names}
+        reviewed = {
+            MODULE_NAME,
+            "pyproject.toml",
+            "MANIFEST.in",
+            "LICENSE",
+            "README.md",
+        }
+        for line in (
+            (repository_root / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
+        ):
+            tokens = shlex.split(line, comments=True)
+            if not tokens:
+                continue
+            if tokens[0] == "include":
+                for pattern in tokens[1:]:
+                    reviewed.update(
+                        path.relative_to(repository_root).as_posix()
+                        for path in repository_root.glob(pattern)
+                        if path.is_file()
+                    )
+            elif tokens[0] == "recursive-include" and len(tokens) >= 3:
+                for pattern in tokens[2:]:
+                    reviewed.update(
+                        path.relative_to(repository_root).as_posix()
+                        for path in (repository_root / tokens[1]).rglob(pattern)
+                        if path.is_file()
+                    )
+            else:
+                raise ValueError("source manifest contains an unsupported directive")
+        egg_info = "aws_chaos_engineering_framework.egg-info/"
+        generated = {"PKG-INFO", "setup.cfg"} | {
+            egg_info + name
+            for name in (
+                "PKG-INFO",
+                "SOURCES.txt",
+                "dependency_links.txt",
+                "entry_points.txt",
+                "requires.txt",
+                "top_level.txt",
+            )
+        }
+        for member in members:
+            relative = "/".join(PurePosixPath(member.name).parts[1:])
+            if member.isdir():
+                continue
+            if not member.isfile() or relative not in reviewed | generated:
+                raise ValueError(
+                    f"source distribution contains an unreviewed file: {relative}"
+                )
+            contents = archive.extractfile(member).read()
+            if (
+                relative in reviewed
+                and contents != (repository_root / relative).read_bytes()
+            ):
+                raise ValueError(
+                    f"source distribution content differs from the repository: {relative}"
+                )
+            if (
+                relative == "setup.cfg"
+                and contents.strip() != b"[egg_info]\ntag_build = \ntag_date = 0"
+            ):
+                raise ValueError(
+                    "source distribution contains unreviewed setup configuration"
+                )
         required = {
             MODULE_NAME,
             "LICENSE",

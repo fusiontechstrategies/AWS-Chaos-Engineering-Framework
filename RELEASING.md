@@ -42,7 +42,7 @@ $candidateCommit = git rev-parse HEAD
 $candidateEpoch = git show -s --format=%ct HEAD
 $env:SOURCE_DATE_EPOCH = $candidateEpoch
 $env:AWS_EC2_METADATA_DISABLED = "true"
-python -m pip install -r requirements-build.txt
+python -m pip install --require-hashes -r requirements-build-lock.txt
 python -m build --no-isolation --wheel --sdist --outdir package-dist
 python scripts\normalize_wheel.py --source-date-epoch $candidateEpoch package-dist\aws_chaos_engineering_framework-2.0.4-py3-none-any.whl
 python scripts\normalize_sdist.py --source-date-epoch $candidateEpoch package-dist\aws_chaos_engineering_framework-2.0.4.tar.gz

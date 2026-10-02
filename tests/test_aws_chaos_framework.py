@@ -8,6 +8,7 @@ the test immediately.
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import os
 import sys
@@ -81,7 +82,30 @@ class FakeAWS:
         )
 
         responses: dict[tuple[str, str], Any] = {
+            ("ec2", "describe_security_groups"): {
+                "SecurityGroups": [
+                    {
+                        "GroupId": "sg-0123456789abcdef0",
+                        "IpPermissions": [
+                            {
+                                "IpProtocol": "tcp",
+                                "FromPort": 443,
+                                "ToPort": 443,
+                                "IpRanges": [{"CidrIp": "192.0.2.0/24"}],
+                            }
+                        ],
+                    }
+                ]
+            },
             ("cloudwatch", "get_metric_statistics"): {"Datapoints": []},
+            ("cloudwatch", "describe_alarms"): {
+                "MetricAlarms": [
+                    {
+                        "AlarmArn": f"arn:aws-us-gov:cloudwatch:{REGION}:{ACCOUNT_ID}:alarm:chaos-stop",
+                        "StateValue": "OK",
+                    }
+                ]
+            },
             ("ec2", "describe_instances"): {
                 "Reservations": [
                     {
@@ -195,7 +219,8 @@ class FakeAWS:
                 "FileSystems": [
                     {
                         "FileSystemId": "fs-0123456789abcdef0",
-                        "ThroughputMode": "bursting",
+                        "ThroughputMode": "provisioned",
+                        "ProvisionedThroughputInMibps": 2.0,
                         "LifeCycleState": "available",
                     }
                 ]
@@ -523,7 +548,12 @@ class FakeAWS:
                 "experimentTemplate": {
                     "id": "EXT1234567890abcdef0",
                     "roleArn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ChaosFisRole",
-                    "actions": {"stop": {"actionId": "aws:ec2:stop-instances"}},
+                    "actions": {
+                        "stop": {
+                            "actionId": "aws:ec2:stop-instances",
+                            "parameters": {"startInstancesAfterDuration": "PT1M"},
+                        }
+                    },
                     "targets": {
                         "Instances": {
                             "resourceType": "aws:ec2:instance",
@@ -575,6 +605,7 @@ class FakeSafetyController:
         self.config = {
             "fail_closed": True,
             "max_blast_radius": 1,
+            "safety_alarms": ["chaos-stop"],
             "required_target_tags": {"ChaosReady": "true"},
             "target_allowlist": [
                 f"arn:aws-us-gov:ec2:{REGION}:{ACCOUNT_ID}:instance/{INSTANCE_ID}"
@@ -1258,7 +1289,8 @@ def test_live_efs_throughput_waits_and_restores_original_mode() -> None:
         "FileSystems": [
             {
                 "FileSystemId": "fs-0123456789abcdef0",
-                "ThroughputMode": "bursting",
+                "ThroughputMode": "provisioned",
+                "ProvisionedThroughputInMibps": 2.0,
                 "LifeCycleState": "available",
             }
         ]
@@ -1286,7 +1318,8 @@ def test_live_efs_throughput_waits_and_restores_original_mode() -> None:
     assert updates[0][2]["ProvisionedThroughputInMibps"] == 1.0
     assert updates[1][2] == {
         "FileSystemId": "fs-0123456789abcdef0",
-        "ThroughputMode": "bursting",
+        "ThroughputMode": "provisioned",
+        "ProvisionedThroughputInMibps": 2.0,
     }
     assert experiment.rollback_verified is True
 
@@ -1397,6 +1430,10 @@ def test_route_rollback_refuses_to_overwrite_conflict() -> None:
 
 def test_live_waf_rule_change_uses_lock_token_and_restores() -> None:
     fake_aws = FakeAWS(reject_writes=False)
+    original = fake_aws.respond("wafv2", "get_web_acl", {})
+    changed = copy.deepcopy(original)
+    changed["WebACL"]["Rules"][0]["Action"] = {"Count": {}}
+    fake_aws.read_overrides[("wafv2", "get_web_acl")] = [original, changed]
     action_config = action_configs()[framework.ChaosType.WAF_RULE_MODIFY]
     experiment = make_experiment(
         framework.ChaosType.WAF_RULE_MODIFY,
