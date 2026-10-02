@@ -5827,6 +5827,7 @@ class WAFChaosExperiment(ChaosExperiment):
             )
             ip_set = response["IPSet"]
             self.original_addresses = list(ip_set["Addresses"])
+            self.ip_set_write_confirmed = False
             self.owned_address_additions = set(addresses_to_add) - set(
                 self.original_addresses
             )
@@ -5854,6 +5855,7 @@ class WAFChaosExperiment(ChaosExperiment):
                 if self.ip_set_description is not None:
                     request["Description"] = self.ip_set_description
                 self.wafv2.update_ip_set(**request)
+                self.ip_set_write_confirmed = True
                 result.affected_resources = [ip_set_id]
                 logger.info(f"Added {len(addresses_to_add)} addresses to IP set")
             else:
@@ -5909,6 +5911,11 @@ class WAFChaosExperiment(ChaosExperiment):
                 logger.info("Restored original WebACL configuration")
 
             if hasattr(self, "original_addresses") and hasattr(self, "ip_set_id"):
+                if not self.ip_set_write_confirmed:
+                    raise SafetyViolation(
+                        "IP set forward write was not confirmed; "
+                        "no cleanup is authorized, reconcile manually"
+                    )
                 response = self.wafv2.get_ip_set(
                     Scope=self.ip_set_scope,
                     Name=self.ip_set_name,

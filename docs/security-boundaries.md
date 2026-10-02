@@ -98,3 +98,6 @@ claiming verified recovery. These are control-plane observations and do not
 prove application health. Eventual consistency or a failed read may require
 manual reconciliation. The exact standalone smoke runtime comes from a new
 virtual environment populated only from the reviewed, hashed runtime lock.
+
+
+WAF IP-set recovery removes only addresses introduced by a confirmed successful experiment update. A rejected or transport-ambiguous forward update does not establish ownership; automatic cleanup is refused and recovery remains unverified until operator reconciliation. This conservative behavior can leave an experiment addition in place after a lost success response, but never authorizes deleting an operator-owned address based on an attempted write.

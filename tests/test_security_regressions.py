@@ -700,3 +700,69 @@ def test_directory_service_rejects_unrestorable_replication_scope_before_delete(
     assert not any(
         operation == "delete_conditional_forwarder" for _, operation, _ in aws.calls
     )
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_waf_rejected_or_ambiguous_forward_write_never_claims_address_ownership(
+    ambiguous,
+):
+    import threading
+
+    from botocore.exceptions import ClientError
+    from test_aws_chaos_framework import (
+        BREAK_GLASS_ARN,
+        OTHER_ACCESS_KEY,
+        FakeSafetyController,
+    )
+
+    aws = FakeAWS(reject_writes=False)
+    original = aws.respond("wafv2", "get_ip_set", {})
+    original["IPSet"]["Addresses"] = ["192.0.2.0/24"]
+    concurrent = copy.deepcopy(original)
+    concurrent["IPSet"]["Addresses"] += ["198.51.100.0/24", "203.0.113.0/24"]
+    concurrent["IPSet"]["Description"] = "operator-owned"
+    aws.read_overrides[("wafv2", "get_ip_set")] = [original, concurrent]
+    respond = aws.respond
+
+    def race(service, operation, request):
+        if operation == "update_ip_set":
+            if ambiguous:
+                raise TimeoutError("unknown forward outcome")
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "WAFOptimisticLockException",
+                        "Message": "stale lock",
+                    }
+                },
+                operation,
+            )
+        return respond(service, operation, request)
+
+    aws.respond = race
+    item, values = experiment(framework.ChaosType.WAF_IP_SET_MODIFY, aws)
+    values["addresses_to_add"] = ["198.51.100.0/24"]
+    orchestrator = object.__new__(framework.ChaosOrchestrator)
+    orchestrator.config = {"global": {}, "safety": {}}
+    orchestrator.region = REGION
+    orchestrator.dry_run = False
+    orchestrator.live = True
+    orchestrator.operator_principal_arn = BREAK_GLASS_ARN
+    orchestrator.active_access_key_id = OTHER_ACCESS_KEY
+    orchestrator._report_sensitive_values = set()
+    orchestrator._sensitive_values_lock = threading.Lock()
+    orchestrator._active_experiments_lock = threading.Lock()
+    orchestrator.active_experiments = []
+    orchestrator.safety_controller = FakeSafetyController(aws, live=True)
+    orchestrator._validate_target_scope = lambda *args: None
+    orchestrator._create_experiment = lambda *args: item
+    result = orchestrator._run_single_experiment(
+        {**values, "type": "waf_ip_set_modify", "auto_rollback": True}
+    )
+    assert result.status == "failed"
+    assert result.rollback_successful is False
+    assert item.mutation_operations == []
+    assert item.rollback_attempts == []
+    assert not item.rollback_verified
+    assert len([call for call in aws.calls if call[1] == "update_ip_set"]) == 1
+    assert any("no cleanup is authorized" in error for error in result.rollback_errors)
