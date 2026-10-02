@@ -1153,6 +1153,16 @@ def test_configuration_rejects_gated_action() -> None:
 
 def test_live_s3_policy_preserves_policy_and_rolls_back_exactly() -> None:
     fake_aws = FakeAWS(reject_writes=False)
+    respond = fake_aws.respond
+
+    def current_policy(service, operation, request):
+        writes = [call for call in fake_aws.calls if call[1] == "put_bucket_policy"]
+        if operation == "get_bucket_policy" and writes:
+            fake_aws.calls.append((service, operation, request))
+            return {"Policy": writes[-1][2]["Policy"]}
+        return respond(service, operation, request)
+
+    fake_aws.respond = current_policy
     action_config = action_configs()[framework.ChaosType.S3_BUCKET_POLICY_DENY]
     experiment = make_experiment(
         framework.ChaosType.S3_BUCKET_POLICY_DENY,
@@ -1173,7 +1183,7 @@ def test_live_s3_policy_preserves_policy_and_rolls_back_exactly() -> None:
         item for item in applied["Statement"] if item.get("Sid") == "ChaosFrameworkDeny"
     )
     assert deny["Condition"]["ArnNotEquals"]["aws:PrincipalArn"] == BREAK_GLASS_ARN
-    assert writes[1][2]["Policy"] == experiment.original_policy
+    assert json.loads(writes[1][2]["Policy"]) == json.loads(experiment.original_policy)
     assert experiment.mutation_attempts == ["s3.put_bucket_policy"]
     assert experiment.rollback_attempts == ["s3.put_bucket_policy"]
 
@@ -1297,6 +1307,7 @@ def test_live_efs_throughput_waits_and_restores_original_mode() -> None:
     }
     fake_aws.read_overrides[("efs", "describe_file_systems")] = [
         initial,
+        changed,
         changed,
         restored,
     ]

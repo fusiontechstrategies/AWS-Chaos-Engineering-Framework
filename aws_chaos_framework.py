@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import copy
+import hashlib
 import ipaddress
 import json
 import logging
@@ -388,7 +389,7 @@ REQUIRED_PARAMETERS: dict[ChaosType, tuple[str, ...]] = {
     ChaosType.S3_BUCKET_POLICY_DENY: ("bucket_name", "break_glass_principal_arn"),
     ChaosType.S3_BUCKET_VERSIONING_SUSPEND: ("bucket_name",),
     ChaosType.S3_BUCKET_ENCRYPTION_DISABLE: ("bucket_name",),
-    ChaosType.S3_OBJECT_DELETE: ("bucket_name",),
+    ChaosType.S3_OBJECT_DELETE: ("bucket_name", "prefix"),
     ChaosType.S3_LIFECYCLE_MODIFY: ("bucket_name",),
     ChaosType.SQS_QUEUE_PURGE: ("queue_url",),
     ChaosType.SQS_QUEUE_POLICY_RESTRICT: ("queue_url", "break_glass_principal_arn"),
@@ -2072,6 +2073,12 @@ class EFSChaosExperiment(ChaosExperiment):
                         update_request["ProvisionedThroughputInMibps"] = (
                             provisioned_throughput
                         )
+                    self.owned_throughput = (
+                        throughput_mode,
+                        provisioned_throughput
+                        if throughput_mode == "provisioned"
+                        else None,
+                    )
                     self.efs.update_file_system(**update_request)
                     self._wait_for_throughput(
                         file_system_id,
@@ -2107,6 +2114,22 @@ class EFSChaosExperiment(ChaosExperiment):
         """Rollback EFS experiments"""
         try:
             if hasattr(self, "original_throughput_mode"):
+                current = self.efs.describe_file_systems(
+                    FileSystemId=self.file_system_id
+                )["FileSystems"][0]
+                original = (
+                    self.original_throughput_mode,
+                    self.original_provisioned_throughput,
+                )
+                current_state = (
+                    current.get("ThroughputMode"),
+                    current.get("ProvisionedThroughputInMibps"),
+                )
+                if not restoration_required(
+                    current_state, original, getattr(self, "owned_throughput", None)
+                ):
+                    self.rollback_verified = True
+                    return
                 # Restore original throughput
                 update_params = {
                     "FileSystemId": self.file_system_id,
@@ -2751,6 +2774,7 @@ class RDSChaosExperiment(ChaosExperiment):
                     "BackupRetentionPeriod"
                 ]
                 self.db_identifier = db_identifier
+                self.owned_retention = retention_period
 
                 if not self.dry_run:
                     self.rds.modify_db_instance(
@@ -2831,6 +2855,7 @@ class RDSChaosExperiment(ChaosExperiment):
                     )
 
             if not self.dry_run:
+                self.owned_parameters = copy.deepcopy(parameters)
                 self.rds.modify_db_parameter_group(
                     DBParameterGroupName=parameter_group_name, Parameters=parameters
                 )
@@ -2922,6 +2947,16 @@ class RDSChaosExperiment(ChaosExperiment):
         """Rollback RDS experiments"""
         try:
             if hasattr(self, "original_retention") and hasattr(self, "db_identifier"):
+                current = self.rds.describe_db_instances(
+                    DBInstanceIdentifier=self.db_identifier
+                )["DBInstances"][0]
+                if not restoration_required(
+                    current.get("BackupRetentionPeriod"),
+                    self.original_retention,
+                    self.owned_retention,
+                ):
+                    self.rollback_verified = True
+                    return
                 # Restore original backup retention
                 self.rds.modify_db_instance(
                     DBInstanceIdentifier=self.db_identifier,
@@ -2929,6 +2964,16 @@ class RDSChaosExperiment(ChaosExperiment):
                     ApplyImmediately=True,
                 )
                 self._wait_for_db_instance_available(self.db_identifier, False)
+                restored = self.rds.describe_db_instances(
+                    DBInstanceIdentifier=self.db_identifier
+                )["DBInstances"][0]
+                if restored.get("BackupRetentionPeriod") != self.original_retention or (
+                    "BackupRetentionPeriod" in restored.get("PendingModifiedValues", {})
+                ):
+                    raise SafetyViolation(
+                        "RDS backup retention recovery is not verified"
+                    )
+                self.rollback_verified = True
                 logger.info(
                     f"Restored backup retention to {self.original_retention} days"
                 )
@@ -2938,6 +2983,27 @@ class RDSChaosExperiment(ChaosExperiment):
                 and hasattr(self, "parameter_group_name")
                 and self.original_parameters
             ):
+                for original, owned in zip(
+                    self.original_parameters, self.owned_parameters, strict=True
+                ):
+                    current = self.rds.describe_db_parameters(
+                        DBParameterGroupName=self.parameter_group_name,
+                        Filters=[
+                            {
+                                "Name": "ParameterName",
+                                "Values": [original["ParameterName"]],
+                            }
+                        ],
+                    )["Parameters"]
+                    if len(current) != 1:
+                        raise SafetyViolation(
+                            "RDS parameter recovery pre-state is unavailable"
+                        )
+                    restoration_required(
+                        current[0].get("ParameterValue"),
+                        original["ParameterValue"],
+                        owned["ParameterValue"],
+                    )
                 # Restore original parameter values
                 self.rds.modify_db_parameter_group(
                     DBParameterGroupName=self.parameter_group_name,
@@ -3011,6 +3077,7 @@ class LambdaChaosExperiment(ChaosExperiment):
                 raise SafetyViolation(
                     "Lambda throttle must reduce concurrency; unreserved functions may only be paused"
                 )
+            self.owned_concurrency = reserved_concurrent_executions
             self.original_concurrency = original_concurrency
             self.function_name = function_name
 
@@ -3061,10 +3128,13 @@ class LambdaChaosExperiment(ChaosExperiment):
             # Add chaos environment variable
             new_env = self.original_env.copy()
             new_env["CHAOS_ERROR_RATE"] = str(error_rate)
+            self.owned_env = copy.deepcopy(new_env)
 
             if not self.dry_run:
                 self.lambda_client.update_function_configuration(
-                    FunctionName=function_name, Environment={"Variables": new_env}
+                    FunctionName=function_name,
+                    Environment={"Variables": new_env},
+                    RevisionId=response["RevisionId"],
                 )
                 self._wait_for_configuration(function_name, True)
                 result.affected_resources = [function_name]
@@ -3104,6 +3174,7 @@ class LambdaChaosExperiment(ChaosExperiment):
                 FunctionName=function_name
             )
             self.original_timeout = response["Timeout"]
+            self.owned_timeout = timeout_seconds
             self.function_name = function_name
 
             if not self.dry_run:
@@ -3150,6 +3221,7 @@ class LambdaChaosExperiment(ChaosExperiment):
                 FunctionName=function_name
             )
             self.original_memory = response["MemorySize"]
+            self.owned_memory = memory_mb
             self.function_name = function_name
 
             if not self.dry_run:
@@ -3197,10 +3269,13 @@ class LambdaChaosExperiment(ChaosExperiment):
             # Corrupt environment variables
             new_env = self.original_env.copy()
             new_env.update(corrupt_vars)
+            self.owned_env = copy.deepcopy(new_env)
 
             if not self.dry_run:
                 self.lambda_client.update_function_configuration(
-                    FunctionName=function_name, Environment={"Variables": new_env}
+                    FunctionName=function_name,
+                    Environment={"Variables": new_env},
+                    RevisionId=response["RevisionId"],
                 )
                 self._wait_for_configuration(function_name, True)
                 result.affected_resources = [function_name]
@@ -3226,47 +3301,88 @@ class LambdaChaosExperiment(ChaosExperiment):
         return result
 
     def rollback(self):
-        """Restore original Lambda configuration"""
-        if hasattr(self, "function_name"):
-            try:
-                update_config = {}
-
-                if hasattr(self, "original_concurrency"):
-                    if self.original_concurrency is not None:
-                        self.lambda_client.put_function_concurrency(
-                            FunctionName=self.function_name,
-                            ReservedConcurrentExecutions=self.original_concurrency,
-                        )
+        """Restore owned fields with revision checks and preserve unrelated edits."""
+        if not hasattr(self, "function_name") or not self.mutation_attempts:
+            return
+        current = self.lambda_client.get_function_configuration(
+            FunctionName=self.function_name
+        )
+        if current.get("LastUpdateStatus") == "InProgress":
+            self._wait_for_configuration(self.function_name, False)
+            current = self.lambda_client.get_function_configuration(
+                FunctionName=self.function_name
+            )
+        update = {}
+        if hasattr(self, "original_env"):
+            environment = copy.deepcopy(
+                current.get("Environment", {}).get("Variables", {})
+            )
+            owned = self.owned_env
+            missing = object()
+            for key in set(owned) | set(self.original_env):
+                if owned.get(key, missing) == self.original_env.get(key, missing):
+                    continue
+                if restoration_required(
+                    environment.get(key, missing),
+                    self.original_env.get(key, missing),
+                    owned.get(key, missing),
+                ):
+                    if key in self.original_env:
+                        environment[key] = self.original_env[key]
                     else:
-                        self.lambda_client.delete_function_concurrency(
-                            FunctionName=self.function_name
-                        )
-                    logger.info(f"Restored concurrency for {self.function_name}")
-
-                if hasattr(self, "original_env"):
-                    update_config["Environment"] = {"Variables": self.original_env}
-
-                if hasattr(self, "original_timeout"):
-                    update_config["Timeout"] = self.original_timeout
-
-                if hasattr(self, "original_memory"):
-                    update_config["MemorySize"] = self.original_memory
-
-                if update_config:
-                    current = self.lambda_client.get_function_configuration(
+                        environment.pop(key, None)
+            update["Environment"] = {"Variables": environment}
+        for attribute, property_name in (
+            ("timeout", "Timeout"),
+            ("memory", "MemorySize"),
+        ):
+            if hasattr(self, f"original_{attribute}"):
+                original = getattr(self, f"original_{attribute}")
+                if restoration_required(
+                    current.get(property_name),
+                    original,
+                    getattr(self, f"owned_{attribute}"),
+                ):
+                    update[property_name] = original
+        if update:
+            revision = current.get("RevisionId")
+            if not revision:
+                raise SafetyViolation(
+                    "Lambda recovery requires a configuration revision"
+                )
+            self.lambda_client.update_function_configuration(
+                FunctionName=self.function_name, RevisionId=revision, **update
+            )
+            self._wait_for_configuration(self.function_name, False)
+            restored = self.lambda_client.get_function_configuration(
+                FunctionName=self.function_name
+            )
+            if any(
+                restored.get(property_name) != value
+                for property_name, value in update.items()
+            ):
+                raise SafetyViolation("Lambda configuration recovery is not verified")
+        if hasattr(self, "original_concurrency"):
+            current_limit = self.lambda_client.get_function_concurrency(
+                FunctionName=self.function_name
+            ).get("ReservedConcurrentExecutions")
+            original = self.original_concurrency
+            if restoration_required(current_limit, original, self.owned_concurrency):
+                if original is None:
+                    self.lambda_client.delete_function_concurrency(
                         FunctionName=self.function_name
                     )
-                    if current.get("LastUpdateStatus") == "InProgress":
-                        self._wait_for_configuration(self.function_name, False)
-                    self.lambda_client.update_function_configuration(
-                        FunctionName=self.function_name, **update_config
+                else:
+                    self.lambda_client.put_function_concurrency(
+                        FunctionName=self.function_name,
+                        ReservedConcurrentExecutions=original,
                     )
-                    self._wait_for_configuration(self.function_name, False)
-                    logger.info(f"Restored configuration for {self.function_name}")
-
-            except Exception as e:
-                logger.error(f"Error rolling back Lambda: {e}")
-                raise
+            restored = self.lambda_client.get_function_concurrency(
+                FunctionName=self.function_name
+            ).get("ReservedConcurrentExecutions")
+            if restored != original:
+                raise SafetyViolation("Lambda concurrency recovery is not verified")
+        self.rollback_verified = True
 
 
 class S3ChaosExperiment(ChaosExperiment):
@@ -3332,6 +3448,7 @@ class S3ChaosExperiment(ChaosExperiment):
                 }
             )
 
+            self.owned_policy_statement = copy.deepcopy(deny_policy["Statement"][-1])
             if not self.dry_run:
                 self.s3.put_bucket_policy(
                     Bucket=bucket_name, Policy=json.dumps(deny_policy)
@@ -3462,6 +3579,10 @@ class S3ChaosExperiment(ChaosExperiment):
         )
 
         try:
+            if not isinstance(prefix, str) or not prefix.strip():
+                raise SafetyViolation(
+                    "S3 deletion requires an explicit nonempty prefix"
+                )
             # List objects to delete
             response = self.s3.list_objects_v2(
                 Bucket=bucket_name, Prefix=prefix, MaxKeys=max_objects
@@ -3554,6 +3675,7 @@ class S3ChaosExperiment(ChaosExperiment):
                 ]
             }
 
+            self.owned_lifecycle = copy.deepcopy(lifecycle_config["Rules"])
             if not self.dry_run:
                 self.s3.put_bucket_lifecycle_configuration(
                     Bucket=bucket_name, LifecycleConfiguration=lifecycle_config
@@ -3581,55 +3703,101 @@ class S3ChaosExperiment(ChaosExperiment):
         return result
 
     def rollback(self):
-        """Rollback S3 experiments"""
-        try:
-            if hasattr(self, "bucket_name"):
-                if hasattr(self, "original_policy"):
-                    if self.original_policy:
-                        # Restore original policy
-                        self.s3.put_bucket_policy(
-                            Bucket=self.bucket_name, Policy=self.original_policy
-                        )
-                    else:
-                        # Delete the deny policy
-                        self.s3.delete_bucket_policy(Bucket=self.bucket_name)
-                    logger.info(f"Restored bucket policy for {self.bucket_name}")
-
-                if hasattr(self, "original_versioning"):
-                    # Restore versioning status
-                    self.s3.put_bucket_versioning(
-                        Bucket=self.bucket_name,
-                        VersioningConfiguration={"Status": self.original_versioning},
+        """Restore only owned S3 changes, refusing conflicting concurrent state."""
+        if not hasattr(self, "bucket_name") or not self.mutation_attempts:
+            return
+        bucket = self.bucket_name
+        if hasattr(self, "owned_policy_statement"):
+            current = self.s3.get_bucket_policy(Bucket=bucket)["Policy"]
+            restored = remove_owned_policy_statement(
+                current, self.owned_policy_statement
+            )
+            if restored != json.loads(current):
+                if restored["Statement"]:
+                    self.s3.put_bucket_policy(
+                        Bucket=bucket, Policy=json.dumps(restored)
                     )
-                    logger.info(f"Restored versioning for {self.bucket_name}")
-
+                    observed = json.loads(
+                        self.s3.get_bucket_policy(Bucket=bucket)["Policy"]
+                    )
+                    if observed != restored:
+                        raise SafetyViolation("S3 policy recovery is not verified")
+                else:
+                    self.s3.delete_bucket_policy(Bucket=bucket)
+                    try:
+                        self.s3.get_bucket_policy(Bucket=bucket)
+                    except self.s3.exceptions.ClientError as error:
+                        if error.response["Error"]["Code"] != "NoSuchBucketPolicy":
+                            raise
+                    else:
+                        raise SafetyViolation("S3 policy deletion is not verified")
+            self.rollback_verified = True
+        if hasattr(self, "original_versioning"):
+            current = self.s3.get_bucket_versioning(Bucket=bucket).get("Status")
+            if restoration_required(current, self.original_versioning, "Suspended"):
+                self.s3.put_bucket_versioning(
+                    Bucket=bucket,
+                    VersioningConfiguration={"Status": self.original_versioning},
+                )
+            if (
+                self.s3.get_bucket_versioning(Bucket=bucket).get("Status")
+                != self.original_versioning
+            ):
+                raise SafetyViolation("S3 versioning recovery is not verified")
+            self.rollback_verified = True
+        if getattr(self, "had_encryption", False):
+            try:
+                current = self.s3.get_bucket_encryption(Bucket=bucket)[
+                    "ServerSideEncryptionConfiguration"
+                ]
+            except self.s3.exceptions.ClientError as error:
                 if (
-                    hasattr(self, "had_encryption")
-                    and hasattr(self, "original_encryption")
-                    and self.had_encryption
+                    error.response["Error"]["Code"]
+                    != "ServerSideEncryptionConfigurationNotFoundError"
                 ):
-                    # Restore encryption
-                    self.s3.put_bucket_encryption(
-                        Bucket=self.bucket_name,
-                        ServerSideEncryptionConfiguration=self.original_encryption,
+                    raise
+                current = None
+            if restoration_required(current, self.original_encryption, None):
+                self.s3.put_bucket_encryption(
+                    Bucket=bucket,
+                    ServerSideEncryptionConfiguration=self.original_encryption,
+                )
+            if (
+                self.s3.get_bucket_encryption(Bucket=bucket)[
+                    "ServerSideEncryptionConfiguration"
+                ]
+                != self.original_encryption
+            ):
+                raise SafetyViolation("S3 encryption recovery is not verified")
+            self.rollback_verified = True
+        if hasattr(self, "owned_lifecycle"):
+            try:
+                current = self.s3.get_bucket_lifecycle_configuration(Bucket=bucket)[
+                    "Rules"
+                ]
+            except self.s3.exceptions.ClientError as error:
+                if error.response["Error"]["Code"] != "NoSuchLifecycleConfiguration":
+                    raise
+                current = []
+            original = getattr(self, "original_lifecycle", [])
+            if restoration_required(current, original, self.owned_lifecycle):
+                if original:
+                    self.s3.put_bucket_lifecycle_configuration(
+                        Bucket=bucket, LifecycleConfiguration={"Rules": original}
                     )
-                    logger.info(f"Restored encryption for {self.bucket_name}")
-
-                if hasattr(self, "had_lifecycle"):
-                    if self.had_lifecycle and hasattr(self, "original_lifecycle"):
-                        # Restore lifecycle
-                        self.s3.put_bucket_lifecycle_configuration(
-                            Bucket=self.bucket_name,
-                            LifecycleConfiguration={"Rules": self.original_lifecycle},
-                        )
-                    else:
-                        # Delete lifecycle
-                        self.s3.delete_bucket_lifecycle(Bucket=self.bucket_name)
-                    logger.info(f"Restored lifecycle for {self.bucket_name}")
-
-        except Exception as e:
-            logger.error(f"Error during S3 rollback: {e}")
-            raise
+                else:
+                    self.s3.delete_bucket_lifecycle(Bucket=bucket)
+            try:
+                observed = self.s3.get_bucket_lifecycle_configuration(Bucket=bucket)[
+                    "Rules"
+                ]
+            except self.s3.exceptions.ClientError as error:
+                if error.response["Error"]["Code"] != "NoSuchLifecycleConfiguration":
+                    raise
+                observed = []
+            if observed != original:
+                raise SafetyViolation("S3 lifecycle recovery is not verified")
+            self.rollback_verified = True
 
 
 class SQSChaosExperiment(ChaosExperiment):
@@ -3959,6 +4127,9 @@ class SNSChaosExperiment(ChaosExperiment):
                 }
             )
 
+            if not self.original_policy:
+                raise SafetyViolation("SNS policy pre-state must be restorable")
+            self.owned_policy_statement = copy.deepcopy(statements[-1])
             if not self.dry_run:
                 self.sns.set_topic_attributes(
                     TopicArn=topic_arn,
@@ -3997,14 +4168,27 @@ class SNSChaosExperiment(ChaosExperiment):
                 )
                 logger.info(f"Re-created subscription for topic {topic_arn}")
 
-            if hasattr(self, "topic_arn") and hasattr(self, "original_policy"):
-                # Restore original policy
-                self.sns.set_topic_attributes(
-                    TopicArn=self.topic_arn,
-                    AttributeName="Policy",
-                    AttributeValue=self.original_policy,
+            if hasattr(self, "topic_arn") and hasattr(self, "owned_policy_statement"):
+                current = self.sns.get_topic_attributes(TopicArn=self.topic_arn)[
+                    "Attributes"
+                ]["Policy"]
+                restored = remove_owned_policy_statement(
+                    current, self.owned_policy_statement
                 )
-                logger.info(f"Restored topic policy for {self.topic_arn}")
+                if restored != json.loads(current):
+                    self.sns.set_topic_attributes(
+                        TopicArn=self.topic_arn,
+                        AttributeName="Policy",
+                        AttributeValue=json.dumps(restored),
+                    )
+                observed = json.loads(
+                    self.sns.get_topic_attributes(TopicArn=self.topic_arn)[
+                        "Attributes"
+                    ]["Policy"]
+                )
+                if observed != restored:
+                    raise SafetyViolation("SNS policy recovery is not verified")
+                self.rollback_verified = True
 
         except Exception as e:
             logger.error(f"Error during SNS rollback: {e}")
@@ -4019,7 +4203,10 @@ class ELBChaosExperiment(ChaosExperiment):
         self.elbv2 = self.client("elbv2")
 
     def remove_targets(
-        self, target_group_arn: str, target_ids: list[str]
+        self,
+        target_group_arn: str,
+        target_ids: list[str],
+        target_descriptors: list[dict[str, Any]] | None = None,
     ) -> ExperimentResult:
         """Remove targets from target group"""
         experiment_id = _experiment_id("elb-remove-targets")
@@ -4038,6 +4225,36 @@ class ELBChaosExperiment(ChaosExperiment):
                 for item in current
                 if item.get("Target", {}).get("Id") in target_ids
             ]
+            if not self.dry_run and not target_descriptors:
+                raise SafetyViolation(
+                    "Live ELB removal requires exact Id/Port/AvailabilityZone descriptors"
+                )
+            if target_descriptors:
+                if any(
+                    set(item) - {"Id", "Port", "AvailabilityZone"}
+                    or item.get("Id") not in target_ids
+                    or not isinstance(item.get("Port"), int)
+                    or isinstance(item["Port"], bool)
+                    or not 1 <= item["Port"] <= 65535
+                    for item in target_descriptors
+                ):
+                    raise ConfigurationError("Invalid exact ELB target descriptor")
+                identities = {
+                    json.dumps(item, sort_keys=True) for item in target_descriptors
+                }
+                selected = [
+                    item
+                    for item in selected
+                    if json.dumps(item["Target"], sort_keys=True) in identities
+                ]
+                if {
+                    json.dumps(item["Target"], sort_keys=True) for item in selected
+                } != identities:
+                    raise SafetyViolation(
+                        "An approved ELB registration is missing or changed"
+                    )
+            elif len(selected) != len(set(target_ids)):
+                raise SafetyViolation("An ELB target ID selects multiple registrations")
             current = selected
             targets = [copy.deepcopy(item["Target"]) for item in selected]
             returned_ids = {str(item.get("Target", {}).get("Id")) for item in current}
@@ -6786,6 +7003,36 @@ class FISTemplateExperiment(ChaosExperiment):
         self.rollback_verified = True
 
 
+def restoration_required(current: Any, original: Any, owned: Any) -> bool:
+    """Refuse to overwrite a property changed by another actor."""
+    if current == original:
+        return False
+    if current != owned:
+        raise SafetyViolation(
+            "Recovery conflicts with a concurrent control-plane change"
+        )
+    return True
+
+
+def remove_owned_policy_statement(
+    current: str, owned: dict[str, Any]
+) -> dict[str, Any]:
+    """Remove only the exact framework statement, preserving unrelated policy edits."""
+    policy = json.loads(current)
+    statements = policy.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    matches = [item for item in statements if item.get("Sid") == owned["Sid"]]
+    if matches and (len(matches) != 1 or matches[0] != owned):
+        raise SafetyViolation(
+            "The framework-owned policy statement changed concurrently"
+        )
+    policy["Statement"] = [
+        item for item in statements if item.get("Sid") != owned["Sid"]
+    ]
+    return policy
+
+
 class ChaosOrchestrator:
     """Orchestrates chaos experiments"""
 
@@ -6964,9 +7211,11 @@ class ChaosOrchestrator:
         atexit.register(self._cleanup)
 
     def expected_confirmation(self, suite_name: str, irreversible: bool) -> str:
-        """Return the exact non-secret live confirmation token."""
-        prefix = "LIVE-IRREVERSIBLE" if irreversible else "LIVE"
-        return f"{prefix}:{self.expected_account}:{self.region}:{suite_name}"
+        """Bind approval to the complete reviewed configuration and runtime identity."""
+        reviewed = copy.deepcopy(self.config)
+        reviewed["global"]["account_id"] = self.expected_account
+        reviewed["global"]["region"] = self.region
+        return confirmation_token(reviewed, suite_name)
 
     def _signal_handler(self, signum: int, frame: Any) -> None:
         """Request cooperative shutdown and rollback."""
@@ -7212,8 +7461,9 @@ class ChaosOrchestrator:
                 ):
                     active.add(
                         executor.submit(
-                            self._run_single_experiment,
+                            self._run_with_failure_policy,
                             experiment_configs[next_index],
+                            stop_on_failure,
                         )
                     )
                     next_index += 1
@@ -7313,6 +7563,32 @@ class ChaosOrchestrator:
     def _target_values(config: dict[str, Any]) -> set[str]:
         """Extract explicit target identifiers without exposing config values."""
         targets: set[str] = set()
+        selector_fields = {
+            ChaosType.VPC_SECURITY_GROUP_MODIFY.value: ("remove_rule",),
+            ChaosType.RDS_PARAMETER_GROUP_MODIFY.value: ("parameters",),
+            ChaosType.LAMBDA_ENVIRONMENT_CORRUPT.value: ("corrupt_vars",),
+            ChaosType.ELB_REMOVE_TARGETS.value: ("target_descriptors",),
+        }
+        selector = {
+            key: config[key]
+            for key in selector_fields.get(config.get("type"), ())
+            if key in config
+        }
+        if config.get("type") == ChaosType.VPC_NACL_BLOCK_TRAFFIC.value:
+            selector = {
+                "rule_number": config.get("rule_number", 100),
+                "protocol": config.get("protocol", "-1"),
+                "cidr_block": config.get("cidr_block", "0.0.0.0/0"),
+                "egress": False,
+                "action": "deny",
+            }
+        if selector:
+            digest = hashlib.sha256(
+                json.dumps(
+                    selector, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                ).encode("utf-8")
+            ).hexdigest()
+            targets.add(f"selector:{config['type']}:{digest}")
         for key, value in config.items():
             if key not in TARGET_PARAMETER_KEYS:
                 continue
@@ -7434,11 +7710,23 @@ class ChaosOrchestrator:
         """Return an honest rollback outcome, including ambiguous write failures."""
         if experiment.rollback_errors:
             return False
-        return not (
-            metadata.rollback in {"automatic", "managed"}
-            and not experiment.rollback_attempts
-            and not experiment.rollback_verified
+        return metadata.rollback not in {"automatic", "managed"} or bool(
+            experiment.rollback_verified
         )
+
+    def _run_with_failure_policy(self, config: dict[str, Any], stop_on_failure: bool):
+        """Signal failure from the worker before the scheduler can submit more work."""
+        try:
+            result = self._run_single_experiment(
+                {**config, "_runtime_stop_on_failure": stop_on_failure}
+            )
+        except Exception:
+            if stop_on_failure:
+                self.safety_controller.emergency_stop_all()
+            raise
+        if stop_on_failure and result.status in {"failed", "aborted"}:
+            self.safety_controller.emergency_stop_all()
+        return result
 
     def _run_single_experiment(
         self, experiment_config: dict[str, Any]
@@ -7487,6 +7775,11 @@ class ChaosOrchestrator:
             result.risk_level = metadata.risk.value
             if self.dry_run and result.status == "completed":
                 result.status = "planned"
+            if experiment_config.get("_runtime_stop_on_failure") and result.status in {
+                "failed",
+                "aborted",
+            }:
+                self.safety_controller.emergency_stop_all()
 
             duration = int(experiment_config.get("duration_seconds", 0))
             if (
@@ -7506,7 +7799,7 @@ class ChaosOrchestrator:
                     metadata.rollback == "automatic"
                     or (
                         metadata.rollback == "managed"
-                        and result.status in {"failed", "aborted"}
+                        and result.status in {"completed", "failed", "aborted"}
                     )
                 )
             )
@@ -7528,6 +7821,7 @@ class ChaosOrchestrator:
                     result.errors.append(f"Rollback failed: {exc}")
                     result.status = "failed"
         except EmergencyStop as exc:
+            self.safety_controller.emergency_stop_all()
             if result is None:
                 result = ExperimentResult(
                     experiment_id=_experiment_id("aborted"),
@@ -7550,6 +7844,8 @@ class ChaosOrchestrator:
                     result.rollback_successful = False
                     result.rollback_errors.append(str(rollback_exc))
         except Exception as exc:
+            if experiment_config.get("_runtime_stop_on_failure"):
+                self.safety_controller.emergency_stop_all()
             if result is None:
                 result = ExperimentResult(
                     experiment_id=_experiment_id("failed"),
@@ -7765,7 +8061,9 @@ class ChaosOrchestrator:
         # ELB experiments
         elif experiment_type == ChaosType.ELB_REMOVE_TARGETS:
             return experiment.remove_targets(
-                config["target_group_arn"], config["target_ids"]
+                config["target_group_arn"],
+                config["target_ids"],
+                config.get("target_descriptors"),
             )
         elif experiment_type == ChaosType.ELB_MODIFY_ATTRIBUTES:
             return experiment.modify_attributes(
@@ -8172,6 +8470,28 @@ class ChaosOrchestrator:
         )
         with self._sensitive_values_lock:
             protected_values.update(self._report_sensitive_values)
+
+        def collect_derived(value: Any, sensitive: bool = False) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    collect_derived(
+                        child,
+                        sensitive
+                        or bool(
+                            re.search(
+                                r"(?i)(?:id|identifier|arn|endpoint|member|snapshot|domain)",
+                                str(key),
+                            )
+                        ),
+                    )
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect_derived(child, sensitive)
+            elif sensitive and isinstance(value, str) and value:
+                protected_values.add(value)
+
+        for result in self.results:
+            collect_derived(result.additional_info)
 
         def redact(value: Any) -> Any:
             """Redact credentials and known target identifiers from report details."""
@@ -8962,7 +9282,18 @@ def confirmation_token(config: dict[str, Any], suite_name: str) -> str:
         raise ConfigurationError(
             "A valid global.account_id is required to generate a live token"
         )
-    return f"{prefix}:{account_id}:{region}:{suite_name}"
+    reviewed = copy.deepcopy(config)
+    reviewed["safety"] = {
+        key: value
+        for key, value in reviewed.get("safety", {}).items()
+        if not key.startswith("_runtime_")
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            reviewed, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"{prefix}:{account_id}:{region}:{suite_name}:{digest}"
 
 
 def configure_logging(level: str) -> None:
@@ -9070,6 +9401,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the exact token required for the selected suite",
     )
+    utilities.add_argument(
+        "--show-target-selectors",
+        action="store_true",
+        help="Print exact child-selector approval digests without contacting AWS",
+    )
     return parser
 
 
@@ -9097,6 +9433,19 @@ def main(argv: list[str] | None = None) -> int:
         validate_config_data(config)
         if args.show_live_token:
             print(confirmation_token(config, args.suite))
+            return 0
+        if args.show_target_selectors:
+            if args.suite not in config["experiment_suites"]:
+                raise ConfigurationError("The selected suite does not exist")
+            selectors = set()
+            for item in config["experiment_suites"][args.suite]["experiments"]:
+                values = {**config.get("global", {}), **item}
+                selectors.update(
+                    value
+                    for value in ChaosOrchestrator._target_values(values)
+                    if value.startswith("selector:")
+                )
+            print(json.dumps(sorted(selectors), indent=2))
             return 0
 
         mode = "LIVE" if args.live else "PLAN"

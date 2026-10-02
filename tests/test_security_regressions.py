@@ -167,7 +167,9 @@ def test_elb_recovery_preserves_port_and_availability_zone():
     target["Port"] = 8443
     target["AvailabilityZone"] = "all"
     aws.read_overrides[("elbv2", "describe_target_health")] = [state, state]
-    item, values = experiment(framework.ChaosType.ELB_REMOVE_TARGETS, aws)
+    item, values = experiment(
+        framework.ChaosType.ELB_REMOVE_TARGETS, aws, target_descriptors=[target]
+    )
     assert item.remove_targets(**values).status == "completed"
     item.run_rollback()
     writes = [
@@ -201,3 +203,164 @@ def test_ecs_recovery_does_not_accept_desired_count_without_running_tasks(monkey
     with pytest.raises(TimeoutError):
         item._wait_for_service_count("cluster", "service", 1, False)
     assert not item.rollback_verified
+
+
+def test_confirmation_token_binds_reviewed_plan_and_safety():
+    config = framework.yaml.safe_load(framework.SAMPLE_CONFIG)
+    config["global"]["account_id"] = ACCOUNT_ID
+    suite = next(iter(config["experiment_suites"]))
+    token = framework.confirmation_token(config, suite)
+    changed = copy.deepcopy(config)
+    changed["safety"]["max_blast_radius"] += 1
+    assert framework.confirmation_token(changed, suite) != token
+    changed = copy.deepcopy(config)
+    changed["experiment_suites"][suite]["experiments"][0]["duration"] = 301
+    assert framework.confirmation_token(changed, suite) != token
+    config["safety"]["_runtime_allow_live_without_safety_alarms"] = True
+    assert framework.confirmation_token(config, suite) == token
+
+
+@pytest.mark.parametrize(
+    "kind,field",
+    [
+        (framework.ChaosType.VPC_SECURITY_GROUP_MODIFY, "remove_rule"),
+        (framework.ChaosType.RDS_PARAMETER_GROUP_MODIFY, "parameters"),
+        (framework.ChaosType.LAMBDA_ENVIRONMENT_CORRUPT, "corrupt_vars"),
+        (framework.ChaosType.ELB_REMOVE_TARGETS, "target_descriptors"),
+    ],
+)
+def test_child_selector_requires_exact_allowlist_digest(kind, field):
+    config = {"type": kind.value, **action_configs()[kind]}
+    config[field] = {"synthetic": "approved"}
+    approved = framework.ChaosOrchestrator._target_values(config)
+    config[field] = {"synthetic": "different"}
+    changed = framework.ChaosOrchestrator._target_values(config)
+    assert {value for value in approved if value.startswith("selector:")}
+    assert changed - approved
+
+
+def test_empty_s3_prefix_never_lists_or_deletes_bucket_objects():
+    aws = FakeAWS(reject_writes=False)
+    item, values = experiment(framework.ChaosType.S3_OBJECT_DELETE, aws, prefix="")
+    assert item.delete_objects(**values).status == "failed"
+    assert not any(
+        op in {"list_objects_v2", "delete_objects"} for _, op, _ in aws.calls
+    )
+
+
+def test_worker_failure_sets_emergency_stop_before_scheduler_reaps():
+    import threading
+    from types import SimpleNamespace
+
+    orchestrator = object.__new__(framework.ChaosOrchestrator)
+    stop = threading.Event()
+    orchestrator.safety_controller = SimpleNamespace(emergency_stop_all=stop.set)
+    orchestrator._run_single_experiment = lambda _: SimpleNamespace(status="failed")
+    result = orchestrator._run_with_failure_policy({}, True)
+    assert result.status == "failed"
+    assert stop.is_set()
+
+
+def test_rollback_attempt_is_not_recovery_verification():
+    from types import SimpleNamespace
+
+    metadata = SimpleNamespace(rollback="automatic")
+    item = SimpleNamespace(
+        rollback_errors=[],
+        rollback_verified=False,
+        rollback_attempts=["s3.put_bucket_policy"],
+    )
+    assert not framework.ChaosOrchestrator._rollback_outcome(metadata, item)
+    item.rollback_verified = True
+    assert framework.ChaosOrchestrator._rollback_outcome(metadata, item)
+
+
+def test_fis_completed_does_not_prove_instances_recovered():
+    aws = FakeAWS(reject_writes=False)
+    item, _ = experiment(framework.ChaosType.FIS_TEMPLATE, aws)
+    item.fis_experiment_id = "synthetic"
+    item.recovery_instance_ids = ["i-0123456789abcdef0"]
+    aws.read_overrides[("fis", "get_experiment")] = [
+        {"experiment": {"state": {"status": "completed"}}}
+    ]
+    aws.read_overrides[("ec2", "describe_instances")] = [
+        {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "InstanceId": item.recovery_instance_ids[0],
+                            "State": {"Name": "stopped"},
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+    with pytest.raises(framework.SafetyViolation, match="not yet verified"):
+        item.run_rollback()
+    assert not item.rollback_verified
+
+
+def test_efs_rollback_refuses_concurrent_operator_throughput():
+    aws = FakeAWS(reject_writes=False)
+    initial = aws.respond("efs", "describe_file_systems", {})
+    owned = copy.deepcopy(initial)
+    owned["FileSystems"][0]["ProvisionedThroughputInMibps"] = 1.0
+    operator = copy.deepcopy(initial)
+    operator["FileSystems"][0]["ProvisionedThroughputInMibps"] = 3.0
+    aws.read_overrides[("efs", "describe_file_systems")] = [initial, owned, operator]
+    item, values = experiment(framework.ChaosType.EFS_THROTTLE_THROUGHPUT, aws)
+    assert item.throttle_throughput(**values).status == "completed"
+    with pytest.raises(framework.SafetyViolation, match="concurrent"):
+        item.run_rollback()
+    assert len([call for call in aws.calls if call[1] == "update_file_system"]) == 1
+    assert not item.rollback_verified
+
+
+def test_lambda_recovery_merges_unrelated_variables_and_uses_revision():
+    aws = FakeAWS(reject_writes=False)
+    initial = aws.respond("lambda", "get_function_configuration", {})
+    initial["RevisionId"] = "rev-original"
+    owned = copy.deepcopy(initial)
+    owned["Environment"]["Variables"]["MODE"] = "chaos"
+    current = copy.deepcopy(owned)
+    current["RevisionId"] = "rev-current"
+    current["Environment"]["Variables"]["UNRELATED"] = "operator-added"
+    restored = copy.deepcopy(current)
+    restored["Environment"]["Variables"]["MODE"] = "normal"
+    aws.read_overrides[("lambda", "get_function_configuration")] = [
+        initial,
+        owned,
+        current,
+        restored,
+        restored,
+    ]
+    item, values = experiment(framework.ChaosType.LAMBDA_ENVIRONMENT_CORRUPT, aws)
+    assert item.corrupt_environment(**values).status == "completed"
+    item.run_rollback()
+    writes = [
+        args for _, op, args in aws.calls if op == "update_function_configuration"
+    ]
+    assert writes[-1]["RevisionId"] == "rev-current"
+    assert writes[-1]["Environment"]["Variables"] == {
+        "MODE": "normal",
+        "UNRELATED": "operator-added",
+    }
+    assert item.rollback_verified
+
+
+def test_owned_policy_removal_preserves_concurrent_unrelated_statement():
+    import json
+
+    owned = {"Sid": "ChaosFrameworkDeny", "Effect": "Deny"}
+    unrelated = {"Sid": "OperatorAdded", "Effect": "Allow"}
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [owned, unrelated]})
+    assert framework.remove_owned_policy_statement(policy, owned)["Statement"] == [
+        unrelated
+    ]
+    changed = {"Sid": "ChaosFrameworkDeny", "Effect": "Allow"}
+    with pytest.raises(framework.SafetyViolation):
+        framework.remove_owned_policy_statement(
+            json.dumps({"Statement": [changed]}), owned
+        )

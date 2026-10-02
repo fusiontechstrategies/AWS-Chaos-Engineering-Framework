@@ -185,7 +185,8 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
                 )
             if (
                 relative == "setup.cfg"
-                and contents.strip() != b"[egg_info]\ntag_build = \ntag_date = 0"
+                and contents.replace(b"\r\n", b"\n").strip()
+                != b"[egg_info]\ntag_build = \ntag_date = 0"
             ):
                 raise ValueError(
                     "source distribution contains unreviewed setup configuration"

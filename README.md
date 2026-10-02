@@ -101,7 +101,7 @@ Live mode is intentionally inconvenient. Complete these steps before enabling it
 4. Configure required target tags and an exact target allowlist.
 5. Add CloudWatch safety alarms and verify their behavior.
 6. Run and review the plan.
-7. Print the exact confirmation token.
+7. Print the exact confirmation token after reviewing the complete configuration. Any plan or safety change invalidates it.
 
 ```powershell
 python .\aws_chaos_framework.py `
