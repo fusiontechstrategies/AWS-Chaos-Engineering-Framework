@@ -364,3 +364,34 @@ def test_owned_policy_removal_preserves_concurrent_unrelated_statement():
         framework.remove_owned_policy_statement(
             json.dumps({"Statement": [changed]}), owned
         )
+
+
+def test_rds_retention_rollback_refuses_concurrent_change():
+    aws = FakeAWS(reject_writes=False)
+    original = aws.respond("rds", "describe_db_instances", {})
+    owned = copy.deepcopy(original)
+    owned["DBInstances"][0]["BackupRetentionPeriod"] = 0
+    operator = copy.deepcopy(original)
+    operator["DBInstances"][0]["BackupRetentionPeriod"] = 14
+    aws.read_overrides[("rds", "describe_db_instances")] = [original, owned, operator]
+    item, values = experiment(framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY, aws)
+    assert item.modify_backup_retention(**values).status == "completed"
+    with pytest.raises(framework.SafetyViolation, match="concurrent"):
+        item.run_rollback()
+    assert len([call for call in aws.calls if call[1] == "modify_db_instance"]) == 1
+    assert not item.rollback_verified
+
+
+def test_rds_original_retention_with_pending_change_is_not_verified():
+    aws = FakeAWS(reject_writes=False)
+    item, _ = experiment(framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY, aws)
+    item.original_retention = 7
+    item.owned_retention = 0
+    item.db_identifier = "synthetic"
+    item.mutation_attempts.append("rds.modify_db_instance")
+    current = aws.respond("rds", "describe_db_instances", {})
+    current["DBInstances"][0]["PendingModifiedValues"] = {"BackupRetentionPeriod": 0}
+    aws.read_overrides[("rds", "describe_db_instances")] = [current]
+    with pytest.raises(framework.SafetyViolation, match="pending"):
+        item.run_rollback()
+    assert not item.rollback_verified

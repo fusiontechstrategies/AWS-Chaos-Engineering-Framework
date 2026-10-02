@@ -2782,7 +2782,9 @@ class RDSChaosExperiment(ChaosExperiment):
                         BackupRetentionPeriod=retention_period,
                         ApplyImmediately=True,
                     )
-                    self._wait_for_db_instance_available(db_identifier, True)
+                    self._wait_for_db_instance_available(
+                        db_identifier, True, expected_retention=retention_period
+                    )
                     result.affected_resources = [db_identifier]
                     logger.info(
                         f"Modified backup retention to {retention_period} days for: {db_identifier}"
@@ -2920,7 +2922,10 @@ class RDSChaosExperiment(ChaosExperiment):
         raise TimeoutError("Timed out waiting for the RDS cluster to become available")
 
     def _wait_for_db_instance_available(
-        self, db_instance_identifier: str, interruptible: bool
+        self,
+        db_instance_identifier: str,
+        interruptible: bool,
+        expected_retention: int | None = None,
     ) -> None:
         """Wait cooperatively for an RDS DB instance to become available."""
         timeout = int(self.config.get("state_timeout_seconds", 600))
@@ -2931,7 +2936,14 @@ class RDSChaosExperiment(ChaosExperiment):
             ).get("DBInstances", [])
             if len(instances) != 1:
                 raise RuntimeError("RDS did not return the selected DB instance")
-            if instances[0].get("DBInstanceStatus") == "available":
+            if instances[0].get("DBInstanceStatus") == "available" and (
+                expected_retention is None
+                or (
+                    instances[0].get("BackupRetentionPeriod") == expected_retention
+                    and "BackupRetentionPeriod"
+                    not in instances[0].get("PendingModifiedValues", {})
+                )
+            ):
                 return
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
@@ -2950,6 +2962,8 @@ class RDSChaosExperiment(ChaosExperiment):
                 current = self.rds.describe_db_instances(
                     DBInstanceIdentifier=self.db_identifier
                 )["DBInstances"][0]
+                if "BackupRetentionPeriod" in current.get("PendingModifiedValues", {}):
+                    raise SafetyViolation("RDS retention still has a pending change")
                 if not restoration_required(
                     current.get("BackupRetentionPeriod"),
                     self.original_retention,
@@ -2963,7 +2977,11 @@ class RDSChaosExperiment(ChaosExperiment):
                     BackupRetentionPeriod=self.original_retention,
                     ApplyImmediately=True,
                 )
-                self._wait_for_db_instance_available(self.db_identifier, False)
+                self._wait_for_db_instance_available(
+                    self.db_identifier,
+                    False,
+                    expected_retention=self.original_retention,
+                )
                 restored = self.rds.describe_db_instances(
                     DBInstanceIdentifier=self.db_identifier
                 )["DBInstances"][0]

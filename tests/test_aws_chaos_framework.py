@@ -1051,7 +1051,7 @@ def test_evidence_report_redacts_identity_and_targets_by_default(
     tmp_path: Path,
 ) -> None:
     orchestrator = object.__new__(framework.ChaosOrchestrator)
-    orchestrator.config = {"reporting": {}}
+    orchestrator.config = {"reporting": {"include_diagnostics": True}}
     orchestrator.results = [
         framework.ExperimentResult(
             experiment_id="test-result",
@@ -1061,6 +1061,11 @@ def test_evidence_report_redacts_identity_and_targets_by_default(
             status="planned",
             affected_resources=[INSTANCE_ID],
             errors=[f"target {INSTANCE_ID} in account {ACCOUNT_ID}"],
+            additional_info={
+                "snapshot_id": "snap-derived-not-configured",
+                "writer_endpoint": "derived-database.internal.invalid",
+                "invalidation_id": "DERIVEDCF123",
+            },
         )
     ]
     orchestrator.run_id = "offline-test-run"
@@ -1085,6 +1090,12 @@ def test_evidence_report_redacts_identity_and_targets_by_default(
     assert INSTANCE_ID not in report_text
     assert ACCOUNT_ID not in report_text
     assert BREAK_GLASS_ARN not in report_text
+    for derived in (
+        "snap-derived-not-configured",
+        "derived-database.internal.invalid",
+        "DERIVEDCF123",
+    ):
+        assert derived not in report_text
     assert "affected_resources" not in report["experiments"][0]
     assert report["experiments"][0]["affected_resource_count"] == 1
 
