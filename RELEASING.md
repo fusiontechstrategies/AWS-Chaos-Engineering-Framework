@@ -90,3 +90,24 @@ partial upload attempts remove only the new draft's returned release ID. If
 creation returns no trustworthy ID or cleanup itself fails, the workflow fails
 and the owner must inspect drafts; it never guesses an existing release by tag
 or deletes a tag. No failed verification authorizes publication.
+
+## PyPI dispatch trust boundary
+
+The external `pypi` environment permits exactly the `main` branch, not tags or
+wildcards, requires the repository owner to approve, and disables administrator
+bypass. These restrictions are external to branch-selected YAML, so a modified
+branch workflow cannot grant itself the deployment identity. Both jobs reject
+non-main dispatches. Verification tools come from the exact workflow commit,
+whose GitHub signature and protected-main ancestry are checked. Each job reads
+and validates the current environment policy, owner reviewer, protected-main CI
+status policy and workflow signature before its work. Read permissions are
+limited to contents and Actions; no administration token is added to the workflow.
+Full signature enforcement, CI, no-force-push and no-deletion branch settings
+also require maintainer audit because the job token cannot read administrative
+branch-protection details. Settings-changing administrators remain trusted.
+
+PyPI must register exactly this repository, `publish.yml`, and `pypi` environment.
+The prior successful trusted publication is historical identity evidence, not a
+fresh inspection of the PyPI maintainer account. Recheck current registration
+before authorizing any future publication; code changes and successful CI do not
+authorize a dispatch or prove that external PyPI account state is unchanged.

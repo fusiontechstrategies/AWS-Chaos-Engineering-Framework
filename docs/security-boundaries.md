@@ -10,17 +10,15 @@ an existing provisioned mode and a smaller positive provisioned throughput. Lamb
 functions without reserved concurrency can only be paused at zero. ECS desired
 count must decrease. Scale-up is not supported by these experiments.
 
-Live FIS templates support only reviewed EC2 reboot actions and stop actions with
-automatic restart between one and 59 minutes. Other actions remain available for
-planning but cannot run live. Targets must be explicit local EC2 instance ARNs,
-already running, and exactly allowlisted. The aggregate target bound must fit
-`max_blast_radius`. A stop alarm must belong to the expected partition, region,
-and account, exist in an OK state, and be named in `safety.safety_alarms`.
-The template is read again before starting and a changed template is rejected.
-Restrict FIS template modification permissions during execution, since AWS starts
-templates by ID and does not provide a conditional version parameter.
+FIS template inspection is read-only. Live starts and live confirmation tokens
+are disabled because StartExperiment takes a mutable template ID with no
+conditional version or digest. A second read does not close the final-read/start
+race, and configuration assertions do not prove an immutable IAM/SCP boundary.
+Re-enabling this capability requires an enforceable, independently verified
+immutable-template trust boundary or conditional AWS start support. Recovery
+methods remain usable for already-running experiments from older versions.
 
-Emergency stop prevents new forward writes at the SDK boundary. Recovery writes
+Emergency stop is a process-wide latch shared by every controller, including controllers created after a stop. Signals and safety failures prevent new forward writes at the SDK boundary. Recovery writes
 remain available. Unknown FIS start outcomes require operator reconciliation.
 Terminal FIS status alone does not prove resource recovery. ECS recovery requires
 restored running capacity, no pending tasks or failed deployments, and one stable
@@ -65,9 +63,7 @@ Lambda writes also use RevisionId and preserve unrelated environment variables.
 S3/SNS policy recovery removes only the exact experiment-owned statement and keeps
 unrelated concurrent statements. API operations without a conditional revision
 parameter still require an exclusive change window: read-before-write checks do
-not make those AWS APIs atomic. FIS template modification must remain denied to
-other principals throughout validation, start and execution. The second read
-narrows the race but cannot replace that IAM deployment prerequisite.
+not make those AWS APIs atomic. Live FIS execution remains disabled rather than trusting an unverified exclusive-change assertion.
 
 All live experiments are serialized from pre-state capture through verified
 recovery, including direct worker calls and separate orchestrators in the same
@@ -137,3 +133,39 @@ distribution bytes are copied into a fresh payload with a tag, source commit,
 size, and SHA-256 manifest. The protected publish job independently checks that
 manifest and the exact distribution set immediately before publishing. No
 tag-controlled code executes after the verified payload is captured.
+
+## Destructive-call and transition evidence
+
+VPC deletion requires an explicitly successful service result, followed by exact
+target absence (including the matching not-found error) or the authoritative
+`deleted` peering tombstone. EC2 may retain deleted peering records temporarily.
+A rejection, unknown result or bounded read-back timeout is a failed result.
+RDS failover requires a different exact writer and available cluster state.
+RDS reboot requires an observed rebooting state followed by available. An API
+acceptance or an unchanged available response alone does not prove completion.
+
+SQS purge configuration requires `queue_arn` as well as `queue_url`. The reviewed
+ARN must exactly match the configured partition, region and account, and the
+native HTTPS queue URL must name the same account and queue. Operators obtain
+QueueArn through a read-only lookup before reviewing the configuration. The
+offline token binds that explicit owner identity; live code resolves and compares
+it again through the final SDK dispatch. Foreign, missing or changed owners fail
+closed before PurgeQueue. No token generator performs an AWS lookup.
+
+Enabled GuardDuty checks consider all non-archived high/critical findings across
+all detectors, without a last-update cutoff. Enabled Security Hub checks block
+ACTIVE CRITICAL findings in NEW or NOTIFIED, while RESOLVED and SUPPRESSED do not
+block. Both exhaust bounded result pages and reject pagination ambiguity or
+exhaustion. Failed reads still fail closed.
+
+Live suite/worker preflight failures and exceptions from safety reads latch the
+same process stop as a signal. Safety and terminal-state reads recheck stop after
+returning; the final SQS owner lookup rechecks stop immediately before dispatch.
+This cannot cancel an AWS request already in flight or make a Python check and
+remote RPC atomic. Recovery waits remain exempt from forward safety polling.
+
+Wheel verification requires the complete canonical member set and exactly one
+RECORD row per member, with SHA-256 and byte size matching the actual contents;
+RECORD leaves its own hash/size empty. Unknown, duplicate, unsafe or missing rows
+and missing metadata fail closed. Expanded wheel members also have per-member
+and aggregate byte budgets before their contents are retained.

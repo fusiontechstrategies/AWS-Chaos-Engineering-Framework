@@ -31,10 +31,11 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 try:
     import boto3
@@ -87,6 +88,8 @@ _LIVE_EXPERIMENT_LOCK = threading.RLock()
 # Recovery uncertainty persists across orchestrators. Only reconciliation and a
 # new process may permit another live baseline after this latch is set.
 _LIVE_RECOVERY_BLOCKED = threading.Event()
+# Signals and safety failures stop forward work across every controller.
+_PROCESS_EMERGENCY_STOP = threading.Event()
 
 
 class ConfigurationError(ValueError):
@@ -439,7 +442,7 @@ REQUIRED_PARAMETERS: dict[ChaosType, tuple[str, ...]] = {
     ChaosType.S3_BUCKET_ENCRYPTION_DISABLE: ("bucket_name",),
     ChaosType.S3_OBJECT_DELETE: ("bucket_name", "prefix"),
     ChaosType.S3_LIFECYCLE_MODIFY: ("bucket_name",),
-    ChaosType.SQS_QUEUE_PURGE: ("queue_url",),
+    ChaosType.SQS_QUEUE_PURGE: ("queue_url", "queue_arn"),
     ChaosType.SQS_QUEUE_POLICY_RESTRICT: ("queue_url", "break_glass_principal_arn"),
     ChaosType.SQS_MESSAGE_DELAY: ("queue_url",),
     ChaosType.SQS_VISIBILITY_TIMEOUT: ("queue_url",),
@@ -573,7 +576,7 @@ PRIMARY_TARGET_KEYS: dict[ChaosType, tuple[str, ...]] = {
 def experiment_metadata(experiment_type: ChaosType) -> ExperimentMetadata:
     """Return authoritative support and risk metadata."""
     if experiment_type == ChaosType.FIS_TEMPLATE:
-        return ExperimentMetadata("fis", RiskLevel.MEDIUM, True, "managed")
+        return ExperimentMetadata("fis", RiskLevel.MEDIUM, False, "managed")
     if experiment_type in FIS_TEMPLATE_ONLY_EXPERIMENTS:
         risk = (
             RiskLevel.HIGH
@@ -860,6 +863,27 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def require_runtime_safety(
+    controller: Any, context: str, error_type: type[Exception] = EmergencyStop
+) -> None:
+    """Every live guard failure latches process stop, including failed guard reads."""
+    if _PROCESS_EMERGENCY_STOP.is_set() or controller.emergency_stop.is_set():
+        raise error_type("Emergency stop requested")
+    try:
+        safe, violations = controller.check_safety_conditions()
+    except Exception:
+        _PROCESS_EMERGENCY_STOP.set()
+        controller.emergency_stop_all()
+        raise error_type(f"{context} evaluation failed") from None
+    if not safe:
+        _PROCESS_EMERGENCY_STOP.set()
+        controller.emergency_stop_all()
+        raise error_type(f"{context} check failed: " + "; ".join(violations))
+    # Safety calls can block while another controller receives a signal.
+    if _PROCESS_EMERGENCY_STOP.is_set() or controller.emergency_stop.is_set():
+        raise error_type("Emergency stop requested")
+
+
 class AwsClientProxy:
     """Record successful AWS mutations without logging request arguments."""
 
@@ -888,6 +912,24 @@ class AwsClientProxy:
                     and self._owner.safety_controller.emergency_stop.is_set()
                 ):
                     raise EmergencyStop("Emergency stop prevents further AWS mutations")
+                if self._service == "sqs" and name == "purge_queue":
+                    expected = str(self._owner.config.get("queue_arn", ""))
+                    url = str(kwargs.get("QueueUrl", ""))
+                    validate_queue_identity(self._owner.config, url, expected)
+                    current = self._client.get_queue_attributes(
+                        QueueUrl=url, AttributeNames=["QueueArn"]
+                    )
+                    if current.get("Attributes", {}).get("QueueArn") != expected:
+                        raise SafetyViolation(
+                            "SQS QueueArn changed before purge dispatch"
+                        )
+                if not self._owner._in_rollback and (
+                    _PROCESS_EMERGENCY_STOP.is_set()
+                    or self._owner.safety_controller.emergency_stop.is_set()
+                ):
+                    raise EmergencyStop(
+                        "Emergency stop prevents dispatch after safety or ownership read"
+                    )
                 self._owner._record_mutation_attempt(f"{self._service}.{name}")
             response = attribute(*args, **kwargs)
             if self._owner is not None:
@@ -935,7 +977,7 @@ class SafetyController:
         self.session = session
         self.region = region
         self.live = live
-        self.emergency_stop = threading.Event()
+        self.emergency_stop = _PROCESS_EMERGENCY_STOP
         self._active_count = 0
         self._active_lock = threading.Lock()
         self._clients: dict[tuple[str, str], Any] = {}
@@ -1050,38 +1092,45 @@ class SafetyController:
 
         return violations
 
+    @staticmethod
+    def _security_pages(operation: Any, **request: Any) -> Iterable[dict[str, Any]]:
+        """Exhaust safety pages without accepting a cycle or unbounded API scan."""
+        seen = set()
+        for _ in range(100):
+            page = operation(**request)
+            yield page
+            token = page.get("NextToken")
+            if not token:
+                return
+            if not isinstance(token, str) or token in seen:
+                raise SafetyViolation("Security finding pagination is ambiguous")
+            seen.add(token)
+            request["NextToken"] = token
+        raise SafetyViolation("Security finding pagination exceeded its safe bound")
+
     def _check_guardduty_findings(self) -> list[str]:
         """Check GuardDuty for high severity findings"""
         violations: list[str] = []
         try:
             guardduty = self.client("guardduty")
-            detectors = guardduty.list_detectors()
-            if not detectors.get("DetectorIds"):
+            detector_ids = []
+            for page in self._security_pages(guardduty.list_detectors):
+                detector_ids.extend(page.get("DetectorIds", []))
+            if not detector_ids:
                 return ["GuardDuty check is enabled but no detector was found"]
-
-            detector_id = detectors["DetectorIds"][0]
-
-            # Check for high severity findings
-            findings = guardduty.list_findings(
-                DetectorId=detector_id,
-                FindingCriteria={
-                    "Criterion": {
-                        "severity": {
-                            "Gte": 7  # High and Critical severity
-                        },
-                        "updatedAt": {
-                            "Gte": int(
-                                (utc_now() - timedelta(hours=1)).timestamp() * 1000
-                            )
-                        },
-                    }
-                },
-            )
-
-            if findings.get("FindingIds"):
-                violations.append(
-                    f"GuardDuty has {len(findings['FindingIds'])} recent high severity findings"
-                )
+            for detector_id in detector_ids:
+                for page in self._security_pages(
+                    guardduty.list_findings,
+                    DetectorId=detector_id,
+                    FindingCriteria={
+                        "Criterion": {
+                            "severity": {"Gte": 7},
+                            "service.archived": {"Eq": ["false"]},
+                        }
+                    },
+                ):
+                    if page.get("FindingIds"):
+                        return ["GuardDuty has active high severity findings"]
 
         except Exception as exc:
             logger.error("Error checking GuardDuty: %s", exc)
@@ -1095,18 +1144,20 @@ class SafetyController:
         violations: list[str] = []
         try:
             securityhub = self.client("securityhub")
-            findings = securityhub.get_findings(
+            for page in self._security_pages(
+                securityhub.get_findings,
                 Filters={
                     "SeverityLabel": [{"Value": "CRITICAL", "Comparison": "EQUALS"}],
-                    "WorkflowStatus": [{"Value": "NEW", "Comparison": "EQUALS"}],
+                    "WorkflowStatus": [
+                        {"Value": "NEW", "Comparison": "EQUALS"},
+                        {"Value": "NOTIFIED", "Comparison": "EQUALS"},
+                    ],
+                    "RecordState": [{"Value": "ACTIVE", "Comparison": "EQUALS"}],
                 },
-                MaxResults=10,
-            )
-
-            if findings.get("Findings"):
-                violations.append(
-                    f"Security Hub has {len(findings['Findings'])} new critical findings"
-                )
+                MaxResults=100,
+            ):
+                if page.get("Findings"):
+                    return ["Security Hub has active critical findings"]
 
         except Exception as exc:
             logger.error("Error checking Security Hub: %s", exc)
@@ -1425,16 +1476,7 @@ class ChaosExperiment:
         """Poll all configured guards during forward work; recovery is exempt."""
         if self.dry_run or self._in_rollback:
             return
-        if self.safety_controller.emergency_stop.is_set():
-            raise EmergencyStop("Emergency stop requested")
-        try:
-            safe, violations = self.safety_controller.check_safety_conditions()
-        except Exception:
-            self.safety_controller.emergency_stop_all()
-            raise EmergencyStop("Runtime safety evaluation failed") from None
-        if not safe:
-            self.safety_controller.emergency_stop_all()
-            raise EmergencyStop("Runtime safety check failed: " + "; ".join(violations))
+        require_runtime_safety(self.safety_controller, "Runtime safety")
 
     def _wait_forward(self, seconds: float) -> None:
         """Wake and poll no later than the configured monitor interval."""
@@ -2973,6 +3015,48 @@ class VPCChaosExperiment(ChaosExperiment):
 
         return result
 
+    def _wait_for_vpc_deletion(self, target: str, *, peering: bool) -> None:
+        """Require exact-target absence or an authoritative EC2 deleted tombstone."""
+        deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
+        while time.monotonic() < deadline:
+            self._check_forward_safety()
+            try:
+                if peering:
+                    items = self.ec2.describe_vpc_peering_connections(
+                        VpcPeeringConnectionIds=[target]
+                    ).get("VpcPeeringConnections")
+                    key = "VpcPeeringConnectionId"
+                else:
+                    items = self.ec2.describe_vpc_endpoints(
+                        VpcEndpointIds=[target]
+                    ).get("VpcEndpoints")
+                    key = "VpcEndpointId"
+            except ClientError as exc:
+                expected = (
+                    "InvalidVpcPeeringConnectionID.NotFound"
+                    if peering
+                    else "InvalidVpcEndpointId.NotFound"
+                )
+                if exc.response.get("Error", {}).get("Code") == expected:
+                    self._check_forward_safety()
+                    return
+                raise
+            self._check_forward_safety()
+            if not isinstance(items, list) or any(
+                item.get(key) != target for item in items
+            ):
+                raise SafetyViolation(
+                    "VPC deletion read-back did not identify the exact target"
+                )
+            if not items or (
+                peering
+                and len(items) == 1
+                and items[0].get("Status", {}).get("Code") == "deleted"
+            ):
+                return
+            self._wait_forward(min(5.0, max(0.1, deadline - time.monotonic())))
+        raise TimeoutError("VPC deletion did not reach a verified deleted state")
+
     def delete_vpc_peering(self, peering_connection_id: str) -> ExperimentResult:
         """Delete VPC peering connection"""
         experiment_id = _experiment_id("vpc-peering-delete")
@@ -2992,9 +3076,12 @@ class VPCChaosExperiment(ChaosExperiment):
 
                 if not self.dry_run:
                     # Delete peering connection
-                    self.ec2.delete_vpc_peering_connection(
+                    response = self.ec2.delete_vpc_peering_connection(
                         VpcPeeringConnectionId=peering_connection_id
                     )
+                    if response.get("Return") is not True:
+                        raise SafetyViolation("AWS did not accept VPC peering deletion")
+                    self._wait_for_vpc_deletion(peering_connection_id, peering=True)
                     result.affected_resources = [peering_connection_id]
                     logger.info(
                         f"Deleted VPC peering connection: {peering_connection_id}"
@@ -3040,7 +3127,14 @@ class VPCChaosExperiment(ChaosExperiment):
 
                 if not self.dry_run:
                     # Delete endpoint
-                    self.ec2.delete_vpc_endpoints(VpcEndpointIds=[endpoint_id])
+                    response = self.ec2.delete_vpc_endpoints(
+                        VpcEndpointIds=[endpoint_id]
+                    )
+                    if response.get("Unsuccessful") != []:
+                        raise SafetyViolation(
+                            "AWS did not accept VPC endpoint deletion"
+                        )
+                    self._wait_for_vpc_deletion(endpoint_id, peering=False)
                     result.affected_resources = [endpoint_id]
                     logger.info(f"Deleted VPC endpoint: {endpoint_id}")
                 else:
@@ -3217,16 +3311,23 @@ class RDSChaosExperiment(ChaosExperiment):
                     "RDS cluster failover requires at least two cluster members"
                 )
 
+            writers = [
+                member["identifier"]
+                for member in result.metrics_before["members"]
+                if member["is_writer"]
+            ]
+            if len(writers) != 1 or not writers[0]:
+                raise SafetyViolation("RDS pre-state must identify one exact writer")
+
             if not self.dry_run:
                 self.rds.failover_db_cluster(DBClusterIdentifier=cluster_identifier)
                 result.affected_resources = [cluster_identifier]
                 logger.info(f"Initiated failover for RDS cluster: {cluster_identifier}")
 
-                # Wait for failover to complete
-                self._wait_for_cluster_available(cluster_identifier)
-
-                # Get cluster info after failover
-                result.metrics_after = self._get_cluster_metrics(cluster_identifier)
+                # An unchanged available response does not prove failover.
+                result.metrics_after = self._wait_for_cluster_available(
+                    cluster_identifier, original_writer=writers[0]
+                )
             else:
                 logger.info(
                     f"DRY RUN: Would failover RDS cluster: {cluster_identifier}"
@@ -3279,7 +3380,9 @@ class RDSChaosExperiment(ChaosExperiment):
                 )
                 result.affected_resources = [db_instance_identifier]
                 logger.info(f"Rebooted RDS instance: {db_instance_identifier}")
-                self._wait_for_db_instance_available(db_instance_identifier, True)
+                self._wait_for_db_instance_available(
+                    db_instance_identifier, True, require_transition=True
+                )
             else:
                 logger.info(
                     f"DRY RUN: Would reboot RDS instance: {db_instance_identifier}"
@@ -3435,7 +3538,10 @@ class RDSChaosExperiment(ChaosExperiment):
         """Get RDS cluster metrics"""
         response = self.rds.describe_db_clusters(DBClusterIdentifier=cluster_identifier)
         clusters = response.get("DBClusters", [])
-        if len(clusters) != 1:
+        if (
+            len(clusters) != 1
+            or clusters[0].get("DBClusterIdentifier") != cluster_identifier
+        ):
             raise ConfigurationError(f"RDS cluster not found: {cluster_identifier}")
         cluster = clusters[0]
         return {
@@ -3453,17 +3559,30 @@ class RDSChaosExperiment(ChaosExperiment):
         }
 
     def _wait_for_cluster_available(
-        self, cluster_identifier: str, interruptible: bool = True
-    ) -> None:
-        """Wait for cluster to be available"""
+        self,
+        cluster_identifier: str,
+        interruptible: bool = True,
+        original_writer: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the exact available observation proving the writer transition."""
         timeout = int(self.config.get("state_timeout_seconds", 600))
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if interruptible:
                 self._check_forward_safety()
             metrics = self._get_cluster_metrics(cluster_identifier)
-            if metrics["status"] == "available":
-                return
+            if interruptible:
+                self._check_forward_safety()
+            writers = [
+                member["identifier"]
+                for member in metrics["members"]
+                if member["is_writer"]
+            ]
+            transitioned = original_writer is None or (
+                len(writers) == 1 and bool(writers[0]) and writers[0] != original_writer
+            )
+            if metrics["status"] == "available" and transitioned:
+                return metrics
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
                 self._wait_forward(wait_seconds)
@@ -3476,24 +3595,37 @@ class RDSChaosExperiment(ChaosExperiment):
         db_instance_identifier: str,
         interruptible: bool,
         expected_retention: int | None = None,
+        require_transition: bool = False,
     ) -> None:
-        """Wait cooperatively for an RDS DB instance to become available."""
+        """Wait for availability after positive evidence of the requested transition."""
         timeout = int(self.config.get("state_timeout_seconds", 600))
         deadline = time.monotonic() + timeout
+        transition_seen = not require_transition
         while time.monotonic() < deadline:
             if interruptible:
                 self._check_forward_safety()
             instances = self.rds.describe_db_instances(
                 DBInstanceIdentifier=db_instance_identifier
             ).get("DBInstances", [])
-            if len(instances) != 1:
+            if interruptible:
+                self._check_forward_safety()
+            if (
+                len(instances) != 1
+                or instances[0].get("DBInstanceIdentifier") != db_instance_identifier
+            ):
                 raise RuntimeError("RDS did not return the selected DB instance")
-            if instances[0].get("DBInstanceStatus") == "available" and (
-                expected_retention is None
-                or (
-                    instances[0].get("BackupRetentionPeriod") == expected_retention
-                    and "BackupRetentionPeriod"
-                    not in instances[0].get("PendingModifiedValues", {})
+            if instances[0].get("DBInstanceStatus") == "rebooting":
+                transition_seen = True
+            if (
+                transition_seen
+                and instances[0].get("DBInstanceStatus") == "available"
+                and (
+                    expected_retention is None
+                    or (
+                        instances[0].get("BackupRetentionPeriod") == expected_retention
+                        and "BackupRetentionPeriod"
+                        not in instances[0].get("PendingModifiedValues", {})
+                    )
                 )
             ):
                 return
@@ -4341,7 +4473,8 @@ class SQSChaosExperiment(ChaosExperiment):
         try:
             # Get queue attributes before purge
             attrs = self.sqs.get_queue_attributes(
-                QueueUrl=queue_url, AttributeNames=["ApproximateNumberOfMessages"]
+                QueueUrl=queue_url,
+                AttributeNames=["ApproximateNumberOfMessages", "QueueArn"],
             )
             result.metrics_before = {
                 "message_count": int(
@@ -4350,6 +4483,20 @@ class SQSChaosExperiment(ChaosExperiment):
             }
 
             if not self.dry_run:
+                expected = str(self.config.get("queue_arn", ""))
+                validate_queue_identity(self.config, queue_url, expected)
+                # Resolve owner again after safety polling, immediately before destructive call.
+                self._check_forward_safety()
+                current = self.sqs.get_queue_attributes(
+                    QueueUrl=queue_url, AttributeNames=["QueueArn"]
+                )
+                if (
+                    attrs.get("Attributes", {}).get("QueueArn") != expected
+                    or current.get("Attributes", {}).get("QueueArn") != expected
+                ):
+                    raise SafetyViolation(
+                        "SQS returned a QueueArn different from the reviewed owner"
+                    )
                 self.sqs.purge_queue(QueueUrl=queue_url)
                 result.affected_resources = [queue_url]
                 logger.info(f"Purged queue: {queue_url}")
@@ -7443,82 +7590,12 @@ class FISTemplateExperiment(ChaosExperiment):
             result.affected_resources = [experiment_template_id]
             if violations:
                 raise SafetyViolation("; ".join(violations))
-            if self.dry_run:
-                result.status = "planned"
-                return result
-            self.recovery_instance_ids = sorted(
-                {
-                    arn.rsplit("/", 1)[1]
-                    for target in template.get("targets", {}).values()
-                    for arn in target.get("resourceArns", [])
-                }
-            )
-            instances = self.client("ec2").describe_instances(
-                InstanceIds=self.recovery_instance_ids
-            )
-            states = {
-                instance["InstanceId"]: instance.get("State", {}).get("Name")
-                for reservation in instances.get("Reservations", [])
-                for instance in reservation.get("Instances", [])
-            }
-            if set(states) != set(self.recovery_instance_ids) or any(
-                state != "running" for state in states.values()
-            ):
+            if not self.dry_run:
                 raise SafetyViolation(
-                    "FIS pre-state must contain all selected running instances"
+                    "Live FIS templates are disabled: StartExperiment cannot bind an immutable reviewed template"
                 )
-            latest = self.fis.get_experiment_template(id=experiment_template_id).get(
-                "experimentTemplate"
-            )
-            if latest != template:
-                raise SafetyViolation("FIS template changed after validation")
-            start_request = {
-                "clientToken": str(uuid.uuid4()),
-                "experimentTemplateId": experiment_template_id,
-                "tags": {"StartedBy": TOOL_NAME, "FrameworkVersion": __version__},
-            }
-            try:
-                started = self.fis.start_experiment(**start_request)
-            except Exception:
-                # The identical token reconciles a lost response without creating a second experiment.
-                started = self.fis.start_experiment(**start_request)
-            experiment = started.get("experiment", {})
-            self.fis_experiment_id = experiment.get("id")
-            if not self.fis_experiment_id:
-                raise RuntimeError("AWS FIS did not return an experiment ID")
-            result.affected_resources = [self.fis_experiment_id]
-            poll_seconds = max(2, int(self.config.get("fis_poll_seconds", 10)))
-            while True:
-                experiment = self.fis.get_experiment(id=self.fis_experiment_id).get(
-                    "experiment", {}
-                )
-                state = experiment.get("state", {})
-                status = state.get("status")
-                if status in self.TERMINAL_STATES:
-                    result.additional_info["fis_status"] = status
-                    reason = state.get("reason")
-                    if reason:
-                        result.additional_info["fis_reason"] = reason
-                    if status == "completed":
-                        result.status = "completed"
-                    else:
-                        result.status = "failed"
-                        result.errors.append(
-                            f"AWS FIS experiment ended with status {status}: {reason or ''}".strip()
-                        )
-                    break
-                safe, safety_violations = (
-                    self.safety_controller.check_safety_conditions()
-                )
-                if not safe:
-                    self.safety_controller.emergency_stop_all()
-                    raise EmergencyStop(
-                        "Runtime safety check failed: " + "; ".join(safety_violations)
-                    )
-                if self.safety_controller.emergency_stop.wait(poll_seconds):
-                    raise EmergencyStop("Emergency stop requested")
-        except EmergencyStop:
-            raise
+            result.status = "planned"
+
         except Exception as exc:
             logger.error("FIS template experiment failed: %s", exc)
             result.errors.append(str(exc))
@@ -7640,8 +7717,20 @@ class ChaosOrchestrator:
         self.random = random.Random(seed)  # nosec B311
         self.seed = seed
 
-        session = boto3.Session(profile_name=profile, region_name=self.region)
         requested_role = role_arn or global_config.get("role_arn")
+        if requested_role:
+            # Cover CLI precedence before making any STS request or forwarding
+            # the configured ExternalId to a different account or partition.
+            effective_config = copy.deepcopy(self.config)
+            effective_config["global"]["role_arn"] = requested_role
+            validate_config_data(effective_config)
+            if not ACCOUNT_ID_PATTERN.fullmatch(
+                str(global_config.get("account_id", ""))
+            ):
+                raise ConfigurationError(
+                    "Role assumption requires a configured account ID"
+                )
+        session = boto3.Session(profile_name=profile, region_name=self.region)
         self.approval_scope = {
             "profile": profile,
             "role_arn": requested_role,
@@ -7981,7 +8070,11 @@ class ChaosOrchestrator:
             item.value
             for item in experiment_types
             if not experiment_metadata(item).live_supported
-            and (self.live or item not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS)
+            and (
+                self.live
+                or item
+                not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS | {ChaosType.FIS_TEMPLATE}
+            )
         ]
         if unsupported:
             raise ConfigurationError(
@@ -8035,14 +8128,14 @@ class ChaosOrchestrator:
 
         logger.info("Starting experiment suite %s", suite_name)
 
-        safe, violations = self.safety_controller.check_safety_conditions()
-        if self.live and not safe:
-            raise SafetyViolation(
-                "Safety checks failed, refusing live execution: "
-                + "; ".join(violations)
+        if self.live:
+            require_runtime_safety(
+                self.safety_controller, "Suite preflight safety", SafetyViolation
             )
-        if not self.live and violations:
-            logger.warning("Dry-run safety observations: %s", "; ".join(violations))
+        else:
+            _safe, violations = self.safety_controller.check_safety_conditions()
+            if violations:
+                logger.warning("Dry-run safety observations: %s", "; ".join(violations))
 
         suite_concurrency = int(suite.get("max_concurrent", 1))
         global_concurrency = int(
@@ -8324,12 +8417,7 @@ class ChaosOrchestrator:
                 return
             if self.safety_controller.emergency_stop.wait(min(interval, remaining)):
                 raise EmergencyStop("Emergency stop requested")
-            safe, violations = self.safety_controller.check_safety_conditions()
-            if not safe:
-                self.safety_controller.emergency_stop_all()
-                raise EmergencyStop(
-                    "Runtime safety check failed: " + "; ".join(violations)
-                )
+            require_runtime_safety(self.safety_controller, "Runtime safety")
 
     @staticmethod
     def _rollback_outcome(
@@ -8367,6 +8455,10 @@ class ChaosOrchestrator:
         with sensitive_log_scope(getattr(self, "_log_sensitive_values", ())):
             if self.live:
                 with _LIVE_EXPERIMENT_LOCK:
+                    if _PROCESS_EMERGENCY_STOP.is_set():
+                        raise EmergencyStop(
+                            "Process-wide emergency stop prevents new live experiments"
+                        )
                     if _LIVE_RECOVERY_BLOCKED.is_set():
                         raise SafetyViolation(
                             "Live execution is blocked after unverified recovery; "
@@ -8399,6 +8491,11 @@ class ChaosOrchestrator:
         runtime_config = dict(self.config.get("global", {}))
         runtime_config.update(experiment_config)
         runtime_config["region"] = self.region
+        runtime_config["account_id"] = getattr(
+            self,
+            "expected_account",
+            self.config.get("global", {}).get("account_id", ""),
+        )
         runtime_config["dry_run"] = self.dry_run
         runtime_config["operator_principal_arn"] = self.operator_principal_arn
         runtime_config["active_access_key_id"] = self.active_access_key_id
@@ -8418,11 +8515,10 @@ class ChaosOrchestrator:
             raise SafetyViolation("Live automatic recovery cannot be disabled")
         self._validate_target_scope(experiment_type, experiment_config)
         if self.live:
-            safe, violations = self.safety_controller.check_safety_conditions()
-            if not safe:
-                raise SafetyViolation(
-                    "Pre-experiment safety check failed: " + "; ".join(violations)
-                )
+            require_runtime_safety(
+                self.safety_controller, "Pre-experiment safety", SafetyViolation
+            )
+
         logger.info(
             "Running experiment type=%s provider=%s risk=%s target_count=%d",
             experiment_type.value,
@@ -8568,7 +8664,8 @@ class ChaosOrchestrator:
         metadata = experiment_metadata(experiment_type)
         if not metadata.live_supported and (
             not experiment.dry_run
-            or experiment_type not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS
+            or experiment_type
+            not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS | {ChaosType.FIS_TEMPLATE}
         ):
             raise ConfigurationError(
                 f"Experiment type is not safely executable: {experiment_type.value}"
@@ -8936,7 +9033,8 @@ class ChaosOrchestrator:
         """Create experiment instance based on type"""
         if (
             not experiment_metadata(experiment_type).live_supported
-            and experiment_type not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS
+            and experiment_type
+            not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS | {ChaosType.FIS_TEMPLATE}
         ):
             raise ConfigurationError(
                 f"Experiment type is not safely executable: {experiment_type.value}"
@@ -9356,7 +9454,7 @@ experiment_suites:
         auto_rollback: true
 
   managed_fis_template:
-    description: Validate and run an existing AWS FIS experiment template.
+    description: Inspect an existing AWS FIS template; live starts are disabled.
     max_concurrent: 1
     failure_policy: stop
     experiments:
@@ -9455,7 +9553,8 @@ def validate_config_data(config: dict[str, Any]) -> None:
     if role_arn:
         expected_partition = "aws-us-gov" if region in GOVCLOUD_REGIONS else "aws"
         match = re.fullmatch(
-            r"arn:(aws|aws-us-gov):iam::([0-9]{12}):role/.+", str(role_arn)
+            r"arn:(aws|aws-us-gov):iam::([0-9]{12}):role/[A-Za-z0-9+=,.@_/-]+",
+            str(role_arn),
         )
         if (
             not match
@@ -9659,6 +9758,10 @@ def validate_config_data(config: dict[str, Any]) -> None:
         for index, experiment_value in enumerate(experiments):
             location = f"experiment_suites.{suite_name}.experiments[{index}]"
             experiment = _mapping(experiment_value, location)
+            if {"account_id", "region", "role_arn", "external_id"} & experiment.keys():
+                raise ConfigurationError(
+                    f"{location} cannot override global execution identity"
+                )
             type_name = experiment.get("type")
             if type_name not in valid_type_names:
                 raise ConfigurationError(f"{location}.type is invalid: {type_name!r}")
@@ -9667,7 +9770,8 @@ def validate_config_data(config: dict[str, Any]) -> None:
             metadata = experiment_metadata(experiment_type)
             if (
                 not metadata.live_supported
-                and experiment_type not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS
+                and experiment_type
+                not in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS | {ChaosType.FIS_TEMPLATE}
             ):
                 if metadata.provider == "fis-template":
                     raise ConfigurationError(
@@ -9960,6 +10064,34 @@ def list_experiment_types() -> None:
         print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
 
 
+def validate_queue_identity(
+    config: dict[str, Any], queue_url: str, queue_arn: str
+) -> None:
+    """Bind an opaque SQS URL to an explicit local partition, region and account."""
+    region = str(config.get("region", DEFAULT_REGION))
+    account = str(config.get("account_id", ""))
+    partition = "aws-us-gov" if region in GOVCLOUD_REGIONS else "aws"
+    match = re.fullmatch(
+        r"arn:(aws|aws-us-gov):sqs:([^:]+):([0-9]{12}):([A-Za-z0-9_-]{1,80}(?:\.fifo)?)",
+        queue_arn,
+    )
+    if not match or match.group(1, 2, 3) != (partition, region, account):
+        raise ConfigurationError(
+            "SQS QueueArn must match the reviewed partition, region and account"
+        )
+    parsed = urlsplit(queue_url)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != f"sqs.{region}.amazonaws.com"
+        or parsed.path != f"/{account}/{match.group(4)}"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigurationError(
+            "SQS QueueUrl must exactly match the reviewed QueueArn"
+        )
+
+
 def confirmation_token(
     config: dict[str, Any],
     suite_name: str,
@@ -9982,6 +10114,16 @@ def confirmation_token(
     experiment_types = [
         ChaosType(item["type"]) for item in suites[suite_name]["experiments"]
     ]
+    for item in suites[suite_name]["experiments"]:
+        if item["type"] == ChaosType.SQS_QUEUE_PURGE.value:
+            values = {**config["global"], **item}
+            validate_queue_identity(
+                config["global"], values["queue_url"], values["queue_arn"]
+            )
+    if ChaosType.FIS_TEMPLATE in experiment_types:
+        raise ConfigurationError(
+            "Live FIS approval is disabled until immutable template authorization can be verified"
+        )
     if any(item in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS for item in experiment_types):
         raise ConfigurationError(
             "Live approval is unavailable for experiments without conditional recovery ownership proof"
@@ -9999,6 +10141,12 @@ def confirmation_token(
             "A valid global.account_id is required to generate a live token"
         )
     reviewed = copy.deepcopy(config)
+    effective_role = (execution_scope or {}).get("role_arn") or global_config.get(
+        "role_arn"
+    )
+    if effective_role:
+        reviewed["global"]["role_arn"] = effective_role
+        validate_config_data(reviewed)
     reviewed["safety"] = {
         key: value
         for key, value in reviewed.get("safety", {}).items()

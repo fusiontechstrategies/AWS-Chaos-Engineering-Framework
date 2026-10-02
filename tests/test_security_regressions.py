@@ -531,7 +531,7 @@ def test_constructor_live_token_matches_offline_token_without_config_mutation(
     for key, value in (
         ("vpc_id", "vpc-0123456789abcdef0"),
         ("seed", 8),
-        ("role_arn", "different-role"),
+        ("role_arn", f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/another-approved-role"),
         ("profile", "other"),
     ):
         assert (

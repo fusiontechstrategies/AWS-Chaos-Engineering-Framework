@@ -51,7 +51,7 @@ experiment_suites:
         auto_rollback: true
 
   managed_fis_template:
-    description: Validate and run an existing AWS FIS experiment template.
+    description: Inspect an existing AWS FIS template; live starts are disabled.
     max_concurrent: 1
     failure_policy: stop
     experiments:
