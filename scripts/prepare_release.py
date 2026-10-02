@@ -7,6 +7,7 @@ import argparse
 import base64
 import csv
 import hashlib
+import importlib.util
 import io
 import json
 import re
@@ -18,10 +19,15 @@ import unicodedata
 import zipfile
 from pathlib import Path, PurePosixPath
 
-try:
-    from scripts.verify_distribution import verify_distribution
-except ModuleNotFoundError:
-    from verify_distribution import verify_distribution
+_verifier_path = Path(__file__).resolve().with_name("verify_distribution.py")
+_verifier_spec = importlib.util.spec_from_file_location(
+    "trusted_distribution_verifier", _verifier_path
+)
+if _verifier_spec is None or _verifier_spec.loader is None:
+    raise ImportError("Trusted distribution verifier is unavailable")
+_verifier_module = importlib.util.module_from_spec(_verifier_spec)
+_verifier_spec.loader.exec_module(_verifier_module)
+verify_distribution = _verifier_module.verify_distribution
 
 
 PROJECT_DISPLAY_NAME = "AWS Chaos Engineering Framework"

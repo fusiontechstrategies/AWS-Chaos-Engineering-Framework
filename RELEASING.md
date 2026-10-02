@@ -2,7 +2,7 @@
 
 AWS Chaos Engineering Framework releases come from a reviewed, fully tested commit on protected `main`. The runtime, package metadata, changelog, release notes, tag, checksums, SBOM, and release evidence must identify the same stable version.
 
-Tag creation and release publication are separate maintainer decisions. The tag workflow creates only a draft GitHub release. It has no publication command and no package-registry upload step.
+Tag creation and release publication are separate maintainer decisions. The tag workflow builds a read-only candidate. A separate protected-main controller verifies that candidate and, after the required release-environment review, attests it and creates a draft. Neither workflow publishes a release or uploads to a package registry.
 
 ## Exact asset contract
 
@@ -55,7 +55,7 @@ The builder rejects mismatched versions or tags, malformed commit IDs, missing r
 
 ## Draft and publication review
 
-A `vX.Y.Z` tag must point to the approved GitHub-verified commit on protected `main`. The tag workflow rebuilds and compares every byte, attests every asset, and creates a non-prerelease draft with exactly the six approved files.
+A `vX.Y.Z` tag must point to the approved GitHub-verified commit on protected `main`. The tag workflow rebuilds and compares every byte with read-only permissions. The default-branch `release-promotion.yml` controller authenticates the producer run, signed source commit, protected-main verifier, immutable artifact ID, and exact six-asset digest map. It reconstructs the release with trusted-main helpers and reads tagged files only as data. Both privileged jobs repeat this verification after `release` environment approval; the draft job downloads and compares the remote asset bytes too. All Python verification runs in isolated mode from the trusted checkout, including the final draft state check.
 
 Before publication, download the draft assets into a clean directory, recompute checksums, verify provenance, inspect the archives and evidence, install both package formats independently, rerun the offline smoke commands, and confirm there are no unresolved security alerts. Publishing the draft remains a manual maintainer decision.
 
@@ -66,3 +66,27 @@ The manually dispatched `.github/workflows/publish.yml` workflow accepts an exis
 Before the first PyPI publication, recheck that the normalized project name is available, secure the PyPI maintainer account with two-factor authentication, register the exact GitHub repository, `publish.yml`, and `pypi` environment as a pending trusted publisher, require maintainer approval on the environment, and allowlist the pinned PyPA publishing Action. A pending publisher does not reserve a project name.
 
 After separately deciding to publish the reviewed GitHub release on PyPI, dispatch `publish.yml` from protected `main` with the exact public release tag. Review the verification job before approving the `pypi` deployment. Confirm PyPI lists the same version and file hashes, install the exact version in a clean environment, and run offline smoke commands before announcing the registry package.
+
+## External release controls
+
+The `release` environment accepts only the protected `main` branch and requires the account owner to review privileged jobs. Version-tag creation is restricted to that owner. A separate no-bypass ruleset prevents subsequent version-tag updates and deletion. These controls are part of the trust boundary; trusted repository administrators can change settings and must review those changes. No approval is implied by a successful candidate build.
+
+The repository currently has one write-capable account: its trusted owner.
+Outside contributions use forks. GitHub release-management and historical-run
+rerun rights accompany repository write access and are not restricted by an
+environment gate. Adding a write-capable collaborator therefore requires a new
+authority review or a role that excludes release management and unsafe reruns.
+Historical version tags retain their historical workflow definitions; the new
+controller does not retroactively rewrite them. The owner remains trusted for
+settings, draft editing, publication, and historical rerun decisions. Main
+requires signed commits, the configured CI gates, conversation resolution, and
+linear history; force pushes and deletion are prohibited. Environment review
+is a single-owner decision, not a two-person control.
+
+The controller binds the producer's authenticated triggering tag to the
+reconstructed version and examines all artifact pages. Trusted helpers load
+their verification dependencies by exact sibling path. Failed verification or
+partial upload attempts remove only the new draft's returned release ID. If
+creation returns no trustworthy ID or cleanup itself fails, the workflow fails
+and the owner must inspect drafts; it never guesses an existing release by tag
+or deletes a tag. No failed verification authorizes publication.

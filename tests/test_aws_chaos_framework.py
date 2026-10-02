@@ -117,7 +117,12 @@ class FakeAWS:
                                 "State": {"Name": "running"},
                                 "Placement": {"AvailabilityZone": f"{REGION}a"},
                                 "BlockDeviceMappings": [
-                                    {"Ebs": {"VolumeId": VOLUME_ID}}
+                                    {
+                                        "Ebs": {
+                                            "VolumeId": VOLUME_ID,
+                                            "DeleteOnTermination": False,
+                                        }
+                                    }
                                 ],
                             }
                         ]
@@ -659,10 +664,16 @@ def action_configs() -> dict[framework.ChaosType, dict[str, Any]]:
         framework.ChaosType.FIS_TEMPLATE: {
             "experiment_template_id": "EXT1234567890abcdef0"
         },
-        framework.ChaosType.EC2_TERMINATE: {"instance_ids": [INSTANCE_ID]},
+        framework.ChaosType.EC2_TERMINATE: {
+            "instance_ids": [INSTANCE_ID],
+            "delete_on_termination_volumes": {INSTANCE_ID: []},
+        },
         framework.ChaosType.EC2_STOP: {"instance_ids": [INSTANCE_ID]},
         framework.ChaosType.EC2_REBOOT: {"instance_ids": [INSTANCE_ID]},
-        framework.ChaosType.EBS_DETACH_VOLUME: {"volume_id": VOLUME_ID},
+        framework.ChaosType.EBS_DETACH_VOLUME: {
+            "volume_id": VOLUME_ID,
+            "attachment": {"instance_id": INSTANCE_ID, "device": "/dev/xvdf"},
+        },
         framework.ChaosType.EBS_THROTTLE_IOPS: {"volume_id": VOLUME_ID, "iops": 100},
         framework.ChaosType.EFS_THROTTLE_THROUGHPUT: {
             "file_system_id": "fs-0123456789abcdef0",
@@ -674,7 +685,7 @@ def action_configs() -> dict[framework.ChaosType, dict[str, Any]]:
         },
         framework.ChaosType.VPC_SUBNET_ACL_MODIFY: {
             "subnet_id": "subnet-0123456789abcdef0",
-            "nacl_id": "acl-0123456789abcdef0",
+            "nacl_id": "acl-0fedcba9876543210",
         },
         framework.ChaosType.VPC_ROUTE_TABLE_MODIFY: {
             "route_table_id": "rtb-0123456789abcdef0",
@@ -908,6 +919,18 @@ def make_experiment(
         }
     }
     orchestrator.safety_controller = FakeSafetyController(fake_aws, live=not dry_run)
+    if experiment_type in {
+        framework.ChaosType.EC2_TERMINATE,
+        framework.ChaosType.EBS_DETACH_VOLUME,
+    }:
+        orchestrator.safety_controller.config["target_allowlist"] = sorted(
+            framework.ChaosOrchestrator._target_values(
+                {"type": experiment_type.value, **action_config}
+            )
+        )
+        orchestrator.safety_controller.config["max_blast_radius"] = (
+            framework.ChaosOrchestrator._blast_radius(experiment_type, action_config)
+        )
     experiment = orchestrator._create_experiment(experiment_type, action_config)
     experiment.rollback_mode = framework.experiment_metadata(experiment_type).rollback
     return experiment
@@ -945,7 +968,10 @@ def test_action_matrix_covers_every_live_supported_type() -> None:
         for item in framework.ChaosType
         if framework.experiment_metadata(item).live_supported
     }
-    assert set(action_configs()) == supported
+    assert (
+        set(action_configs())
+        == supported | framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS
+    )
 
 
 def test_declared_unsupported_actions_are_not_live_supported() -> None:
@@ -1262,6 +1288,7 @@ def test_live_ebs_detach_creates_no_snapshot_and_restores_attachment() -> None:
     }
     fake_aws.read_overrides[("ec2", "describe_volumes")] = [
         initial_volume,
+        copy.deepcopy(initial_volume),
         available_volume,
         available_volume,
         restored_volume,

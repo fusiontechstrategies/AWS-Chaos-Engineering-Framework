@@ -1,6 +1,7 @@
 include .markdownlint-cli2.yaml
 recursive-include .github/release-notes *.md
 include .github/workflows/release.yml
+include .github/workflows/release-promotion.yml
 include CHANGELOG.md
 include CODE_OF_CONDUCT.md
 include CONTRIBUTING.md
@@ -16,5 +17,6 @@ include requirements-build.txt
 include requirements-build-lock.txt
 include requirements-runtime-lock.txt
 include docs/security-boundaries.md
+include docs/runtime-safety-scope.md
 recursive-include scripts *.py
 recursive-include tests *.py

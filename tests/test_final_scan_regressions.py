@@ -137,10 +137,10 @@ def test_ec2_termination_creates_no_implicit_volume_copies():
     assert writes == [("terminate_instances", {"InstanceIds": config["instance_ids"]})]
 
 
-def test_staggered_same_queue_workers_restore_the_authoritative_pre_state():
+def test_staggered_same_volume_workers_restore_the_authoritative_pre_state():
     aws = FakeAWS(reject_writes=False)
-    baseline = aws.respond("sqs", "get_queue_attributes", {})
-    baseline["Attributes"]["DelaySeconds"] = "0"
+    baseline = aws.respond("ec2", "describe_volumes", {})
+    baseline["Volumes"][0]["Iops"] = 3000
     state = copy.deepcopy(baseline)
     original = aws.respond
     first_mutated = threading.Event()
@@ -151,20 +151,19 @@ def test_staggered_same_queue_workers_restore_the_authoritative_pre_state():
     captures = []
 
     def model(service, operation, request):
-        if service == "sqs" and operation == "get_queue_attributes":
+        if service == "ec2" and operation == "describe_volumes":
             aws.calls.append((service, operation, request))
-            if request["AttributeNames"] == ["DelaySeconds"]:
-                captures.append(state["Attributes"]["DelaySeconds"])
+            captures.append(state["Volumes"][0]["Iops"])
             return copy.deepcopy(state)
-        if service == "sqs" and operation == "set_queue_attributes":
+        if service == "ec2" and operation == "modify_volume":
             aws.calls.append((service, operation, request))
-            value = request["Attributes"]["DelaySeconds"]
-            state["Attributes"]["DelaySeconds"] = value
+            value = request["Iops"]
+            state["Volumes"][0]["Iops"] = value
             writes.append(value)
-            if value == "5":
+            if value == 100:
                 first_mutated.set()
                 assert release_first.wait(5)
-            if value == "9":
+            if value == 200:
                 second_mutated.set()
             return {}
         return original(service, operation, request)
@@ -178,14 +177,14 @@ def test_staggered_same_queue_workers_restore_the_authoritative_pre_state():
 
     def run(item, value):
         try:
-            if value == 9:
+            if value == 200:
                 second_started.set()
             results.append(
                 item._run_single_experiment(
                     {
-                        "type": "sqs_message_delay",
-                        "queue_url": "https://sqs.us-gov-west-1.amazonaws.com/111122223333/synthetic",
-                        "delay_seconds": value,
+                        "type": "ebs_throttle_iops",
+                        "volume_id": "vol-0123456789abcdef0",
+                        "iops": value,
                         "auto_rollback": True,
                     }
                 )
@@ -194,8 +193,8 @@ def test_staggered_same_queue_workers_restore_the_authoritative_pre_state():
             failures.append(error)
 
     threads = [
-        threading.Thread(target=run, args=(first, 5)),
-        threading.Thread(target=run, args=(second, 9)),
+        threading.Thread(target=run, args=(first, 100)),
+        threading.Thread(target=run, args=(second, 200)),
     ]
     threads[0].start()
     try:
@@ -215,9 +214,9 @@ def test_staggered_same_queue_workers_restore_the_authoritative_pre_state():
         result.status == "completed" and result.rollback_successful
         for result in results
     )
-    assert state["Attributes"]["DelaySeconds"] == "0"
-    assert writes == ["5", "0", "9", "0"]
-    assert captures[0] == "0"
+    assert state["Volumes"][0]["Iops"] == 3000
+    assert writes == [100, 3000, 200, 3000]
+    assert captures[0] == 3000
 
 
 def synthetic_live_suite(item, experiments, delay=0):
@@ -244,40 +243,40 @@ def synthetic_live_suite(item, experiments, delay=0):
 
 def test_failed_recovery_blocks_continue_policy_and_separate_orchestrators():
     aws = FakeAWS(reject_writes=False)
-    state = aws.respond("sqs", "get_queue_attributes", {})
-    state["Attributes"]["DelaySeconds"] = "0"
+    state = aws.respond("ec2", "describe_volumes", {})
+    state["Volumes"][0]["Iops"] = 3000
     original = aws.respond
     writes = []
 
     def model(service, operation, request):
-        if service == "sqs" and operation == "get_queue_attributes":
+        if service == "ec2" and operation == "describe_volumes":
             aws.calls.append((service, operation, request))
             return copy.deepcopy(state)
-        if service == "sqs" and operation == "set_queue_attributes":
+        if service == "ec2" and operation == "modify_volume":
             aws.calls.append((service, operation, request))
-            value = request["Attributes"]["DelaySeconds"]
+            value = request["Iops"]
             writes.append(value)
-            if value == "0":
+            if value == 3000:
                 raise RuntimeError("Synthetic recovery failed before restoration")
-            state["Attributes"]["DelaySeconds"] = value
+            state["Volumes"][0]["Iops"] = value
             return {}
         return original(service, operation, request)
 
     aws.respond = model
     configs = [
         {
-            "type": "sqs_message_delay",
-            "queue_url": "https://sqs.us-gov-west-1.amazonaws.com/111122223333/synthetic",
-            "delay_seconds": value,
+            "type": "ebs_throttle_iops",
+            "volume_id": "vol-0123456789abcdef0",
+            "iops": value,
             "auto_rollback": True,
         }
-        for value in (5, 9)
+        for value in (100, 200)
     ]
     first = worker(aws)
     synthetic_live_suite(first, configs)
     assert not first.run_experiment_suite("synthetic")
-    assert writes == ["5", "0"]
-    assert state["Attributes"]["DelaySeconds"] == "5"
+    assert writes == [100, 3000]
+    assert state["Volumes"][0]["Iops"] == 100
     assert len(first.results) == 1
     assert first.results[0].rollback_successful is False
     assert first.safety_controller.emergency_stop.is_set()
@@ -296,9 +295,9 @@ def test_disabled_live_automatic_recovery_is_rejected_before_sdk_calls():
     with pytest.raises(framework.SafetyViolation, match="cannot be disabled"):
         item._run_single_experiment(
             {
-                "type": "sqs_message_delay",
-                "queue_url": "synthetic-queue",
-                "delay_seconds": 5,
+                "type": "ebs_throttle_iops",
+                "volume_id": "vol-0123456789abcdef0",
+                "iops": 100,
                 "auto_rollback": False,
             }
         )
@@ -310,20 +309,20 @@ def test_live_interexperiment_delay_starts_after_recovery_completes():
     item = worker(FakeAWS())
     configs = [
         {
-            "type": "sqs_message_delay",
-            "queue_url": "synthetic-queue",
-            "delay_seconds": value,
+            "type": "ebs_throttle_iops",
+            "volume_id": "vol-0123456789abcdef0",
+            "iops": value,
         }
-        for value in (5, 9)
+        for value in (100, 200)
     ]
     synthetic_live_suite(item, configs, delay=7)
     trace = []
 
     def run(config):
-        trace.append(f"recovered-{config['delay_seconds']}")
+        trace.append(f"recovered-{config['iops']}")
         return framework.ExperimentResult(
             "synthetic",
-            framework.ChaosType.SQS_MESSAGE_DELAY,
+            framework.ChaosType.EBS_THROTTLE_IOPS,
             framework.utc_now(),
             status="completed",
             rollback_successful=True,
@@ -334,7 +333,7 @@ def test_live_interexperiment_delay_starts_after_recovery_completes():
         trace.append(f"delay-{seconds}") or False
     )
     assert item.run_experiment_suite("synthetic")
-    assert trace == ["recovered-5", "delay-7", "recovered-9"]
+    assert trace == ["recovered-100", "delay-7", "recovered-200"]
 
 
 @pytest.mark.parametrize(
