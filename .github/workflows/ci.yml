@@ -267,7 +267,7 @@ jobs:
           cmp --silent "$candidate" "$RUNNER_TEMP/chaos-candidate-smoke.py"
           candidate="$RUNNER_TEMP/chaos-candidate-smoke.py"
           runtime="$(command -v python)"
-          isolated=(sudo bwrap --unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try --die-with-parent --new-session --ro-bind / / --ro-bind "$candidate" /candidate.py --proc /proc --dev /dev --tmpfs /tmp --chdir /tmp --clearenv --setenv AWS_EC2_METADATA_DISABLED true --setenv PYTHONDONTWRITEBYTECODE 1 --cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID --cap-add CAP_SETPCAP /usr/bin/setpriv --reuid=65534 --regid=65534 --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs "$runtime" /candidate.py)
+          isolated=(sudo bwrap --unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try --die-with-parent --new-session --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --ro-bind "$candidate" /tmp/candidate.py --chdir /tmp --clearenv --setenv AWS_EC2_METADATA_DISABLED true --setenv PYTHONDONTWRITEBYTECODE 1 --cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID --cap-add CAP_SETPCAP /usr/bin/setpriv --reuid=65534 --regid=65534 --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs "$runtime" /tmp/candidate.py)
           test "$("${isolated[@]}" --version)" = "AWS Chaos Engineering Framework 2.0.4"
           "${isolated[@]}" --help >/dev/null
           "${isolated[@]}" --list-experiments >/dev/null
