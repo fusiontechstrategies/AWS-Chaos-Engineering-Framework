@@ -53,6 +53,16 @@ python scripts\prepare_release.py --version 2.0.4 --tag v2.0.4 --source-commit $
 
 The builder rejects mismatched versions or tags, malformed commit IDs, missing release notes, unpinned runtime dependencies, unexpected distributions, unsafe archive members, incomplete wheel records, existing output directories, and unexpected final assets.
 
+The trusted verifier independently fixes the permitted source member list and
+manifest. It accepts only the pinned static `setuptools.build_meta` configuration,
+the reviewed module and console entry point, and reconstructed generated metadata.
+Custom backends, `backend-path`, legacy `setup.py`, setuptools hooks, dynamic
+project metadata and extra source-controlled executable members are refused even
+when their bytes match the selected commit. `SOURCES.txt` is verified output,
+never a policy input. Normalized source files must use mode 0644 and directories
+mode 0755. Changes to this policy require review of the trusted verifier before
+a candidate can pass the protected verification jobs.
+
 ## Draft and publication review
 
 A `vX.Y.Z` tag must point to the approved GitHub-verified commit on protected `main`. The tag workflow rebuilds and compares every byte with read-only permissions. The default-branch `release-promotion.yml` controller authenticates the producer run, signed source commit, protected-main verifier, immutable artifact ID, and exact six-asset digest map. It reconstructs the release with trusted-main helpers and reads tagged files only as data. Both privileged jobs repeat this verification after `release` environment approval; the draft job downloads and compares the remote asset bytes too. All Python verification runs in isolated mode from the trusted checkout, including the final draft state check.

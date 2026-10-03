@@ -57,7 +57,7 @@ class FakeAWS:
 
     def respond(self, service: str, operation: str, request: dict[str, Any]) -> Any:
         self.calls.append((service, operation, request))
-        is_read = operation.startswith(framework.READ_ONLY_OPERATION_PREFIXES)
+        is_read = operation in framework.READ_ONLY_OPERATIONS.get(service, ())
         if self.reject_writes and not is_read:
             raise AssertionError(
                 f"Plan mode attempted an AWS write: {service}.{operation}"
@@ -957,8 +957,8 @@ def test_every_supported_action_plans_without_aws_writes(
     assert not result.errors
     assert experiment.mutation_attempts == []
     assert all(
-        operation.startswith(framework.READ_ONLY_OPERATION_PREFIXES)
-        for _service, operation, _request in fake_aws.calls
+        operation in framework.READ_ONLY_OPERATIONS.get(service, ())
+        for service, operation, _request in fake_aws.calls
     )
 
 

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.normalize_sdist import normalize_sdist
 from scripts.verify_distribution import _project_version, _verify_sdist, _verify_wheel
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +27,9 @@ def distributions(tmp_path_factory):
         check=True,
         capture_output=True,
     )  # noqa: S603
-    return next(output.glob("*.whl")), next(output.glob("*.tar.gz"))
+    sdist = next(output.glob("*.tar.gz"))
+    normalize_sdist(sdist, 315532800)
+    return next(output.glob("*.whl")), sdist
 
 
 @pytest.mark.parametrize(

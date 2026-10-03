@@ -10,25 +10,206 @@ import email
 import hashlib
 import io
 import re
-import shlex
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10; supplied by the pinned build lock.
+    import tomli as tomllib
 
 PROJECT_NAME = "aws-chaos-engineering-framework"
 MODULE_NAME = "aws_chaos_framework.py"
 BLOCKED_SUFFIXES = {".env", ".key", ".p12", ".pem", ".pfx", ".pyc"}
 
 
+# This policy belongs to the independently trusted verifier, not the selected
+# tag's MANIFEST.in or artifact SOURCES.txt. Updating it requires verifier review.
+APPROVED_BUILD_SYSTEM = {
+    "requires": ["setuptools==84.0.0", "wheel==0.48.0"],
+    "build-backend": "setuptools.build_meta",
+}
+APPROVED_MANIFEST = "include .markdownlint-cli2.yaml\nrecursive-include .github/release-notes *.md\ninclude .github/workflows/release.yml\ninclude .github/workflows/release-promotion.yml\ninclude CHANGELOG.md\ninclude CODE_OF_CONDUCT.md\ninclude CONTRIBUTING.md\ninclude LICENSE\ninclude README.md\ninclude RELEASING.md\ninclude SECURITY.md\ninclude TESTING.md\ninclude example-config.yaml\ninclude requirements.txt\ninclude requirements-dev.txt\ninclude requirements-build.txt\ninclude requirements-build-lock.txt\ninclude requirements-runtime-lock.txt\ninclude docs/security-boundaries.md\ninclude docs/runtime-safety-scope.md\nrecursive-include scripts *.py\nrecursive-include tests *.py"
+APPROVED_SOURCE_PATHS = frozenset(
+    [
+        ".github/workflows/release-promotion.yml",
+        ".github/workflows/release.yml",
+        ".markdownlint-cli2.yaml",
+        "CHANGELOG.md",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTING.md",
+        "LICENSE",
+        "MANIFEST.in",
+        "README.md",
+        "RELEASING.md",
+        "SECURITY.md",
+        "TESTING.md",
+        "aws_chaos_framework.py",
+        "docs/runtime-safety-scope.md",
+        "docs/security-boundaries.md",
+        "example-config.yaml",
+        "pyproject.toml",
+        "requirements-build-lock.txt",
+        "requirements-build.txt",
+        "requirements-dev.txt",
+        "requirements-runtime-lock.txt",
+        "requirements.txt",
+        "scripts/create_verified_draft.py",
+        "scripts/normalize_sdist.py",
+        "scripts/normalize_wheel.py",
+        "scripts/prepare_release.py",
+        "scripts/publish_payload.py",
+        "scripts/verify_distribution.py",
+        "scripts/verify_publish_trust.py",
+        "scripts/verify_release_handoff.py",
+        "scripts/verify_release_integrity.py",
+        "tests/conftest.py",
+        "tests/test_archive_security.py",
+        "tests/test_aws_chaos_framework.py",
+        "tests/test_final_nine_regressions.py",
+        "tests/test_final_scan_regressions.py",
+        "tests/test_latest_main_four_regressions.py",
+        "tests/test_latest_runtime_scan_regressions.py",
+        "tests/test_normalize_sdist.py",
+        "tests/test_normalize_wheel.py",
+        "tests/test_release_assets.py",
+        "tests/test_security_regressions.py",
+        "tests/test_trusted_release_promotion.py",
+    ]
+)
+EGG_INFO = "aws_chaos_engineering_framework.egg-info/"
+GENERATED_SDIST_PATHS = frozenset({"PKG-INFO", "setup.cfg"}) | {
+    EGG_INFO + name
+    for name in (
+        "PKG-INFO",
+        "SOURCES.txt",
+        "dependency_links.txt",
+        "entry_points.txt",
+        "requires.txt",
+        "top_level.txt",
+    )
+}
+
+
+def _approved_project(repository_root: Path) -> dict:
+    pyproject = repository_root / "pyproject.toml"
+    if pyproject.is_symlink() or pyproject.stat().st_size > 1_048_576:
+        raise ValueError("unsafe packaging metadata source")
+    try:
+        document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("invalid packaging metadata") from exc
+    if document.get("build-system") != APPROVED_BUILD_SYSTEM:
+        raise ValueError("unreviewed build-system configuration or backend-path")
+    tool = document.get("tool", {})
+    if (
+        tool.get("setuptools") != {"py-modules": ["aws_chaos_framework"]}
+        or set(tool) - {"setuptools", "pytest", "ruff"}
+        or set(document) != {"build-system", "project", "tool"}
+    ):
+        raise ValueError("unreviewed setuptools build hooks or configuration")
+    project = document.get("project", {})
+    if set(project) != {
+        "name",
+        "version",
+        "description",
+        "readme",
+        "requires-python",
+        "license",
+        "authors",
+        "dependencies",
+        "classifiers",
+        "urls",
+        "scripts",
+    } or project.get("scripts") != {"aws-chaos-framework": "aws_chaos_framework:main"}:
+        raise ValueError("unreviewed dynamic metadata or project entry points")
+    if (
+        project.get("name") != PROJECT_NAME
+        or project.get("readme") != "README.md"
+        or project.get("license") != "Apache-2.0"
+        or project.get("requires-python") != ">=3.10,<3.15"
+        or not isinstance(project.get("version"), str)
+        or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", project["version"])
+        or any((repository_root / name).exists() for name in ("setup.py", "setup.cfg"))
+    ):
+        raise ValueError("unreviewed static project metadata or legacy build hook")
+    return project
+
+
 def _project_version(pyproject_path: Path) -> str:
-    text = pyproject_path.read_text(encoding="utf-8")
-    project = re.search(r"(?ms)^\[project\]\s*$.*?(?=^\[|\Z)", text)
-    if project is None:
-        raise ValueError("pyproject.toml has no [project] table")
-    version = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', project.group(0))
-    if version is None:
-        raise ValueError("[project] has no literal version")
-    return version.group(1)
+    return _approved_project(pyproject_path.parent)["version"]
+
+
+def _approved_source_files(repository_root: Path) -> set[str]:
+    if (repository_root / "MANIFEST.in").read_text(
+        encoding="utf-8"
+    ).strip() != APPROVED_MANIFEST:
+        raise ValueError("source manifest differs from the trusted packaging policy")
+    reviewed = {
+        name for name in APPROVED_SOURCE_PATHS if (repository_root / name).exists()
+    }
+    required = {
+        MODULE_NAME,
+        "pyproject.toml",
+        "MANIFEST.in",
+        "LICENSE",
+        "README.md",
+        "RELEASING.md",
+        "requirements.txt",
+        "requirements-build.txt",
+        "example-config.yaml",
+    }
+    if not required <= reviewed:
+        raise ValueError("selected source is missing required packaging inputs")
+    # Historical release notes are data. Only one leaf with a canonical version
+    # name is permitted; source-controlled patterns never extend executable paths.
+    for path in (repository_root / ".github/release-notes").glob("*.md"):
+        if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+\.md", path.name):
+            raise ValueError("unreviewed release-note filename")
+        reviewed.add(path.relative_to(repository_root).as_posix())
+    for name in reviewed:
+        path = repository_root / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 8_388_608:
+            raise ValueError("source packaging input is not a bounded regular file")
+    return reviewed
+
+
+def _normal_text(value: bytes) -> str:
+    return value.decode("utf-8").replace("\r\n", "\n").replace("\r", "")
+
+
+def _verify_package_metadata(
+    value: bytes, project: dict, repository_root: Path
+) -> None:
+    expected = {
+        "metadata-version": ["2.4"],
+        "name": [PROJECT_NAME],
+        "version": [project["version"]],
+        "summary": [project["description"]],
+        "author": [", ".join(author["name"] for author in project["authors"])],
+        "license-expression": ["Apache-2.0"],
+        "project-url": [f"{key}, {url}" for key, url in project["urls"].items()],
+        "classifier": project["classifiers"],
+        "requires-python": ["<3.15,>=3.10"],
+        "description-content-type": ["text/markdown"],
+        "license-file": ["LICENSE"],
+        "requires-dist": project["dependencies"],
+        "dynamic": ["license-file"],
+    }
+    message = email.message_from_string(_normal_text(value))
+    actual = {key.lower(): message.get_all(key) for key in message}
+    if message.defects or actual != expected:
+        raise ValueError(
+            "generated package metadata differs from static project metadata"
+        )
+    readme = _normal_text((repository_root / "README.md").read_bytes())
+    if message.get_payload().rstrip("\n") != readme.rstrip("\n"):
+        raise ValueError("generated package description differs from static README")
+    if set(project["dependencies"]) != _runtime_requirements(
+        repository_root / "requirements.txt"
+    ):
+        raise ValueError("project dependencies differ from the reviewed requirements")
 
 
 def _assert_safe_names(names: list[str]) -> None:
@@ -123,6 +304,7 @@ def validate_entry_points(entry_points: str, repository_root: Path) -> None:
 
 
 def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None:
+    _approved_project(repository_root)
     with zipfile.ZipFile(wheel_path) as archive:
         names = archive.namelist()
         _assert_safe_names(names)
@@ -200,64 +382,58 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
 
 
 def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
+    project = _approved_project(repository_root)
+    reviewed = _approved_source_files(repository_root)
+    root = f"aws_chaos_engineering_framework-{project['version']}"
+    expected_files = reviewed | GENERATED_SDIST_PATHS
+    expected_directories = {root}
+    for name in expected_files:
+        expected_directories.update(
+            root + "/" + parent.as_posix()
+            for parent in PurePosixPath(name).parents
+            if parent.as_posix() != "."
+        )
+    values = {}
+    names = []
+    total_size = 0
     with tarfile.open(sdist_path, mode="r:gz") as archive:
-        members = archive.getmembers()
-        names = [member.name for member in members]
-        _assert_safe_names(names)
-        links = [member.name for member in members if member.issym() or member.islnk()]
-        if links:
-            raise ValueError(f"source distribution contains archive links: {links}")
-        relative_names = {"/".join(PurePosixPath(name).parts[1:]) for name in names}
-        reviewed = {
-            MODULE_NAME,
-            "pyproject.toml",
-            "MANIFEST.in",
-            "LICENSE",
-            "README.md",
-        }
-        for line in (
-            (repository_root / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
-        ):
-            tokens = shlex.split(line, comments=True)
-            if not tokens:
-                continue
-            if tokens[0] == "include":
-                for pattern in tokens[1:]:
-                    reviewed.update(
-                        path.relative_to(repository_root).as_posix()
-                        for path in repository_root.glob(pattern)
-                        if path.is_file()
-                    )
-            elif tokens[0] == "recursive-include" and len(tokens) >= 3:
-                for pattern in tokens[2:]:
-                    reviewed.update(
-                        path.relative_to(repository_root).as_posix()
-                        for path in (repository_root / tokens[1]).rglob(pattern)
-                        if path.is_file()
-                    )
-            else:
-                raise ValueError("source manifest contains an unsupported directive")
-        egg_info = "aws_chaos_engineering_framework.egg-info/"
-        generated = {"PKG-INFO", "setup.cfg"} | {
-            egg_info + name
-            for name in (
-                "PKG-INFO",
-                "SOURCES.txt",
-                "dependency_links.txt",
-                "entry_points.txt",
-                "requires.txt",
-                "top_level.txt",
-            )
-        }
-        for member in members:
-            relative = "/".join(PurePosixPath(member.name).parts[1:])
+        for member in archive:
+            names.append(member.name)
+            if len(names) > 128:
+                raise ValueError("source distribution exceeds the member budget")
+            canonical = member.name.rstrip("/")
+            if canonical != PurePosixPath(canonical).as_posix():
+                raise ValueError("source distribution has a noncanonical path")
             if member.isdir():
+                if (
+                    canonical not in expected_directories
+                    or member.size
+                    or member.mode != 0o755
+                ):
+                    raise ValueError("source distribution has an unreviewed directory")
                 continue
-            if not member.isfile() or relative not in reviewed | generated:
+            if not member.isfile() or not canonical.startswith(root + "/"):
+                raise ValueError(
+                    "source distribution contains an unreviewed file type or root"
+                )
+            relative = canonical[len(root) + 1 :]
+            if relative not in expected_files:
                 raise ValueError(
                     f"source distribution contains an unreviewed file: {relative}"
                 )
-            contents = archive.extractfile(member).read()
+            if member.mode != 0o644 or not 0 <= member.size <= 8_388_608:
+                raise ValueError("source distribution has unsafe mode or size")
+            total_size += member.size
+            if total_size > 33_554_432 or relative in values:
+                raise ValueError(
+                    "source distribution exceeds its budget or duplicates a path"
+                )
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise ValueError("source distribution member is unreadable")
+            contents = stream.read(member.size + 1)
+            if len(contents) != member.size:
+                raise ValueError("source distribution member size differs from bytes")
             if (
                 relative in reviewed
                 and contents != (repository_root / relative).read_bytes()
@@ -265,64 +441,31 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
                 raise ValueError(
                     f"source distribution content differs from the repository: {relative}"
                 )
-            if (
-                relative == "setup.cfg"
-                and contents.replace(b"\r\n", b"\n").strip()
-                != b"[egg_info]\ntag_build = \ntag_date = 0"
-            ):
-                raise ValueError(
-                    "source distribution contains unreviewed setup configuration"
-                )
-        required = {
-            MODULE_NAME,
-            "LICENSE",
-            "README.md",
-            "RELEASING.md",
-            "pyproject.toml",
-            "requirements.txt",
-            "requirements-build.txt",
-            "example-config.yaml",
-            "scripts/normalize_sdist.py",
-            "scripts/normalize_wheel.py",
-            "scripts/prepare_release.py",
-            "scripts/verify_distribution.py",
-            "tests/test_aws_chaos_framework.py",
-            "tests/test_normalize_sdist.py",
-            "tests/test_normalize_wheel.py",
-            "tests/test_release_assets.py",
-        }
-        missing = sorted(required - relative_names)
-        if missing:
-            raise ValueError(f"source distribution is missing: {', '.join(missing)}")
-        for relative_path in (
-            MODULE_NAME,
-            "pyproject.toml",
-            "requirements.txt",
-            "requirements-build.txt",
-            "example-config.yaml",
-            "scripts/normalize_sdist.py",
-            "scripts/normalize_wheel.py",
-            "scripts/prepare_release.py",
-            "scripts/verify_distribution.py",
-            "tests/test_aws_chaos_framework.py",
-            "tests/test_normalize_sdist.py",
-            "tests/test_normalize_wheel.py",
-            "tests/test_release_assets.py",
-        ):
-            archived_name = next(
-                name
-                for name in names
-                if "/".join(PurePosixPath(name).parts[1:]) == relative_path
-            )
-            archived_file = archive.extractfile(archived_name)
-            if (
-                archived_file is None
-                or archived_file.read()
-                != (repository_root / relative_path).read_bytes()
-            ):
-                raise ValueError(
-                    f"source distribution content differs from the repository: {relative_path}"
-                )
+            values[relative] = contents
+    _assert_safe_names(names)
+    if set(values) != expected_files:
+        raise ValueError("source distribution is missing canonical source or metadata")
+    for name in ("PKG-INFO", EGG_INFO + "PKG-INFO"):
+        _verify_package_metadata(values[name], project, repository_root)
+    expected_generated = {
+        "setup.cfg": "[egg_info]\ntag_build = \ntag_date = 0\n\n",
+        EGG_INFO + "dependency_links.txt": "\n",
+        EGG_INFO
+        + "entry_points.txt": "[console_scripts]\naws-chaos-framework = aws_chaos_framework:main\n",
+        EGG_INFO + "requires.txt": "".join(
+            requirement + "\n" for requirement in project["dependencies"]
+        ),
+        EGG_INFO + "top_level.txt": "aws_chaos_framework\n",
+    }
+    listed = reviewed | {
+        name for name in GENERATED_SDIST_PATHS if name.startswith(EGG_INFO)
+    }
+    expected_generated[EGG_INFO + "SOURCES.txt"] = "\n".join(
+        sorted(listed, key=lambda item: ("/" in item, item))
+    )
+    for name, expected in expected_generated.items():
+        if _normal_text(values[name]) != expected:
+            raise ValueError(f"unreviewed generated source metadata: {name}")
 
 
 def verify_distribution(dist_dir: Path, repository_root: Path) -> tuple[Path, Path]:

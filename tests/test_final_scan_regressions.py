@@ -30,7 +30,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def worker(aws):
     item = object.__new__(framework.ChaosOrchestrator)
-    item.config = {"global": {}, "safety": {}}
+    item.config = {"global": {"account_id": ACCOUNT_ID}, "safety": {}}
+    item.expected_account = ACCOUNT_ID
     item.region = REGION
     item.dry_run = False
     item.live = True
@@ -131,8 +132,8 @@ def test_ec2_termination_creates_no_implicit_volume_copies():
     assert item.terminate_instances(**config).status == "completed"
     writes = [
         (operation, request)
-        for _, operation, request in aws.calls
-        if not operation.startswith(framework.READ_ONLY_OPERATION_PREFIXES)
+        for service, operation, request in aws.calls
+        if operation not in framework.READ_ONLY_OPERATIONS.get(service, ())
     ]
     assert writes == [("terminate_instances", {"InstanceIds": config["instance_ids"]})]
 

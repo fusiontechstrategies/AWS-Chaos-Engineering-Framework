@@ -28,7 +28,7 @@ def writes(aws):
     return [
         call
         for call in aws.calls
-        if not call[1].startswith(framework.READ_ONLY_OPERATION_PREFIXES)
+        if call[1] not in framework.READ_ONLY_OPERATIONS.get(call[0], ())
     ]
 
 
