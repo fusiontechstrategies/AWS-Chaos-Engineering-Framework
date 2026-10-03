@@ -52,9 +52,21 @@ the final read does not provide a distributed lock against another AWS writer.
 Every extension transition helper polls CloudWatch, GuardDuty, Security Hub,
 allowed days/hours, and resource-limit conditions before reading transition state
 and while waiting. Sleeps wake no later than `monitor_interval_seconds`; SDK
-request time is additional. A violation or failed safety evaluation sets the
-emergency stop and prevents later forward writes. Recovery waits and permitted
+request time is additional. A violation or failed safety evaluation requests a
+process-wide emergency stop and prevents new forward-call admission. An accepted
+SDK call holds the dispatch barrier through its return. The stop latch activates
+only after that call exits; no forward call begins after activation. A request
+after the final admission check can still precede the accepted call's start.
+Signals on that thread defer activation without deadlocking. Stop activation
+does not cancel an in-flight SDK request and can await its timeouts and retries.
+Recovery waits and permitted
 rollback writes continue after a stop request.
+
+S3 bucket operations bind `ExpectedBucketOwner` to the captured approved global
+account on reads, forward writes and recovery. Missing accounts, differing
+explicit owners and per-experiment account overrides are refused. Cross-account
+bucket targets are unsupported; changes to the approved global account require
+a new configuration confirmation token.
 
 EC2 recovery requires the exact selected instance set on every read. Empty,
 partial, duplicated, or extra responses cannot establish recovery. An unverified

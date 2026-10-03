@@ -18,8 +18,16 @@ Re-enabling this capability requires an enforceable, independently verified
 immutable-template trust boundary or conditional AWS start support. Recovery
 methods remain usable for already-running experiments from older versions.
 
-Emergency stop is a process-wide latch shared by every controller, including controllers created after a stop. Signals and safety failures prevent new forward writes at the SDK boundary. Recovery writes
-remain available. Unknown FIS start outcomes require operator reconciliation.
+Emergency stop is shared by every controller, including controllers created
+after a stop. A request immediately blocks new forward-call admission and wakes
+forward waits. Stop activation and forward SDK calls share a dispatch barrier:
+the latch activates after an already accepted call returns, and no forward SDK
+call begins after that activation. A request arriving after the final admission
+check can precede the start of that accepted call; the latch remains inactive
+until it returns. Signals on the dispatching thread defer activation to that
+same return boundary. SDK requests are not cancelled, and stop activation may
+wait for their configured timeouts and retries. Recovery writes remain available.
+Unknown FIS start outcomes require operator reconciliation.
 Terminal FIS status alone does not prove resource recovery. ECS recovery requires
 restored running capacity, no pending tasks or failed deployments, and one stable
 deployment. Failed recovery remains a failed result.
@@ -32,7 +40,15 @@ permission observed before the experiment and confirmed absent after revocation.
 
 Release verification rejects unexpected archive members, including startup hooks,
 unreviewed build scripts, native binaries, and executable wheel data directories.
-Source files must match reviewed repository contents. Install release build tools
+Source files must match reviewed repository contents. The independently trusted
+verifier fixes the source member list, exact static setuptools backend and build
+requirements, manifest, module and console entry point. Selected source cannot
+add `setup.py`, custom backend paths, setuptools hooks or dynamic metadata.
+Generated source metadata is reconstructed from static project data; the
+artifact's `SOURCES.txt` never defines accepted members. Source archives require
+regular files with mode 0644 and directories with mode 0755. Adding a new packaged
+script or changing build policy requires a trusted verifier review.
+Install release build tools
 with `--require-hashes` using `requirements-build-lock.txt`. Regenerate this lock
 with `uv pip compile requirements-build.txt --generate-hashes --universal` when
 updating build tools, then review the changes before release.
@@ -53,6 +69,13 @@ For live ELB removal, provide `target_descriptors` with exact Id, Port and retur
 AvailabilityZone. An ID alone cannot distinguish multiple registrations.
 S3 object deletion requires a non-empty reviewed prefix; whole-bucket deletion is
 not supported by that action.
+All supported experiment bucket reads, writes, verification and recovery calls
+carry `ExpectedBucketOwner` equal to the captured global approved AWS account.
+AWS refuses an owner mismatch. Per-experiment account overrides are rejected;
+editing the global account invalidates the confirmation token. Cross-account
+S3 experiments are unsupported. Direct library callers must supply the reviewed
+twelve-digit account through their controller or experiment configuration; a
+missing or invalid account refuses bucket calls before dispatch.
 
 ## Concurrent changes and recovery evidence
 

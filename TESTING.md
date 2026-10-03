@@ -9,6 +9,14 @@ These offline checks do not establish deployed AWS permissions or service behavi
 
 All repository and release tests are offline. They use deterministic fake AWS clients, synthetic identifiers, and generated package fixtures. Public CI must never require credentials or contact an AWS account.
 
+`tests/test_latest_main_four_regressions.py` covers the approved static sdist
+backend/member policy and generated metadata tampering without executing hostile
+build hooks. Real botocore service models and Stubber validate S3 owner-bound
+request shapes and 403 refusal without network calls. Deterministic threaded and
+same-thread signal simulations exercise stop admission, latch activation,
+in-flight completion and continued recovery. Redaction cases include complete
+registered account-prefixed targets and longer unregistered ARN controls.
+
 ## 2.0.3 release-readiness gate
 
 The 2.0.3 candidate must pass:

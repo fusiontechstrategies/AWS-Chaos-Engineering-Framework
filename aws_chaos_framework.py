@@ -28,7 +28,7 @@ import unicodedata
 import uuid
 from collections.abc import Iterable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -88,8 +88,6 @@ _LIVE_EXPERIMENT_LOCK = threading.RLock()
 # Recovery uncertainty persists across orchestrators. Only reconciliation and a
 # new process may permit another live baseline after this latch is set.
 _LIVE_RECOVERY_BLOCKED = threading.Event()
-# Signals and safety failures stop forward work across every controller.
-_PROCESS_EMERGENCY_STOP = threading.Event()
 
 
 class ConfigurationError(ValueError):
@@ -102,6 +100,77 @@ class SafetyViolation(RuntimeError):
 
 class EmergencyStop(RuntimeError):
     """Raised when an experiment must stop and roll back."""
+
+
+class EmergencyStopLatch:
+    """Coordinate monotonic stop activation with every accepted forward SDK call."""
+
+    def __init__(self) -> None:
+        self._dispatch_lock = threading.RLock()
+        self._condition = threading.Condition(threading.RLock())
+        self._local = threading.local()
+        self._requested = False
+        self._latched = False
+
+    def set(self) -> None:
+        # Record the request before waiting for an already accepted SDK call.
+        # RLocks also permit a Python signal handler on the dispatching thread.
+        with self._condition:
+            self._requested = True
+            self._condition.notify_all()
+        with self._dispatch_lock:
+            if not getattr(self._local, "depth", 0):
+                with self._condition:
+                    self._latched = True
+
+    def is_set(self) -> bool:
+        """The stop linearization point occurs only after accepted calls exit."""
+        with self._condition:
+            return self._latched
+
+    def stop_requested(self) -> bool:
+        with self._condition:
+            return self._requested
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Forward waits wake on the request, without waiting for SDK completion."""
+        with self._condition:
+            return self._condition.wait_for(lambda: self._requested, timeout)
+
+    @contextmanager
+    def forward_dispatch(self):
+        with self._dispatch_lock:
+            if self.stop_requested():
+                raise EmergencyStop("Emergency stop prevents new SDK dispatch")
+            self._local.depth = getattr(self._local, "depth", 0) + 1
+            try:
+                yield
+            finally:
+                self._local.depth -= 1
+                if not self._local.depth and self.stop_requested():
+                    with self._condition:
+                        self._latched = True
+
+
+# Signals and safety failures stop forward work across every controller.
+# Production never resets the latch; recovery remains a separate allowed path.
+_PROCESS_EMERGENCY_STOP = EmergencyStopLatch()
+S3_OWNER_BOUND_OPERATIONS = frozenset(
+    {
+        "get_bucket_policy",
+        "put_bucket_policy",
+        "delete_bucket_policy",
+        "get_bucket_versioning",
+        "put_bucket_versioning",
+        "get_bucket_encryption",
+        "put_bucket_encryption",
+        "delete_bucket_encryption",
+        "list_objects_v2",
+        "delete_objects",
+        "get_bucket_lifecycle_configuration",
+        "put_bucket_lifecycle_configuration",
+    }
+)
 
 
 class RiskLevel(Enum):
@@ -722,24 +791,49 @@ def redact_runtime_text(
         _SENSITIVE_LOG_VALUES.get() if protected_values is None else protected_values
     )
     values = sorted({item for item in protected if item}, key=len, reverse=True)
-    alternatives = [
-        f"(?P<ARN>{ARN_PATTERN.pattern})",
-        f"(?P<ACCESS_KEY>{ACCESS_KEY_PATTERN.pattern})",
-        f"(?P<ACCOUNT>{ACCOUNT_IN_TEXT_PATTERN.pattern})",
-    ]
+    alternatives = []
     if values:
         alternatives.append(
             r"(?P<RESOURCE>(?<!\w)(?:"
             + "|".join(re.escape(item) for item in values)
             + r")(?!\w))"
         )
+    # Exact registered targets carry the strongest intent. At a shared start,
+    # their longest complete value must win before any shorter generic prefix.
+    alternatives.extend(
+        [
+            f"(?P<ARN>{ARN_PATTERN.pattern})",
+            f"(?P<ACCESS_KEY>{ACCESS_KEY_PATTERN.pattern})",
+            f"(?P<ACCOUNT>{ACCOUNT_IN_TEXT_PATTERN.pattern})",
+        ]
+    )
     # One pass protects only markers we emit. Raw bracketed names and marker-
     # shaped target names remain eligible, while generated markers are never
     # reprocessed by another target replacement.
-    text_value = re.sub(
-        "|".join(alternatives), lambda match: f"[{match.lastgroup}]", str(value)
+    source = str(value)
+    combined = re.compile("|".join(alternatives))
+    generic = re.compile(
+        "|".join(
+            [
+                f"(?P<ARN>{ARN_PATTERN.pattern})",
+                f"(?P<ACCESS_KEY>{ACCESS_KEY_PATTERN.pattern})",
+                f"(?P<ACCOUNT>{ACCOUNT_IN_TEXT_PATTERN.pattern})",
+            ]
+        )
     )
-    return safe_display(text_value)
+    parts = []
+    position = 0
+    while match := combined.search(source, position):
+        # Preserve complete generic ARN masking when a registered parent is only
+        # a prefix of a longer ARN (for example bucket ARN + object key). Exact
+        # resources win ties and shorter account/access-key prefix matches.
+        other = generic.match(source, match.start())
+        if other is not None and other.end() > match.end():
+            match = other
+        parts.extend((source[position : match.start()], f"[{match.lastgroup}]"))
+        position = match.end()
+    parts.append(source[position:])
+    return safe_display("".join(parts))
 
 
 def canonical_caller_principal(caller_arn: str | None) -> str | None:
@@ -867,7 +961,7 @@ def require_runtime_safety(
     controller: Any, context: str, error_type: type[Exception] = EmergencyStop
 ) -> None:
     """Every live guard failure latches process stop, including failed guard reads."""
-    if _PROCESS_EMERGENCY_STOP.is_set() or controller.emergency_stop.is_set():
+    if _PROCESS_EMERGENCY_STOP.stop_requested() or controller.emergency_stop.is_set():
         raise error_type("Emergency stop requested")
     try:
         safe, violations = controller.check_safety_conditions()
@@ -880,7 +974,7 @@ def require_runtime_safety(
         controller.emergency_stop_all()
         raise error_type(f"{context} check failed: " + "; ".join(violations))
     # Safety calls can block while another controller receives a signal.
-    if _PROCESS_EMERGENCY_STOP.is_set() or controller.emergency_stop.is_set():
+    if _PROCESS_EMERGENCY_STOP.stop_requested() or controller.emergency_stop.is_set():
         raise error_type("Emergency stop requested")
 
 
@@ -894,10 +988,42 @@ class AwsClientProxy:
 
     def __getattr__(self, name: str) -> Any:
         attribute = getattr(self._client, name)
-        if not callable(attribute) or name.startswith(READ_ONLY_OPERATION_PREFIXES):
+        read_only = name.startswith(READ_ONLY_OPERATION_PREFIXES)
+        bind_s3_owner = (
+            self._service == "s3"
+            and self._owner is not None
+            and name in S3_OWNER_BOUND_OPERATIONS
+        )
+        if not callable(attribute) or (read_only and not bind_s3_owner):
             return attribute
 
         def invoke(*args: Any, **kwargs: Any) -> Any:
+            if bind_s3_owner:
+                expected = self._owner.expected_account
+                if not isinstance(expected, str) or not ACCOUNT_ID_PATTERN.fullmatch(
+                    expected
+                ):
+                    raise SafetyViolation(
+                        "S3 requires the reviewed twelve-digit bucket owner account"
+                    )
+                if (
+                    args
+                    or not isinstance(kwargs.get("Bucket"), str)
+                    or not kwargs["Bucket"]
+                ):
+                    raise SafetyViolation(
+                        "S3 bucket operations require explicit keyword arguments"
+                    )
+                if (
+                    "ExpectedBucketOwner" in kwargs
+                    and kwargs["ExpectedBucketOwner"] != expected
+                ):
+                    raise SafetyViolation(
+                        "S3 bucket owner differs from the reviewed account"
+                    )
+                kwargs["ExpectedBucketOwner"] = expected
+            if read_only:
+                return attribute(*args, **kwargs)
             if self._owner is not None:
                 if (
                     not self._owner.dry_run
@@ -924,17 +1050,31 @@ class AwsClientProxy:
                             "SQS QueueArn changed before purge dispatch"
                         )
                 if not self._owner._in_rollback and (
-                    _PROCESS_EMERGENCY_STOP.is_set()
+                    _PROCESS_EMERGENCY_STOP.stop_requested()
                     or self._owner.safety_controller.emergency_stop.is_set()
                 ):
                     raise EmergencyStop(
                         "Emergency stop prevents dispatch after safety or ownership read"
                     )
-                self._owner._record_mutation_attempt(f"{self._service}.{name}")
-            response = attribute(*args, **kwargs)
-            if self._owner is not None:
-                self._owner._record_mutation(f"{self._service}.{name}")
-            return response
+            forward = self._owner is not None and not self._owner._in_rollback
+            barrier = (
+                _PROCESS_EMERGENCY_STOP.forward_dispatch() if forward else nullcontext()
+            )
+            with barrier:
+                if self._owner is not None:
+                    self._owner._record_mutation_attempt(f"{self._service}.{name}")
+                # A stop requested while recording admission (including a same-thread
+                # signal) prevents invocation. Once invoked, the barrier remains held
+                # through the SDK return, so the actual latch cannot precede its start.
+                if forward and (
+                    _PROCESS_EMERGENCY_STOP.stop_requested()
+                    or self._owner.safety_controller.emergency_stop.is_set()
+                ):
+                    raise EmergencyStop("Emergency stop prevents admitted SDK dispatch")
+                response = attribute(*args, **kwargs)
+                if self._owner is not None:
+                    self._owner._record_mutation(f"{self._service}.{name}")
+                return response
 
         return invoke
 
@@ -972,8 +1112,10 @@ class SafetyController:
         session: Any,
         region: str,
         live: bool,
+        expected_account: str | None = None,
     ):
         self.config = config
+        self.expected_account = expected_account
         self.session = session
         self.region = region
         self.live = live
@@ -1173,8 +1315,8 @@ class SafetyController:
             return self._active_count <= limit
 
     def emergency_stop_all(self) -> None:
-        """Emergency stop all experiments"""
-        logger.warning("EMERGENCY STOP TRIGGERED")
+        """Request stop now; latch after any accepted forward SDK call exits."""
+        logger.warning("EMERGENCY STOP REQUESTED")
         self.emergency_stop.set()
 
     def log_experiment_to_cloudtrail(
@@ -1196,6 +1338,11 @@ class ChaosExperiment:
     def __init__(self, config: dict[str, Any], safety_controller: SafetyController):
         self.config = config
         self.safety_controller = safety_controller
+        # Capture the account authenticated by the orchestrator, rather than
+        # consulting a mutable per-experiment mapping at every request.
+        self.expected_account = getattr(safety_controller, "expected_account", None)
+        if self.expected_account is None:
+            self.expected_account = config.get("account_id")
         self.region = config.get("region", DEFAULT_REGION)
         self.dry_run = bool(config.get("dry_run", True))
         self.result = None
@@ -7776,14 +7923,14 @@ class ChaosOrchestrator:
             allow_live_without_safety_alarms
             and safety_config.get("allow_live_without_safety_alarms", False)
         )
+        self.expected_account = str(global_config.get("account_id", ""))
         self.safety_controller = SafetyController(
             safety_config,
             self.session,
             self.region,
             self.live,
+            expected_account=self.expected_account,
         )
-
-        self.expected_account = str(global_config.get("account_id", ""))
         self.actual_account: str | None = None
         self.caller_arn: str | None = None
         self.active_access_key_id: str | None = None
@@ -8455,7 +8602,7 @@ class ChaosOrchestrator:
         with sensitive_log_scope(getattr(self, "_log_sensitive_values", ())):
             if self.live:
                 with _LIVE_EXPERIMENT_LOCK:
-                    if _PROCESS_EMERGENCY_STOP.is_set():
+                    if _PROCESS_EMERGENCY_STOP.stop_requested():
                         raise EmergencyStop(
                             "Process-wide emergency stop prevents new live experiments"
                         )
@@ -8489,13 +8636,19 @@ class ChaosOrchestrator:
     ) -> ExperimentResult:
         """Run a single experiment"""
         runtime_config = dict(self.config.get("global", {}))
+        expected_account = getattr(
+            self, "expected_account", runtime_config.get("account_id", "")
+        )
+        if (
+            "account_id" in experiment_config
+            and experiment_config["account_id"] != expected_account
+        ):
+            raise SafetyViolation(
+                "Experiment account cannot override the reviewed global account"
+            )
         runtime_config.update(experiment_config)
         runtime_config["region"] = self.region
-        runtime_config["account_id"] = getattr(
-            self,
-            "expected_account",
-            self.config.get("global", {}).get("account_id", ""),
-        )
+        runtime_config["account_id"] = expected_account
         runtime_config["dry_run"] = self.dry_run
         runtime_config["operator_principal_arn"] = self.operator_principal_arn
         runtime_config["active_access_key_id"] = self.active_access_key_id
@@ -9039,7 +9192,15 @@ class ChaosOrchestrator:
             raise ConfigurationError(
                 f"Experiment type is not safely executable: {experiment_type.value}"
             )
-        experiment_config = {**self.config.get("global", {}), **config}
+        global_config = self.config.get("global", {})
+        expected_account = getattr(self.safety_controller, "expected_account", None)
+        if expected_account is None:
+            expected_account = global_config.get("account_id")
+        if "account_id" in config and config["account_id"] != expected_account:
+            raise SafetyViolation(
+                "Experiment account cannot override the reviewed global account"
+            )
+        experiment_config = {**global_config, **config, "account_id": expected_account}
 
         if experiment_type == ChaosType.FIS_TEMPLATE:
             return FISTemplateExperiment(experiment_config, self.safety_controller)

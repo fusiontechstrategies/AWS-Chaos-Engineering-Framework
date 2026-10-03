@@ -30,7 +30,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def worker(aws):
     item = object.__new__(framework.ChaosOrchestrator)
-    item.config = {"global": {}, "safety": {}}
+    item.config = {"global": {"account_id": ACCOUNT_ID}, "safety": {}}
+    item.expected_account = ACCOUNT_ID
     item.region = REGION
     item.dry_run = False
     item.live = True
