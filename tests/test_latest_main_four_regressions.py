@@ -550,7 +550,11 @@ def test_stop_waits_for_accepted_sdk_call_and_blocks_later_calls_but_not_recover
 
     owner.ec2 = f.AwsClientProxy(
         "ec2",
-        SimpleNamespace(reboot_instances=admitted_call, start_instances=lambda **_: {}),
+        SimpleNamespace(
+            meta=SimpleNamespace(region_name=REGION),
+            reboot_instances=admitted_call,
+            start_instances=lambda **_: {},
+        ),
         owner,
     )
     worker = invoke_thread(
@@ -587,7 +591,11 @@ def test_reentrant_stop_inside_already_started_sdk_call_latches_after_return():
         return {}
 
     proxy = f.AwsClientProxy(
-        "ec2", SimpleNamespace(reboot_instances=admitted_call), owner
+        "ec2",
+        SimpleNamespace(
+            meta=SimpleNamespace(region_name=REGION), reboot_instances=admitted_call
+        ),
+        owner,
     )
     proxy.reboot_instances(InstanceIds=[INSTANCE_ID])
     assert states == [False, False]
@@ -610,7 +618,11 @@ def test_stop_dispatch_stress_has_no_sdk_start_after_latch(monkeypatch):
             return {}
 
         proxy = f.AwsClientProxy(
-            "ec2", SimpleNamespace(reboot_instances=raw_call), owner
+            "ec2",
+            SimpleNamespace(
+                meta=SimpleNamespace(region_name=REGION), reboot_instances=raw_call
+            ),
+            owner,
         )
 
         def dispatch(ready=ready, proxy=proxy):
@@ -636,7 +648,10 @@ def test_stop_dispatch_stress_has_no_sdk_start_after_latch(monkeypatch):
 @pytest.mark.parametrize("operation", sorted(f.S3_OWNER_BOUND_OPERATIONS))
 def test_all_s3_bucket_reads_writes_and_verifications_bind_captured_owner(operation):
     calls = []
-    client = SimpleNamespace(**{operation: lambda **kwargs: calls.append(kwargs) or {}})
+    client = SimpleNamespace(
+        meta=SimpleNamespace(region_name=REGION),
+        **{operation: lambda **kwargs: calls.append(kwargs) or {}},
+    )
     controller, _ = native_controller()
     owner = f.ChaosExperiment({"account_id": ACCOUNT_ID, "dry_run": False}, controller)
     # An unrelated later mapping edit cannot replace the authenticated account.

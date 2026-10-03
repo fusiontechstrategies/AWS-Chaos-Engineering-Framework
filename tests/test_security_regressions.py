@@ -5,8 +5,10 @@ import copy
 import pytest
 from test_aws_chaos_framework import (
     ACCOUNT_ID,
+    INSTANCE_ID,
     REGION,
     FakeAWS,
+    FakeSafetyController,
     action_configs,
     make_experiment,
 )
@@ -671,6 +673,14 @@ def test_waf_ip_set_recovery_preserves_concurrent_addresses_and_description():
     aws.read_overrides[("wafv2", "get_ip_set")] = [original, concurrent, restored]
     item, values = experiment(framework.ChaosType.WAF_IP_SET_MODIFY, aws)
     values["addresses_to_add"] = ["192.0.2.0/24", "198.51.100.0/24"]
+    item.safety_controller.config.update(
+        target_allowlist=sorted(
+            framework.ChaosOrchestrator._target_values(
+                {"type": "waf_ip_set_modify", **values}
+            )
+        ),
+        max_blast_radius=3,
+    )
     assert item.modify_ip_set(**values).status == "completed"
     item.run_rollback()
     writes = [
@@ -765,6 +775,14 @@ def test_waf_rejected_or_ambiguous_forward_write_never_claims_address_ownership(
     aws.respond = race
     item, values = experiment(framework.ChaosType.WAF_IP_SET_MODIFY, aws)
     values["addresses_to_add"] = ["198.51.100.0/24"]
+    item.safety_controller.config.update(
+        target_allowlist=sorted(
+            framework.ChaosOrchestrator._target_values(
+                {"type": "waf_ip_set_modify", **values}
+            )
+        ),
+        max_blast_radius=2,
+    )
     orchestrator = object.__new__(framework.ChaosOrchestrator)
     orchestrator.config = {"global": {}, "safety": {}}
     orchestrator.region = REGION
@@ -789,3 +807,1207 @@ def test_waf_rejected_or_ambiguous_forward_write_never_claims_address_ownership(
     assert not item.rollback_verified
     assert item.mutation_attempts == ["wafv2.update_ip_set"]
     assert any("no cleanup is authorized" in error for error in result.rollback_errors)
+
+
+# Offline controls for the validated d104 target-identity findings.
+DIGEST = "sha256:" + "1" * 64
+
+
+def config_for(values):
+    config = framework.yaml.safe_load(framework.SAMPLE_CONFIG)
+    config["global"]["account_id"] = ACCOUNT_ID
+    config["global"]["region"] = REGION
+    config["experiment_suites"] = {"reviewed": {"experiments": [values]}}
+    return config
+
+
+@pytest.mark.parametrize(
+    "kind,key,service,resource",
+    [
+        (
+            "kms_grant_revoke",
+            "key_id",
+            "kms",
+            "key/01234567-89ab-cdef-0123-456789abcdef",
+        ),
+        (
+            "sns_subscription_delete",
+            "subscription_arn",
+            "sns",
+            "reviewed-topic:01234567-89ab-cdef-0123-456789abcdef",
+        ),
+        ("sns_topic_policy_restrict", "topic_arn", "sns", "reviewed-topic"),
+        (
+            "elb_remove_targets",
+            "target_group_arn",
+            "elasticloadbalancing",
+            "targetgroup/reviewed/0123456789abcdef",
+        ),
+        ("ecs_task_stop", "cluster", "ecs", "cluster/reviewed"),
+        ("ecs_task_stop", "task_arns", "ecs", "task/reviewed/0123456789abcdef"),
+        ("lambda_throttle", "function_name", "lambda", "function:reviewed"),
+    ],
+)
+@pytest.mark.parametrize(
+    "change", ["account", "region", "partition", "service", "wildcard", "valid"]
+)
+def test_offline_config_and_token_bind_typed_arn(kind, key, service, resource, change):
+    arn = f"arn:aws-us-gov:{service}:{REGION}:{ACCOUNT_ID}:{resource}"
+    if change == "account":
+        arn = arn.replace(ACCOUNT_ID, "999900001111")
+    elif change == "region":
+        arn = arn.replace(REGION, "us-gov-east-1")
+    elif change == "partition":
+        arn = arn.replace("aws-us-gov", "aws", 1)
+    elif change == "service":
+        arn = arn.replace(f":{service}:", ":s3:", 1)
+    elif change == "wildcard":
+        arn += "*"
+    values = {"type": kind, **action_configs()[framework.ChaosType(kind)]}
+    values[key] = [arn] if key == "task_arns" else arn
+    config = config_for(values)
+    if change == "valid":
+        framework.validate_config_data(config)
+        assert framework.confirmation_token(config, "reviewed").startswith("LIVE")
+    else:
+        with pytest.raises(framework.ConfigurationError):
+            framework.validate_config_data(config)
+        with pytest.raises(framework.ConfigurationError):
+            framework.confirmation_token(config, "reviewed")
+
+
+@pytest.mark.parametrize(
+    "service,operation,key",
+    [
+        ("kms", "revoke_grant", "KeyId"),
+        ("sns", "unsubscribe", "SubscriptionArn"),
+        ("ecs", "stop_task", "task"),
+        ("elbv2", "deregister_targets", "TargetGroupArn"),
+    ],
+)
+@pytest.mark.parametrize("recovery", [False, True])
+def test_direct_sdk_foreign_arn_never_reaches_mutation(
+    service, operation, key, recovery
+):
+    aws = FakeAWS(reject_writes=False)
+    owner = framework.ChaosExperiment(
+        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False},
+        FakeSafetyController(aws, live=True),
+    )
+    owner._in_rollback = recovery
+    arn_service = "elasticloadbalancing" if service == "elbv2" else service
+    arn = f"arn:aws-us-gov:{arn_service}:{REGION}:999900001111:reviewed-resource"
+    with pytest.raises(framework.SafetyViolation):
+        getattr(owner.client(service), operation)(**{key: arn})
+    assert not aws.calls and not owner.mutation_attempts and not owner.rollback_attempts
+
+
+def test_global_arn_exceptions_are_narrow_and_explicit():
+    framework.validate_resource_arn(
+        f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/Reviewed", "iam", ACCOUNT_ID, REGION
+    )
+    framework.validate_resource_arn(
+        "arn:aws-us-gov:iam::aws:policy/ReadOnlyAccess",
+        "iam",
+        ACCOUNT_ID,
+        REGION,
+        aws_managed_policy=True,
+    )
+    framework.validate_resource_arn(
+        "arn:aws-us-gov:s3:::reviewed-bucket", "s3", ACCOUNT_ID, REGION
+    )
+    framework.validate_resource_arn(
+        f"arn:aws:cloudfront::{ACCOUNT_ID}:distribution/REVIEWED",
+        "cloudfront",
+        ACCOUNT_ID,
+        "us-east-1",
+    )
+    for arn, service in [
+        ("arn:aws-us-gov:kms:::key/reviewed", "kms"),
+        ("arn:aws-us-gov:iam::aws:role/Reviewed", "iam"),
+        ("arn:aws-us-gov:s3:::reviewed-bucket/objects", "s3"),
+        (f"arn:aws-us-gov:iam:{REGION}:{ACCOUNT_ID}:role/Reviewed", "iam"),
+    ]:
+        with pytest.raises(framework.SafetyViolation):
+            framework.validate_resource_arn(
+                arn, service, ACCOUNT_ID, REGION, aws_managed_policy=True
+            )
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        [{"imageTag": "chaos-test"}],
+        [{"imageDigest": DIGEST, "imageTag": "chaos-test"}],
+        [{"imageDigest": "sha256:short"}],
+        [{"imageDigest": DIGEST}, {"imageDigest": DIGEST}],
+    ],
+)
+def test_live_tag_or_unproven_digest_refused_before_reads_and_token(selector):
+    aws = FakeAWS(reject_writes=False)
+    values = {"repository_name": "chaos-test-repository", "image_ids": selector}
+    item = make_experiment(
+        framework.ChaosType.ECR_IMAGE_DELETE, values, aws, dry_run=False
+    )
+    assert item.delete_images(**values).status == "failed"
+    assert not aws.calls and not item.mutation_attempts
+    with pytest.raises(framework.SafetyViolation):
+        item.ecr.batch_delete_image(
+            repositoryName=values["repository_name"], imageIds=selector
+        )
+    with pytest.raises((framework.SafetyViolation, framework.ConfigurationError)):
+        framework.confirmation_token(
+            config_for({"type": "ecr_image_delete", **values}), "reviewed"
+        )
+
+
+def test_reviewed_digest_reaches_ecr_with_account_binding_not_a_tag():
+    aws = FakeAWS(reject_writes=False)
+    values = {
+        "repository_name": "chaos-test-repository",
+        "image_ids": [{"imageDigest": DIGEST}],
+    }
+    item = make_experiment(
+        framework.ChaosType.ECR_IMAGE_DELETE, values, aws, dry_run=False
+    )
+    item.safety_controller.config.update(
+        target_allowlist=[values["repository_name"], DIGEST], max_blast_radius=1
+    )
+    result = item.delete_images(**values)
+    assert result.status == "completed", result.errors
+    request = next(r for _, op, r in aws.calls if op == "batch_delete_image")
+    assert request["imageIds"] == [{"imageDigest": DIGEST}]
+    assert request["registryId"] == ACCOUNT_ID
+    assert result.affected_resources == [values["repository_name"] + "/" + DIGEST]
+
+
+def test_tags_remain_planning_only_without_changing_delete_semantics():
+    aws = FakeAWS()
+    values = {
+        "repository_name": "chaos-test-repository",
+        "image_ids": [{"imageTag": "chaos-test"}],
+    }
+    item = make_experiment(framework.ChaosType.ECR_IMAGE_DELETE, values, aws)
+    assert item.delete_images(**values).status == "completed"
+    assert all(op != "batch_delete_image" for _, op, _ in aws.calls)
+
+
+@pytest.mark.parametrize(
+    "kind,key",
+    [
+        (framework.ChaosType.CLOUDFRONT_CACHE_INVALIDATE, "paths"),
+        (framework.ChaosType.WAF_IP_SET_MODIFY, "addresses_to_add"),
+    ],
+)
+def test_child_digest_scope_changes_and_counts_all_children(kind, key):
+    values = {"type": kind.value, **action_configs()[kind]}
+    values[key] = (
+        ["/reviewed", "/other"]
+        if key == "paths"
+        else ["198.51.100.1/24", "203.0.113.0/24"]
+    )
+    approved = framework.ChaosOrchestrator._target_values(values)
+    assert any(target.startswith(f"selector:{kind.value}:") for target in approved)
+    assert framework.ChaosOrchestrator._blast_radius(kind, values) == 3
+    canonical = copy.deepcopy(values)
+    canonical[key] = (
+        sorted(set(values[key]))
+        if key == "paths"
+        else ["198.51.100.0/24", "203.0.113.0/24"]
+    )
+    assert framework.ChaosOrchestrator._target_values(canonical) == approved
+    changed = copy.deepcopy(values)
+    changed[key] = ["/unreviewed"] if key == "paths" else ["192.0.2.0/24"]
+    assert framework.ChaosOrchestrator._target_values(changed) - approved
+    if key == "addresses_to_add":
+        changed = {**values, "scope": "CLOUDFRONT"}
+        assert framework.ChaosOrchestrator._target_values(changed) - approved
+
+
+@pytest.mark.parametrize(
+    "kind,method",
+    [
+        (framework.ChaosType.CLOUDFRONT_CACHE_INVALIDATE, "invalidate_cache"),
+        (framework.ChaosType.WAF_IP_SET_MODIFY, "modify_ip_set"),
+    ],
+)
+@pytest.mark.parametrize("approval", ["parent_only", "over_radius", "exact"])
+def test_direct_child_calls_require_scope_and_emit_approved_digest(
+    kind, method, approval
+):
+    values = action_configs()[kind]
+    aws = FakeAWS(reject_writes=False)
+    item = make_experiment(kind, values, aws, dry_run=False)
+    if kind == framework.ChaosType.CLOUDFRONT_CACHE_INVALIDATE:
+        respond = aws.respond
+
+        def cloudfront_response(service, operation, request):
+            result = respond(service, operation, request)
+            if operation == "create_invalidation":
+                return {
+                    "Invalidation": {
+                        "Id": "synthetic-invalidation",
+                        "Status": "InProgress",
+                    }
+                }
+            return result
+
+        aws.respond = cloudfront_response
+    targets = framework.ChaosOrchestrator._target_values({"type": kind.value, **values})
+    item.safety_controller.config.update(
+        target_allowlist=sorted(targets), max_blast_radius=2
+    )
+    if approval == "parent_only":
+        item.safety_controller.config["target_allowlist"] = [
+            t for t in targets if not t.startswith("selector:")
+        ]
+    elif approval == "over_radius":
+        item.safety_controller.config["max_blast_radius"] = 1
+    result = getattr(item, method)(**values)
+    if approval == "exact":
+        assert result.status == "completed", result.errors
+        assert set(result.affected_resources) == targets
+    else:
+        assert result.status == "failed"
+        assert not aws.calls and not item.mutation_attempts
+
+
+def test_ec2_termination_has_no_live_authority_in_token_handler_or_sdk():
+    values = action_configs()[framework.ChaosType.EC2_TERMINATE]
+    assert not framework.experiment_metadata(
+        framework.ChaosType.EC2_TERMINATE
+    ).live_supported
+    config = config_for({"type": "ec2_terminate", **values})
+    framework.validate_config_data(config)
+    with pytest.raises(framework.ConfigurationError):
+        framework.confirmation_token(config, "reviewed")
+    aws = FakeAWS(reject_writes=False)
+    item = make_experiment(
+        framework.ChaosType.EC2_TERMINATE, values, aws, dry_run=False
+    )
+    assert item.terminate_instances(**values).status == "failed"
+    assert not aws.calls
+    with pytest.raises(framework.SafetyViolation):
+        item.ec2.terminate_instances(InstanceIds=[INSTANCE_ID])
+    assert not aws.calls and not item.mutation_attempts
+
+
+# Native botocore controls use synthetic credentials and Stubber, never transport.
+def native_target_experiment(kind, values):
+    session = framework.boto3.Session(
+        aws_access_key_id="synthetic",
+        aws_secret_access_key="synthetic",
+        region_name=REGION,
+    )
+    safety = framework.SafetyController(
+        {
+            "target_allowlist": list(
+                framework.ChaosOrchestrator._target_values(
+                    {"type": kind.value, **values}
+                )
+            ),
+            "max_blast_radius": 100,
+        },
+        session,
+        REGION,
+        True,
+        ACCOUNT_ID,
+    )
+    config = {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False, **values}
+    cls = {
+        framework.ChaosType.ECR_IMAGE_DELETE: framework.ECRChaosExperiment,
+        framework.ChaosType.KMS_GRANT_REVOKE: framework.KMSChaosExperiment,
+    }[kind]
+    return cls(config, safety)
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "valid",
+        "registry",
+        "repository",
+        "digest",
+        "missing",
+        "extra",
+        "response_missing",
+        "response_foreign",
+        "many_tags",
+    ],
+)
+def test_native_ecr_digest_provenance_and_response_proof(attack):
+    from botocore.stub import Stubber
+
+    values = {
+        "repository_name": "reviewed-repo",
+        "image_ids": [{"imageDigest": DIGEST}],
+    }
+    item = native_target_experiment(framework.ChaosType.ECR_IMAGE_DELETE, values)
+    request = {
+        "registryId": ACCOUNT_ID,
+        "repositoryName": values["repository_name"],
+        "imageIds": values["image_ids"],
+    }
+    detail = {
+        "registryId": ACCOUNT_ID,
+        "repositoryName": values["repository_name"],
+        "imageDigest": DIGEST,
+    }
+    details = [detail]
+    if attack == "registry":
+        detail["registryId"] = "999900001111"
+    elif attack == "repository":
+        detail["repositoryName"] = "other-repo"
+    elif attack == "digest":
+        detail["imageDigest"] = "sha256:" + "2" * 64
+    elif attack == "missing":
+        details = []
+    elif attack == "extra":
+        details.append({**detail, "imageDigest": "sha256:" + "2" * 64})
+    good_read = attack in {"valid", "response_missing", "response_foreign", "many_tags"}
+    with Stubber(item.ecr._client) as stub:
+        stub.add_response("describe_images", {"imageDetails": details}, request)
+        if good_read:
+            deleted = [{"imageDigest": DIGEST}]
+            if attack == "response_missing":
+                deleted = []
+            elif attack == "response_foreign":
+                deleted = [{"imageDigest": "sha256:" + "2" * 64}]
+            elif attack == "many_tags":
+                deleted = [
+                    {"imageDigest": DIGEST, "imageTag": "one"},
+                    {"imageDigest": DIGEST, "imageTag": "two"},
+                ]
+            stub.add_response(
+                "batch_delete_image",
+                (
+                    {"failures": []}
+                    if attack == "response_missing"
+                    else {"imageIds": deleted, "failures": []}
+                ),
+                request,
+            )
+        result = item.delete_images(**values)
+        stub.assert_no_pending_responses()
+
+    assert result.status == (
+        "completed" if attack in {"valid", "many_tags"} else "failed"
+    ), result.errors
+    assert bool(item.mutation_attempts) == good_read
+    assert (
+        bool(item.mutation_operations) == good_read
+    )  # Bad responses cannot erase the mutation.
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "valid",
+        "alias",
+        "bare_id",
+        "alias_arn",
+        "foreign_account",
+        "foreign_region",
+        "wrong_key_response",
+        "wrong_sdk_region",
+        "unapproved",
+    ],
+)
+def test_native_kms_grant_key_identity_before_dispatch(attack):
+    from botocore.stub import Stubber
+
+    key = f"arn:aws-us-gov:kms:{REGION}:{ACCOUNT_ID}:key/01234567-89ab-cdef-0123-456789abcdef"
+    supplied = {
+        "alias": "alias/reviewed",
+        "bare_id": key.rsplit("/", 1)[1],
+        "alias_arn": key.replace("key/", "alias/"),
+        "foreign_account": key.replace(ACCOUNT_ID, "999900001111"),
+        "foreign_region": key.replace(REGION, "us-gov-east-1"),
+    }.get(attack, key)
+    values = {"key_id": supplied, "grant_id": "1" * 64}
+    item = native_target_experiment(framework.ChaosType.KMS_GRANT_REVOKE, values)
+    if attack == "unapproved":
+        item.safety_controller.config["target_allowlist"] = []
+    if attack == "wrong_sdk_region":
+        item.kms._client = framework.boto3.Session(
+            aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+        ).client("kms", region_name="us-gov-east-1")
+    read = attack in {"valid", "wrong_key_response", "wrong_sdk_region"}
+    with Stubber(item.kms._client) as stub:
+        if read:
+            entry = {
+                "KeyId": key
+                if attack != "wrong_key_response"
+                else key.replace(ACCOUNT_ID, "999900001111"),
+                "GrantId": values["grant_id"],
+            }
+            stub.add_response(
+                "list_grants",
+                {"Grants": [entry]},
+                {"KeyId": key, "GrantId": values["grant_id"]},
+            )
+        if attack == "valid":
+            stub.add_response(
+                "revoke_grant", {}, {"KeyId": key, "GrantId": values["grant_id"]}
+            )
+        result = item.revoke_grant(**values)
+        stub.assert_no_pending_responses()
+    assert result.status == ("completed" if attack == "valid" else "failed"), (
+        result.errors
+    )
+    assert bool(item.mutation_attempts) == (attack == "valid")
+
+
+@pytest.mark.parametrize("attack", ["cycle", "deep", "wide", "malformed_arn", "valid"])
+def test_bounded_sdk_arguments_refuse_before_tracking(attack):
+    aws = FakeAWS(reject_writes=False)
+    owner = framework.ChaosExperiment(
+        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False},
+        FakeSafetyController(aws, live=True),
+    )
+    payload = {"Arn": f"arn:aws-us-gov:sns:{REGION}:{ACCOUNT_ID}:reviewed"}
+    if attack == "cycle":
+        payload["cycle"] = payload
+    elif attack == "deep":
+        for _ in range(18):
+            payload = {"child": payload}
+    elif attack == "wide":
+        payload = {"children": ["x"] * 20001}
+    elif attack == "malformed_arn":
+        payload = {"Arn": "arn:"}
+    if attack == "valid":
+        owner.client("sns").unsubscribe(SubscriptionArn=payload["Arn"])
+        assert owner.mutation_operations == ["sns.unsubscribe"]
+    else:
+        with pytest.raises(framework.SafetyViolation):
+            if attack == "malformed_arn":
+                owner.client("sns").unsubscribe(SubscriptionArn=payload["Arn"])
+            else:
+                owner.client("sns").unsubscribe(Nested=payload)
+        assert not aws.calls and not owner.mutation_attempts
+
+
+@pytest.mark.parametrize("attack", ["valid", "paths", "limit"])
+def test_native_cloudfront_canonical_child_admission(attack):
+    from botocore.stub import ANY, Stubber
+
+    values = {"distribution_id": "EREVIEWED", "paths": ["/b", "/a", "/a"]}
+    kind = framework.ChaosType.CLOUDFRONT_CACHE_INVALIDATE
+    session = framework.boto3.Session(
+        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    )
+    safety = framework.SafetyController(
+        {
+            "target_allowlist": list(
+                framework.ChaosOrchestrator._target_values(
+                    {"type": kind.value, **values}
+                )
+            ),
+            "max_blast_radius": 3 if attack != "limit" else 2,
+        },
+        session,
+        "us-east-1",
+        True,
+        ACCOUNT_ID,
+    )
+    item = framework.CloudFrontChaosExperiment(
+        {"account_id": ACCOUNT_ID, "region": "us-east-1", "dry_run": False, **values},
+        safety,
+    )
+    supplied = {**values, "paths": ["/secret"]} if attack == "paths" else values
+    with Stubber(item.cloudfront._client) as stub:
+        if attack == "valid":
+            stub.add_response(
+                "create_invalidation",
+                {
+                    "Invalidation": {
+                        "Id": "IREVIEWED",
+                        "Status": "InProgress",
+                        "CreateTime": framework.utc_now(),
+                        "InvalidationBatch": {
+                            "Paths": {"Quantity": 2, "Items": ["/a", "/b"]},
+                            "CallerReference": "offline",
+                        },
+                    }
+                },
+                {
+                    "DistributionId": "EREVIEWED",
+                    "InvalidationBatch": {
+                        "Paths": {"Quantity": 2, "Items": ["/a", "/b"]},
+                        "CallerReference": ANY,
+                    },
+                },
+            )
+        result = item.invalidate_cache(**supplied)
+        stub.assert_no_pending_responses()
+    assert result.status == ("completed" if attack == "valid" else "failed"), (
+        result.errors
+    )
+    assert bool(item.mutation_attempts) == (attack == "valid")
+    if attack == "valid":
+        assert any(value.startswith("selector:") for value in result.affected_resources)
+
+
+@pytest.mark.parametrize("attack", ["valid", "cidr", "scope", "limit", "zero_prefix"])
+def test_native_waf_canonical_children_and_scope_before_mutation(attack):
+    from botocore.stub import Stubber
+
+    values = {
+        "ip_set_id": "01234567-89ab-cdef-0123-456789abcdef",
+        "ip_set_name": "Reviewed",
+        "scope": "REGIONAL",
+        "addresses_to_add": ["198.51.100.9/24", "198.51.100.0/24"],
+    }
+    kind = framework.ChaosType.WAF_IP_SET_MODIFY
+    session = framework.boto3.Session(
+        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    )
+    safety = framework.SafetyController(
+        {
+            "target_allowlist": list(
+                framework.ChaosOrchestrator._target_values(
+                    {"type": kind.value, **values}
+                )
+            ),
+            "max_blast_radius": 2 if attack != "limit" else 1,
+        },
+        session,
+        REGION,
+        True,
+        ACCOUNT_ID,
+    )
+    item = framework.WAFChaosExperiment(
+        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False, **values}, safety
+    )
+    supplied = dict(values)
+    if attack == "cidr":
+        supplied["addresses_to_add"] = ["203.0.113.0/24"]
+    elif attack == "scope":
+        supplied["scope"] = "CLOUDFRONT"
+    elif attack == "zero_prefix":
+        supplied["addresses_to_add"] = ["0.0.0.0/0"]
+    with Stubber(item.wafv2._client) as stub:
+        if attack == "valid":
+            request = {
+                "Scope": "REGIONAL",
+                "Name": "Reviewed",
+                "Id": values["ip_set_id"],
+            }
+            token = "1" + values["ip_set_id"][1:]
+            stub.add_response(
+                "get_ip_set",
+                {
+                    "LockToken": token,
+                    "IPSet": {
+                        "Id": values["ip_set_id"],
+                        "Name": "Reviewed",
+                        "ARN": f"arn:aws-us-gov:wafv2:{REGION}:{ACCOUNT_ID}:regional/ipset/Reviewed/{values['ip_set_id']}",
+                        "IPAddressVersion": "IPV4",
+                        "Addresses": ["192.0.2.0/24"],
+                    },
+                },
+                request,
+            )
+            stub.add_response(
+                "update_ip_set",
+                {"NextLockToken": token},
+                {
+                    **request,
+                    "LockToken": token,
+                    "Addresses": ["192.0.2.0/24", "198.51.100.0/24"],
+                },
+            )
+        result = item.modify_ip_set(**supplied)
+        stub.assert_no_pending_responses()
+    assert result.status == ("completed" if attack == "valid" else "failed"), (
+        result.errors
+    )
+    assert bool(item.mutation_attempts) == (attack == "valid")
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+@pytest.mark.parametrize("allowlisted", [False, True])
+@pytest.mark.parametrize("service", ["kms", "ecr", "cloudfront", "wafv2"])
+def test_native_raw_protected_requests_have_no_handler_authority(
+    service, allowlisted, rollback
+):
+    """Even literal target approval cannot authorize an unbound raw SDK call."""
+    from botocore.stub import Stubber
+
+    region = "us-east-1" if service == "cloudfront" else REGION
+    key = f"arn:aws-us-gov:kms:{REGION}:{ACCOUNT_ID}:key/01234567-89ab-cdef-0123-456789abcdef"
+    ip_set_id = "01234567-89ab-cdef-0123-456789abcdef"
+    cases = {
+        "kms": (
+            "revoke_grant",
+            framework.ChaosType.KMS_GRANT_REVOKE,
+            {"KeyId": key, "GrantId": "1" * 64},
+            {"key_id": key, "grant_id": "1" * 64},
+        ),
+        "ecr": (
+            "batch_delete_image",
+            framework.ChaosType.ECR_IMAGE_DELETE,
+            {
+                "registryId": ACCOUNT_ID,
+                "repositoryName": "reviewed-repo",
+                "imageIds": [{"imageDigest": DIGEST}],
+            },
+            {
+                "repository_name": "reviewed-repo",
+                "image_ids": [{"imageDigest": DIGEST}],
+            },
+        ),
+        "cloudfront": (
+            "create_invalidation",
+            framework.ChaosType.CLOUDFRONT_CACHE_INVALIDATE,
+            {
+                "DistributionId": "EREVIEWED",
+                "InvalidationBatch": {
+                    "Paths": {"Quantity": 1, "Items": ["/reviewed"]},
+                    "CallerReference": "offline",
+                },
+            },
+            {"distribution_id": "EREVIEWED", "paths": ["/reviewed"]},
+        ),
+        "wafv2": (
+            "update_ip_set",
+            framework.ChaosType.WAF_IP_SET_MODIFY,
+            {
+                "Scope": "REGIONAL",
+                "Name": "Reviewed",
+                "Id": "01234567-89ab-cdef-0123-456789abcdef",
+                "Addresses": ["198.51.100.0/24"],
+                "LockToken": ip_set_id,
+            },
+            {
+                "scope": "REGIONAL",
+                "ip_set_name": "Reviewed",
+                "ip_set_id": "01234567-89ab-cdef-0123-456789abcdef",
+                "addresses_to_add": ["198.51.100.0/24"],
+            },
+        ),
+    }
+    operation, kind, request, values = cases[service]
+    raw = framework.boto3.Session(
+        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    ).client(service, region_name=region)
+    from types import SimpleNamespace
+
+    safety = framework.SafetyController(
+        {
+            "target_allowlist": sorted(
+                framework.ChaosOrchestrator._target_values(
+                    {"type": kind.value, **values}
+                )
+            )
+            if allowlisted
+            else [],
+            "max_blast_radius": 100,
+        },
+        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        region,
+        True,
+        ACCOUNT_ID,
+    )
+    safety.check_safety_conditions = lambda: (True, [])
+    owner = framework.ChaosExperiment(
+        {"account_id": ACCOUNT_ID, "region": region, "dry_run": False, **values}, safety
+    )
+    owner._in_rollback = rollback
+    with Stubber(raw) as stub:
+        # No response is queued. A dispatch would fail the native SDK guard.
+        with pytest.raises(
+            framework.SafetyViolation, match="matching reviewed handler"
+        ):
+            getattr(owner.client(service), operation)(**request)
+        stub.assert_no_pending_responses()
+    assert not owner.mutation_attempts and not owner.rollback_attempts
+
+
+@pytest.mark.parametrize("attack", ["valid", "account", "region", "partition"])
+def test_native_elb_cognito_snapshot_is_restorable_before_fault(attack):
+    from botocore.stub import Stubber
+
+    rule = f"arn:aws-us-gov:elasticloadbalancing:{REGION}:{ACCOUNT_ID}:listener-rule/app/reviewed/123/456/789"
+    pool = f"arn:aws-us-gov:cognito-idp:{REGION}:{ACCOUNT_ID}:userpool/{REGION}_Offline"
+    pool = {
+        "account": pool.replace(ACCOUNT_ID, "999900001111"),
+        "region": pool.replace(REGION, "us-gov-east-1"),
+        "partition": pool.replace("aws-us-gov", "aws"),
+    }.get(attack, pool)
+    actions = [
+        {
+            "Type": "authenticate-cognito",
+            "Order": 1,
+            "AuthenticateCognitoConfig": {
+                "UserPoolArn": pool,
+                "UserPoolClientId": "offline",
+                "UserPoolDomain": "offline",
+            },
+        },
+        {
+            "Type": "forward",
+            "Order": 2,
+            "TargetGroupArn": f"arn:aws-us-gov:elasticloadbalancing:{REGION}:{ACCOUNT_ID}:targetgroup/reviewed/123",
+        },
+    ]
+    session = framework.boto3.Session(
+        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    )
+    safety = framework.SafetyController({}, session, REGION, True, ACCOUNT_ID)
+    safety.check_safety_conditions = lambda: (True, [])
+    item = framework.ELBChaosExperiment(
+        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, safety
+    )
+    fault = [
+        {
+            "Type": "fixed-response",
+            "FixedResponseConfig": {
+                "StatusCode": "503",
+                "ContentType": "text/plain",
+                "MessageBody": "Service Unavailable - Chaos Experiment",
+            },
+        }
+    ]
+    original = {"Rules": [{"RuleArn": rule, "Actions": actions}]}
+    with Stubber(item.elbv2._client) as stub:
+        stub.add_response("describe_rules", original, {"RuleArns": [rule]})
+        if attack == "valid":
+            stub.add_response(
+                "modify_rule", {"Rules": []}, {"RuleArn": rule, "Actions": fault}
+            )
+            stub.add_response(
+                "modify_rule", original, {"RuleArn": rule, "Actions": actions}
+            )
+            stub.add_response("describe_rules", original, {"RuleArns": [rule]})
+        result = item.modify_listener_rule(rule)
+        assert result.status == ("completed" if attack == "valid" else "failed"), (
+            result.errors
+        )
+        if attack == "valid":
+            item.run_rollback()
+            assert item.rollback_verified
+            assert item.rollback_operations == ["elbv2.modify_rule"]
+        else:
+            assert not item.mutation_attempts
+        stub.assert_no_pending_responses()
+
+
+def test_lambda_recovery_preserves_opaque_arn_values():
+    aws = FakeAWS(reject_writes=False)
+    initial = aws.respond("lambda", "get_function_configuration", {})
+    initial["RevisionId"] = "rev-original"
+    initial["Environment"]["Variables"]["OPAQUE"] = "arn:foreign:application:data"
+    owned = copy.deepcopy(initial)
+    owned["Environment"]["Variables"]["MODE"] = (
+        "arn:aws:sns:us-east-1:999900001111:application-text"
+    )
+    current = copy.deepcopy(owned)
+    current["RevisionId"] = "rev-current"
+    restored = copy.deepcopy(current)
+    restored["Environment"]["Variables"]["MODE"] = "normal"
+    aws.read_overrides[("lambda", "get_function_configuration")] = [
+        initial,
+        owned,
+        current,
+        restored,
+        restored,
+    ]
+    item, values = experiment(framework.ChaosType.LAMBDA_ENVIRONMENT_CORRUPT, aws)
+    values["corrupt_vars"] = {"MODE": owned["Environment"]["Variables"]["MODE"]}
+    assert item.corrupt_environment(**values).status == "completed"
+    item.run_rollback()
+    assert item.rollback_verified
+    writes = [
+        args for _, op, args in aws.calls if op == "update_function_configuration"
+    ]
+    assert (
+        writes[0]["Environment"]["Variables"]["OPAQUE"]
+        == "arn:foreign:application:data"
+    )
+    assert (
+        writes[-1]["Environment"]["Variables"] == restored["Environment"]["Variables"]
+    )
+
+
+@pytest.mark.parametrize(
+    "attack", ["opaque", "foreign_function", "foreign_role", "oversized"]
+)
+def test_native_lambda_application_text_does_not_erase_identity_checks(attack):
+    from types import SimpleNamespace
+
+    from botocore.stub import Stubber
+
+    function = f"arn:aws-us-gov:lambda:{REGION}:{ACCOUNT_ID}:function:reviewed"
+    request = {
+        "FunctionName": function,
+        "Environment": {"Variables": {"OPAQUE": "arn:foreign:application:data"}},
+    }
+    if attack == "foreign_function":
+        request["FunctionName"] = function.replace(ACCOUNT_ID, "999900001111")
+    elif attack == "foreign_role":
+        request["Role"] = "arn:aws-us-gov:iam::999900001111:role/foreign"
+    elif attack == "oversized":
+        request["Environment"]["Variables"]["OPAQUE"] = "x" * (
+            framework.MAX_CONFIG_BYTES + 1
+        )
+    raw = framework.boto3.Session(
+        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    ).client("lambda", region_name=REGION)
+    safety = framework.SafetyController(
+        {},
+        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        REGION,
+        True,
+        ACCOUNT_ID,
+    )
+    safety.check_safety_conditions = lambda: (True, [])
+    owner = framework.ChaosExperiment(
+        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, safety
+    )
+    with Stubber(raw) as stub:
+        if attack == "opaque":
+            stub.add_response("update_function_configuration", {}, request)
+            owner.client("lambda").update_function_configuration(**request)
+            assert owner.mutation_attempts == ["lambda.update_function_configuration"]
+        else:
+            with pytest.raises(framework.SafetyViolation):
+                owner.client("lambda").update_function_configuration(**request)
+            assert not owner.mutation_attempts
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("attack", ["replay", "changed", "thread", "detached"])
+def test_native_protected_dispatch_ticket_is_single_use_exact_and_thread_local(attack):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from botocore.stub import Stubber
+
+    key = f"arn:aws-us-gov:kms:{REGION}:{ACCOUNT_ID}:key/01234567-89ab-cdef-0123-456789abcdef"
+    values = {"key_id": key, "grant_id": "1" * 64}
+    owner = native_target_experiment(framework.ChaosType.KMS_GRANT_REVOKE, values)
+    owner.safety_controller.check_safety_conditions = lambda: (True, [])
+    request = {"KeyId": key, "GrantId": values["grant_id"]}
+    expected = copy.deepcopy(request)
+    with Stubber(owner.kms._client) as stub:
+        if attack != "changed":
+            stub.add_response("revoke_grant", {}, expected)
+        with owner._approved_sdk_request("kms", "revoke_grant", request) as admitted:
+            if attack == "changed":
+                admitted["GrantId"] = "2" * 64
+                with pytest.raises(framework.SafetyViolation):
+                    owner.kms.revoke_grant(**admitted)
+                with pytest.raises(framework.SafetyViolation):
+                    owner.kms.revoke_grant(**expected)
+            else:
+                if attack == "thread":
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        pending = executor.submit(owner.kms.revoke_grant, **admitted)
+                        with pytest.raises(framework.SafetyViolation):
+                            pending.result()
+                elif attack == "detached":
+                    request["GrantId"] = "2" * 64
+                    assert admitted == expected
+                owner.kms.revoke_grant(**admitted)
+                with pytest.raises(framework.SafetyViolation):
+                    owner.kms.revoke_grant(**admitted)
+        with pytest.raises(framework.SafetyViolation):
+            owner.kms.revoke_grant(**expected)
+        stub.assert_no_pending_responses()
+    assert len(owner.mutation_attempts) == (0 if attack == "changed" else 1)
+
+
+@pytest.mark.parametrize("path", ["target_group", "forward_group", "misplaced_cognito"])
+def test_nested_identity_fields_do_not_gain_opaque_data_exemption(path):
+    foreign = f"arn:aws-us-gov:elasticloadbalancing:{REGION}:999900001111:targetgroup/other/123"
+    action = {
+        "target_group": {"Type": "forward", "TargetGroupArn": foreign},
+        "forward_group": {
+            "Type": "forward",
+            "ForwardConfig": {"TargetGroups": [{"TargetGroupArn": foreign}]},
+        },
+        "misplaced_cognito": {
+            "Type": "forward",
+            "Unknown": {
+                "UserPoolArn": f"arn:aws-us-gov:cognito-idp:{REGION}:{ACCOUNT_ID}:userpool/offline"
+            },
+        },
+    }[path]
+    with pytest.raises(framework.SafetyViolation):
+        framework.validate_sdk_request_arns(
+            "elbv2", "modify_rule", {"Actions": [action]}, ACCOUNT_ID, REGION
+        )
+
+
+@pytest.mark.parametrize(
+    "attack", ["root_width", "key_bytes", "value_bytes", "aggregate_bytes", "valid"]
+)
+def test_sdk_request_budget_covers_root_keys_and_aggregate_text(attack):
+    values = {
+        "root_width": {str(i): "x" for i in range(20001)},
+        "key_bytes": {"x" * (framework.MAX_CONFIG_BYTES + 1): "small"},
+        "value_bytes": {"small": "é" * (framework.MAX_CONFIG_BYTES // 2 + 1)},
+        "aggregate_bytes": {
+            "a": "x" * (framework.MAX_CONFIG_BYTES // 2),
+            "b": "y" * (framework.MAX_CONFIG_BYTES // 2),
+        },
+        "valid": {
+            "FunctionName": "reviewed",
+            "Environment": {"Variables": {"TEXT": "ordinary application data"}},
+        },
+    }[attack]
+    if attack == "valid":
+        assert list(framework.bounded_argument_leaves(values))
+    else:
+        with pytest.raises(framework.SafetyViolation, match="budget"):
+            list(framework.bounded_argument_leaves(values))
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "valid",
+        "role_account",
+        "role_partition",
+        "role_region",
+        "role_service",
+        "role_type",
+        "missing_role",
+        "misplaced_role",
+        "non_firehose",
+        "endpoint_account",
+    ],
+)
+def test_native_sns_firehose_role_reference_is_narrow_and_owner_bound(attack):
+    from types import SimpleNamespace
+
+    from botocore.stub import Stubber
+
+    topic = f"arn:aws-us-gov:sns:{REGION}:{ACCOUNT_ID}:reviewed"
+    role = f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/reviewed"
+    request = {
+        "TopicArn": topic,
+        "Protocol": "firehose",
+        "Endpoint": f"arn:aws-us-gov:firehose:{REGION}:{ACCOUNT_ID}:deliverystream/reviewed",
+        "Attributes": {"SubscriptionRoleArn": role},
+    }
+    if attack == "role_account":
+        request["Attributes"]["SubscriptionRoleArn"] = role.replace(
+            ACCOUNT_ID, "999900001111"
+        )
+    elif attack == "role_partition":
+        request["Attributes"]["SubscriptionRoleArn"] = role.replace("aws-us-gov", "aws")
+    elif attack == "role_region":
+        request["Attributes"]["SubscriptionRoleArn"] = role.replace(
+            "iam::", f"iam:{REGION}:"
+        )
+    elif attack == "role_service":
+        request["Attributes"]["SubscriptionRoleArn"] = role.replace(":iam:", ":kms:")
+    elif attack == "role_type":
+        request["Attributes"]["SubscriptionRoleArn"] = role.replace("role/", "user/")
+    elif attack == "missing_role":
+        request.pop("Attributes")
+    elif attack == "misplaced_role":
+        request["Attributes"] = {"Other": role}
+    elif attack == "non_firehose":
+        request["Protocol"] = "lambda"
+        request["Endpoint"] = (
+            f"arn:aws-us-gov:lambda:{REGION}:{ACCOUNT_ID}:function:reviewed"
+        )
+    elif attack == "endpoint_account":
+        request["Endpoint"] = request["Endpoint"].replace(ACCOUNT_ID, "999900001111")
+    raw = framework.boto3.Session(
+        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    ).client("sns", region_name=REGION)
+    safety = framework.SafetyController(
+        {},
+        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        REGION,
+        True,
+        ACCOUNT_ID,
+    )
+    safety.check_safety_conditions = lambda: (True, [])
+    owner = framework.ChaosExperiment(
+        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, safety
+    )
+    with Stubber(raw) as stub:
+        if attack == "valid":
+            stub.add_response(
+                "subscribe",
+                {"SubscriptionArn": topic + ":01234567-89ab-cdef-0123-456789abcdef"},
+                request,
+            )
+            owner.client("sns").subscribe(**request)
+        else:
+            with pytest.raises(framework.SafetyViolation):
+                owner.client("sns").subscribe(**request)
+            assert not owner.mutation_attempts
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("protocol", ["lambda", "firehose"])
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "valid",
+        "endpoint_account",
+        "endpoint_region",
+        "endpoint_partition",
+        "topic_account",
+        "role_account",
+        "missing_role",
+    ],
+)
+def test_native_sns_snapshot_admission_precedes_irreversible_fault(protocol, attack):
+    from botocore.stub import Stubber
+
+    topic = f"arn:aws-us-gov:sns:{REGION}:{ACCOUNT_ID}:reviewed"
+    subscription = topic + ":01234567-89ab-cdef-0123-456789abcdef"
+    leaf = "function:reviewed" if protocol == "lambda" else "deliverystream/reviewed"
+    endpoint = f"arn:aws-us-gov:{protocol}:{REGION}:{ACCOUNT_ID}:{leaf}"
+    details = {"TopicArn": topic, "Protocol": protocol, "Endpoint": endpoint}
+    if protocol == "firehose":
+        details["SubscriptionRoleArn"] = (
+            f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/reviewed"
+        )
+    if attack == "endpoint_account":
+        details["Endpoint"] = endpoint.replace(ACCOUNT_ID, "999900001111")
+    elif attack == "endpoint_region":
+        details["Endpoint"] = endpoint.replace(REGION, "us-gov-east-1")
+    elif attack == "endpoint_partition":
+        details["Endpoint"] = endpoint.replace("aws-us-gov", "aws")
+    elif attack == "topic_account":
+        details["TopicArn"] = topic.replace(ACCOUNT_ID, "999900001111")
+    elif protocol == "firehose" and attack == "role_account":
+        details["SubscriptionRoleArn"] = details["SubscriptionRoleArn"].replace(
+            ACCOUNT_ID, "999900001111"
+        )
+    elif protocol == "firehose" and attack == "missing_role":
+        details.pop("SubscriptionRoleArn")
+    good = attack == "valid" or (
+        protocol == "lambda" and attack in {"role_account", "missing_role"}
+    )
+    request = {
+        "TopicArn": details["TopicArn"],
+        "Protocol": protocol,
+        "Endpoint": details["Endpoint"],
+    }
+    if protocol == "firehose" and "SubscriptionRoleArn" in details:
+        request["Attributes"] = {"SubscriptionRoleArn": details["SubscriptionRoleArn"]}
+    session = framework.boto3.Session(
+        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    )
+    safety = framework.SafetyController({}, session, REGION, True, ACCOUNT_ID)
+    safety.check_safety_conditions = lambda: (True, [])
+    owner = framework.SNSChaosExperiment(
+        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, safety
+    )
+    with Stubber(owner.sns._client) as stub:
+        stub.add_response(
+            "get_subscription_attributes",
+            {"Attributes": details},
+            {"SubscriptionArn": subscription},
+        )
+        if good:
+            stub.add_response("unsubscribe", {}, {"SubscriptionArn": subscription})
+            stub.add_response("subscribe", {"SubscriptionArn": subscription}, request)
+        result = owner.delete_subscription(subscription)
+        assert result.status == ("completed" if good else "failed"), result.errors
+        owner.run_rollback()
+        if good:
+            assert owner.mutation_operations == ["sns.unsubscribe"]
+            assert owner.rollback_operations == ["sns.subscribe"]
+            assert (
+                not owner.rollback_verified
+            )  # Recreation never proves full irreversible recovery.
+        else:
+            assert not owner.mutation_attempts and not owner.rollback_attempts
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "delete"])
+@pytest.mark.parametrize(
+    "resource, valid",
+    [
+        ("role/reviewed", True),
+        ("role/team/component/reviewed", True),
+        ("role/" + "n" * 64, True),
+        ("role/" + "p" * 510 + "/reviewed", True),
+        ("role/a:b/role_+=,.@-", True),
+        ("role/team//reviewed", True),
+        ("role/team/", False),
+        ("role//", False),
+        ("role/", False),
+        ("role/na:me", False),
+        ("role/" + "n" * 65, False),
+        ("role/" + "p" * 511 + "/reviewed", False),
+        ("role/na me", False),
+        ("role/na%me", False),
+        ("role/n\u00e4me", False),
+        ("role/t\u00e4m/reviewed", False),
+        ("role/team space/reviewed", False),
+        ("role/team\x7f/reviewed", False),
+        ("role/team\n/reviewed", False),
+        ("user/reviewed", False),
+    ],
+)
+def test_native_sns_role_grammar_precedes_dispatch_and_irreversible_fault(
+    entrypoint, resource, valid
+):
+    from botocore.stub import Stubber
+
+    topic = f"arn:aws-us-gov:sns:{REGION}:{ACCOUNT_ID}:reviewed"
+    subscription = topic + ":01234567-89ab-cdef-0123-456789abcdef"
+    role = f"arn:aws-us-gov:iam::{ACCOUNT_ID}:{resource}"
+    endpoint = f"arn:aws-us-gov:firehose:{REGION}:{ACCOUNT_ID}:deliverystream/reviewed"
+    request = {
+        "TopicArn": topic,
+        "Protocol": "firehose",
+        "Endpoint": endpoint,
+        "Attributes": {"SubscriptionRoleArn": role},
+    }
+    session = framework.boto3.Session(
+        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    )
+    safety = framework.SafetyController({}, session, REGION, True, ACCOUNT_ID)
+    safety.check_safety_conditions = lambda: (True, [])
+    owner = framework.SNSChaosExperiment(
+        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, safety
+    )
+    with Stubber(owner.sns._client) as stub:
+        if entrypoint == "delete":
+            stub.add_response(
+                "get_subscription_attributes",
+                {
+                    "Attributes": {
+                        "TopicArn": topic,
+                        "Protocol": "firehose",
+                        "Endpoint": endpoint,
+                        "SubscriptionRoleArn": role,
+                    }
+                },
+                {"SubscriptionArn": subscription},
+            )
+            if valid:
+                stub.add_response("unsubscribe", {}, {"SubscriptionArn": subscription})
+                stub.add_response(
+                    "subscribe", {"SubscriptionArn": subscription}, request
+                )
+            result = owner.delete_subscription(subscription)
+            assert result.status == ("completed" if valid else "failed"), result.errors
+            owner.run_rollback()
+            if valid:
+                assert owner.mutation_operations == ["sns.unsubscribe"]
+                assert owner.rollback_operations == ["sns.subscribe"]
+                assert not owner.rollback_verified
+            else:
+                assert not owner.mutation_attempts and not owner.rollback_attempts
+        elif valid:
+            stub.add_response("subscribe", {"SubscriptionArn": subscription}, request)
+            owner.sns.subscribe(**request)
+            assert owner.mutation_operations == ["sns.subscribe"]
+        else:
+            with pytest.raises(framework.SafetyViolation):
+                owner.sns.subscribe(**request)
+            assert not owner.mutation_attempts
+        stub.assert_no_pending_responses()

@@ -518,6 +518,7 @@ FIS_PREFERRED_EXPERIMENTS = frozenset(
 
 CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
     {
+        ChaosType.EC2_TERMINATE,
         ChaosType.VPC_NACL_BLOCK_TRAFFIC,
         ChaosType.SQS_QUEUE_POLICY_RESTRICT,
         ChaosType.SQS_MESSAGE_DELAY,
@@ -536,6 +537,7 @@ CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
 # read/write race. Keep planning, but do not create a fault requiring this recovery.
 CONCURRENCY_UNSAFE_MUTATIONS = frozenset(
     {
+        "ec2.terminate_instances",
         "ec2.create_network_acl_entry",
         "ec2.delete_network_acl_entry",
         "sqs.set_queue_attributes",
@@ -716,6 +718,369 @@ PRIMARY_TARGET_KEYS: dict[ChaosType, tuple[str, ...]] = {
     ChaosType.ECS_TASK_STOP: ("task_arns",),
     ChaosType.ECR_IMAGE_DELETE: ("image_ids",),
 }
+
+ARN_SERVICE_NAMES = {
+    "elb": "elasticloadbalancing",
+    "elbv2": "elasticloadbalancing",
+    "ebs": "ec2",
+    "vpc": "ec2",
+    "efs": "elasticfilesystem",
+    "opensearch": "es",
+    "waf": "wafv2",
+    "stepfunctions": "states",
+}
+
+SDK_CROSS_SERVICE_ARN_FIELDS = {
+    ("stepfunctions", "test_state", ("roleArn",)): frozenset({"iam"}),
+    (
+        "codecommit",
+        "test_repository_triggers",
+        ("triggers", "[]", "destinationArn"),
+    ): frozenset({"sns", "lambda"}),
+    (
+        "codecommit",
+        "put_repository_triggers",
+        ("triggers", "[]", "destinationArn"),
+    ): frozenset({"sns", "lambda"}),
+    ("elbv2", "deregister_targets", ("Targets", "[]", "Id")): frozenset({"lambda"}),
+    ("elbv2", "register_targets", ("Targets", "[]", "Id")): frozenset({"lambda"}),
+    (
+        "elbv2",
+        "modify_rule",
+        ("Actions", "[]", "AuthenticateCognitoConfig", "UserPoolArn"),
+    ): frozenset({"cognito-idp"}),
+    ("lambda", "update_function_configuration", ("Role",)): frozenset({"iam"}),
+}
+
+PROTECTED_MUTATION_TYPES = {
+    ("kms", "revoke_grant"): ChaosType.KMS_GRANT_REVOKE,
+    ("ecr", "batch_delete_image"): ChaosType.ECR_IMAGE_DELETE,
+    ("cloudfront", "create_invalidation"): ChaosType.CLOUDFRONT_CACHE_INVALIDATE,
+    ("wafv2", "update_ip_set"): ChaosType.WAF_IP_SET_MODIFY,
+}
+
+
+def bounded_argument_leaves(arguments: dict[str, Any], *, with_paths: bool = False):
+    """Visit bounded request data, refusing cycles before any SDK dispatch."""
+    if len(arguments) > 20000:
+        raise SafetyViolation("AWS request exceeds the reviewed traversal budget")
+    pending = [(key, value, 0, (key,)) for key, value in arguments.items()]
+    seen: set[int] = set()
+    visited = 0
+    text_bytes = 0
+    while pending:
+        key, value, depth, path = pending.pop()
+        visited += 1
+        if visited > 20000 or depth > 16:
+            raise SafetyViolation(
+                "AWS request data exceeds the reviewed traversal budget"
+            )
+        if isinstance(key, str):
+            if len(key) > MAX_CONFIG_BYTES:
+                raise SafetyViolation(
+                    "AWS request key exceeds the reviewed byte budget"
+                )
+            text_bytes += len(key.encode("utf-8"))
+            if text_bytes > MAX_CONFIG_BYTES:
+                raise SafetyViolation(
+                    "AWS request text exceeds the reviewed byte budget"
+                )
+        if isinstance(value, (dict, list, tuple)):
+            if len(value) > 20000:
+                raise SafetyViolation(
+                    "AWS request container exceeds the reviewed traversal budget"
+                )
+            if id(value) in seen:
+                raise SafetyViolation(
+                    "AWS request data repeats a container or contains a cycle"
+                )
+            seen.add(id(value))
+            if isinstance(value, dict):
+                pending.extend(
+                    (child, item, depth + 1, (*path, child))
+                    for child, item in value.items()
+                )
+            else:
+                pending.extend((key, item, depth + 1, (*path, "[]")) for item in value)
+        else:
+            if isinstance(value, str):
+                if len(value) > MAX_CONFIG_BYTES:
+                    raise SafetyViolation(
+                        "AWS request string exceeds the reviewed byte budget"
+                    )
+                text_bytes += len(value.encode("utf-8"))
+                if text_bytes > MAX_CONFIG_BYTES:
+                    raise SafetyViolation(
+                        "AWS request strings exceed the reviewed byte budget"
+                    )
+            yield (key, value, path) if with_paths else (key, value)
+
+
+def validate_kms_key_arn(value: Any, account: str | None, region: str) -> None:
+    """Live grant revocation approves an immutable key ARN, never an alias."""
+    if not isinstance(value, str):
+        raise SafetyViolation("Live KMS grant revocation requires an immutable key ARN")
+    validate_resource_arn(value, "kms", account, region)
+    if not re.fullmatch(
+        r"arn:[^:]+:kms:[^:]+:[0-9]{12}:key/(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|mrk-[0-9a-f]{32})",
+        value,
+    ):
+        raise SafetyViolation("Live KMS grant revocation requires an immutable key ARN")
+
+
+def validate_resource_arn(
+    value: str,
+    service: str,
+    account: str | None,
+    region: str,
+    *,
+    aws_managed_policy: bool = False,
+) -> None:
+    """Bind literal resource ARNs without a network lookup or mutable alias."""
+    match = re.fullmatch(
+        r"arn:(aws|aws-us-gov):([a-z0-9-]+):([^:]*):([^:]*):([^\s*?]+)", value
+    )
+    if not match or not ACCOUNT_ID_PATTERN.fullmatch(str(account or "")):
+        raise SafetyViolation(
+            "Resource ARN requires a valid reviewed account and exact identity"
+        )
+    partition, arn_service, arn_region, arn_account, resource = match.groups()
+    expected_service = ARN_SERVICE_NAMES.get(service, service)
+    expected_partition = "aws-us-gov" if region in GOVCLOUD_REGIONS else "aws"
+    if partition != expected_partition or arn_service != expected_service:
+        raise SafetyViolation(
+            "Resource ARN differs from the reviewed partition or service"
+        )
+    # These are explicit global-service forms, not a general empty-field exemption.
+    if arn_service in {"iam", "cloudfront"}:
+        if arn_region:
+            raise SafetyViolation("Global resource ARN must have an empty region")
+    elif arn_service == "s3" and not arn_region and not arn_account:
+        # Bucket ARNs carry neither region nor account. The S3 proxy independently
+        # binds every permitted bucket request with ExpectedBucketOwner.
+        if not resource or "/" in resource:
+            raise SafetyViolation(
+                "Only bucket resource ARNs have this global exception"
+            )
+        return
+    elif arn_region != region:
+        raise SafetyViolation("Resource ARN differs from the reviewed region")
+    managed = (
+        aws_managed_policy
+        and arn_service == "iam"
+        and arn_account == "aws"
+        and resource.startswith("policy/")
+    )
+    if arn_account != account and not managed:
+        raise SafetyViolation("Resource ARN differs from the reviewed account")
+
+
+def validate_experiment_arns(
+    config: dict[str, Any], account: str | None, region: str
+) -> None:
+    """Validate every ARN-valued target before approval or dispatch."""
+    service = str(config.get("type", "")).split("_", 1)[0]
+    if (
+        service == "waf"
+        and config.get("scope") == "CLOUDFRONT"
+        and region != "us-east-1"
+    ):
+        raise SafetyViolation(
+            "WAF CloudFront scope requires the reviewed us-east-1 endpoint"
+        )
+    targets = {
+        key: value
+        for key, value in config.items()
+        if key in TARGET_PARAMETER_KEYS or key == "queue_arn"
+    }
+    for key, target in bounded_argument_leaves(targets):
+        if isinstance(target, str) and target.startswith("arn:"):
+            target_service = (
+                "lambda" if service == "elb" and key == "target_ids" else service
+            )
+            validate_resource_arn(
+                target,
+                target_service,
+                account,
+                region,
+                aws_managed_policy=key == "policy_arn",
+            )
+
+
+def validate_sdk_request_arns(
+    service: str,
+    operation: str,
+    request: dict[str, Any],
+    account: str | None,
+    region: str,
+) -> None:
+    """Classify actual SDK identity fields, preserving opaque structured data."""
+    leaves = list(bounded_argument_leaves(request, with_paths=True))
+    if (
+        service == "sns"
+        and operation == "subscribe"
+        and request.get("Protocol") == "firehose"
+    ):
+        attributes = request.get("Attributes", {})
+        role = (
+            attributes.get("SubscriptionRoleArn")
+            if isinstance(attributes, dict)
+            else None
+        )
+        if not isinstance(role, str):
+            raise SafetyViolation(
+                "Firehose subscriptions require a reviewed IAM role ARN"
+            )
+        validate_resource_arn(role, "iam", account, region)
+        resource = role.split(":", 5)[5]
+        role_path, separator, role_name = resource.removeprefix("role/").rpartition("/")
+        role_path = "/" if not separator else "/" + role_path + "/"
+        if (
+            not resource.startswith("role/")
+            or re.fullmatch(r"[A-Za-z0-9_+=,.@-]{1,64}", role_name) is None
+            or len(role_path) > 512
+            or (role_path != "/" and re.fullmatch(r"/[\x21-\x7e]+/", role_path) is None)
+        ):
+            raise SafetyViolation(
+                "Firehose subscriptions require a reviewed IAM role ARN"
+            )
+    opaque_root_fields = {
+        "Description",
+        "Message",
+        "Subject",
+        "Policy",
+        "PolicyDocument",
+        "definition",
+        "input",
+        "output",
+        "Document",
+        "PolicyText",
+        "policyText",
+        "MessageBody",
+        "Value",
+        "AttributeValue",
+        "Token",
+    }
+    for key, value, path in leaves:
+        reference = (service, operation, path)
+        if (
+            service == "lambda"
+            and operation == "update_function_configuration"
+            and path[:2] == ("Environment", "Variables")
+        ):
+            # These SDK fields are application string data. Other nested ARN
+            # values retain identity admission unless their exact reference
+            # structure permits a reviewed cross-service identity.
+            continue
+        if len(path) == 1 and key in opaque_root_fields:
+            continue
+        if not isinstance(value, str) or not value.startswith("arn:"):
+            continue
+        expected_service = service
+        allowed_services = SDK_CROSS_SERVICE_ARN_FIELDS.get(reference, ())
+        if service == "sns" and operation == "subscribe" and path == ("Endpoint",):
+            allowed_services = {request.get("Protocol")} & {"lambda", "sqs", "firehose"}
+        elif (
+            service == "sns"
+            and operation == "subscribe"
+            and path == ("Attributes", "SubscriptionRoleArn")
+            and request.get("Protocol") == "firehose"
+        ):
+            allowed_services = {"iam"}
+        parts = value.split(":", 3)
+        supplied_service = parts[2] if len(parts) > 2 else ""
+        if supplied_service in allowed_services:
+            expected_service = supplied_service
+        validate_resource_arn(
+            value,
+            expected_service,
+            account,
+            region,
+            aws_managed_policy=path == ("PolicyArn",),
+        )
+
+
+def validate_digest_image_ids(image_ids: Any) -> None:
+    """Live ECR deletion approves immutable images, never movable tag names."""
+    if not isinstance(image_ids, list) or not image_ids or len(image_ids) > 100:
+        raise SafetyViolation(
+            "Live ECR deletion needs one to one hundred reviewed image digests"
+        )
+    for item in image_ids:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"imageDigest"}
+            or not isinstance(item["imageDigest"], str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", item["imageDigest"])
+        ):
+            raise SafetyViolation(
+                "Live ECR deletion requires explicit SHA-256 imageDigest selectors; tags are planning only"
+            )
+    if len({item["imageDigest"] for item in image_ids}) != len(image_ids):
+        raise SafetyViolation("Live ECR deletion requires unique image digests")
+
+
+def canonical_child_selectors(
+    kind: ChaosType, config: dict[str, Any]
+) -> dict[str, Any]:
+    """Use the same exact child representation in authorization and AWS calls."""
+    if kind == ChaosType.CLOUDFRONT_CACHE_INVALIDATE:
+        paths = config.get("paths", ["/*"])
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or len(paths) > 3000
+            or any(
+                not isinstance(path, str)
+                or not path.startswith("/")
+                or any(ord(char) < 32 or ord(char) == 127 for char in path)
+                for path in paths
+            )
+        ):
+            raise ConfigurationError(
+                "CloudFront paths must be a bounded non-empty list of literal absolute paths"
+            )
+        return {
+            "distribution_id": config.get("distribution_id"),
+            "paths": sorted(set(paths)),
+        }
+    if kind == ChaosType.WAF_IP_SET_MODIFY:
+        scope = config.get("scope", "REGIONAL")
+        addresses = config.get("addresses_to_add")
+        if (
+            scope not in {"REGIONAL", "CLOUDFRONT"}
+            or not isinstance(addresses, list)
+            or not addresses
+            or len(addresses) > 10000
+        ):
+            raise ConfigurationError(
+                "WAF IP-set scope and addresses must be explicit and bounded"
+            )
+        try:
+            normalized = sorted(
+                {
+                    str(ipaddress.ip_network(address, strict=False))
+                    for address in addresses
+                    if isinstance(address, str)
+                }
+            )
+            if len(normalized) == 0 or any(
+                not isinstance(address, str) for address in addresses
+            ):
+                raise ValueError("Invalid CIDR")
+            if any(
+                ipaddress.ip_network(address).prefixlen == 0 for address in normalized
+            ):
+                raise ValueError("WAF does not permit a /0 CIDR")
+        except ValueError as exc:
+            raise ConfigurationError("Invalid WAF IP-set CIDR selector") from exc
+        return {
+            "ip_set_id": config.get("ip_set_id"),
+            "ip_set_name": config.get("ip_set_name"),
+            "scope": scope,
+            "addresses_to_add": normalized,
+        }
+    return {}
 
 
 def experiment_metadata(experiment_type: ChaosType) -> ExperimentMetadata:
@@ -1143,6 +1508,63 @@ class AwsClientProxy:
                 return attribute(*args, **kwargs)
             if self._owner.dry_run:
                 raise SafetyViolation("Plan mode refuses direct AWS mutation dispatch")
+            if args:
+                raise SafetyViolation(
+                    "AWS mutations require explicit keyword resource arguments"
+                )
+            # Direct library calls receive the same account/region boundary as
+            # the CLI, including recovery requests. Nested request ARNs are data.
+            client_region = getattr(
+                getattr(self._client, "meta", None), "region_name", None
+            )
+            expected_region = self._owner.expected_region
+            allowed_regions = {expected_region}
+            if self._service == "iam":
+                allowed_regions = {
+                    "aws-us-gov-global"
+                    if expected_region in GOVCLOUD_REGIONS
+                    else "aws-global"
+                }
+            elif (
+                self._service == "cloudfront"
+                and expected_region not in GOVCLOUD_REGIONS
+            ):
+                allowed_regions = {"aws-global"}
+            if client_region not in allowed_regions:
+                raise SafetyViolation(
+                    "AWS SDK client region differs from the reviewed endpoint region"
+                )
+            validate_sdk_request_arns(
+                self._service,
+                name,
+                kwargs,
+                self._owner.expected_account,
+                self._owner.expected_region,
+            )
+            if self._service == "kms" and name == "revoke_grant":
+                validate_kms_key_arn(
+                    kwargs.get("KeyId"), self._owner.expected_account, expected_region
+                )
+            if (
+                self._service == "wafv2"
+                and kwargs.get("Scope") == "CLOUDFRONT"
+                and client_region != "us-east-1"
+            ):
+                raise SafetyViolation(
+                    "WAF CloudFront scope requires the reviewed us-east-1 endpoint"
+                )
+            if self._service == "ecr" and name == "batch_delete_image":
+                validate_digest_image_ids(kwargs.get("imageIds"))
+                if (
+                    "registryId" in kwargs
+                    and kwargs["registryId"] != self._owner.expected_account
+                ):
+                    raise SafetyViolation(
+                        "ECR registry differs from the reviewed account"
+                    )
+                kwargs["registryId"] = self._owner.expected_account
+            if (self._service, name) in PROTECTED_MUTATION_TYPES:
+                self._owner._consume_sdk_request(self._service, name, kwargs)
             if self._owner is not None:
                 if (
                     not self._owner.dry_run
@@ -1463,6 +1885,7 @@ class ChaosExperiment:
         if self.expected_account is None:
             self.expected_account = config.get("account_id")
         self.region = config.get("region", DEFAULT_REGION)
+        self.expected_region = getattr(safety_controller, "region", self.region)
         self.dry_run = bool(config.get("dry_run", True))
         self.result = None
         self.mutation_operations: list[str] = []
@@ -1473,6 +1896,110 @@ class ChaosExperiment:
         self.rollback_verified = False
         self._in_rollback = False
         self.rollback_mode = "none"
+        self._sdk_request_authority = threading.local()
+
+    @contextmanager
+    def _approved_sdk_request(
+        self,
+        service: str,
+        operation: str,
+        request: dict[str, Any],
+        child_scope: dict[str, Any] | None = None,
+    ):
+        """Bind one internal dispatch to a copied, canonical authorized request."""
+        kind = PROTECTED_MUTATION_TYPES[(service, operation)]
+        list(bounded_argument_leaves(request))
+        encoded = json.dumps(
+            request, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        if len(encoded.encode("utf-8")) > MAX_CONFIG_BYTES:
+            raise SafetyViolation(
+                "Authorized SDK request exceeds the reviewed byte budget"
+            )
+        snapshot = json.loads(encoded)
+        if kind == ChaosType.KMS_GRANT_REVOKE:
+            scope = {"key_id": snapshot["KeyId"], "grant_id": snapshot["GrantId"]}
+            validate_kms_key_arn(
+                scope["key_id"], self.expected_account, self.expected_region
+            )
+        elif kind == ChaosType.ECR_IMAGE_DELETE:
+            if snapshot.get("registryId") != self.expected_account:
+                raise SafetyViolation(
+                    "Authorized ECR request differs from the reviewed registry"
+                )
+            scope = {
+                "repository_name": snapshot["repositoryName"],
+                "image_ids": snapshot["imageIds"],
+            }
+            validate_digest_image_ids(scope["image_ids"])
+        elif kind == ChaosType.CLOUDFRONT_CACHE_INVALIDATE:
+            paths = snapshot["InvalidationBatch"]["Paths"]
+            scope = canonical_child_selectors(
+                kind,
+                {
+                    "distribution_id": snapshot["DistributionId"],
+                    "paths": paths["Items"],
+                },
+            )
+            if (
+                paths["Quantity"] != len(scope["paths"])
+                or paths["Items"] != scope["paths"]
+            ):
+                raise SafetyViolation("Authorized CloudFront request is not canonical")
+        else:
+            if child_scope is None:
+                raise SafetyViolation("WAF dispatch requires reviewed child scope")
+            scope = canonical_child_selectors(kind, child_scope)
+            if (snapshot["Id"], snapshot["Name"], snapshot["Scope"]) != (
+                scope["ip_set_id"],
+                scope["ip_set_name"],
+                scope["scope"],
+            ):
+                raise SafetyViolation(
+                    "Authorized WAF request differs from its reviewed parent or scope"
+                )
+            if self._in_rollback:
+                if not getattr(self, "ip_set_write_confirmed", False):
+                    raise SafetyViolation(
+                        "WAF recovery requires confirmed owned additions"
+                    )
+                if not set(self.owned_address_additions) <= set(
+                    scope["addresses_to_add"]
+                ):
+                    raise SafetyViolation(
+                        "WAF recovery additions differ from reviewed children"
+                    )
+                expected_addresses = set(self.rollback_ip_set_state["Addresses"])
+            else:
+                expected_addresses = set(self.original_addresses) | set(
+                    scope["addresses_to_add"]
+                )
+            if snapshot["Addresses"] != sorted(expected_addresses):
+                raise SafetyViolation(
+                    "Authorized WAF request differs from the verified address transition"
+                )
+        self._require_derived_scope(kind, {**self.config, **scope})
+        if getattr(self._sdk_request_authority, "ticket", None) is not None:
+            raise SafetyViolation("Nested protected SDK authorization is refused")
+        self._sdk_request_authority.ticket = (service, operation, encoded)
+        try:
+            yield snapshot
+        finally:
+            self._sdk_request_authority.ticket = None
+
+    def _consume_sdk_request(
+        self, service: str, operation: str, request: dict[str, Any]
+    ) -> None:
+        """Raw proxy invocation cannot acquire or reuse handler authorization."""
+        encoded = json.dumps(
+            request, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        supplied = getattr(self._sdk_request_authority, "ticket", None)
+        self._sdk_request_authority.ticket = None
+        if supplied != (service, operation, encoded):
+            raise SafetyViolation(
+                "Protected SDK mutation requires one matching reviewed handler request"
+            )
 
     def client(self, service: str, region_name: str | None = None) -> AwsClientProxy:
         """Return an SDK client whose successful writes are recorded."""
@@ -1872,6 +2399,10 @@ class EC2ChaosExperiment(ChaosExperiment):
         )
 
         try:
+            if not self.dry_run:
+                raise SafetyViolation(
+                    "Live EC2 termination is disabled: AWS cannot condition termination on the reviewed block-device relationships"
+                )
             # Log to CloudTrail
             self.safety_controller.log_experiment_to_cloudtrail(
                 "EC2_TERMINATE", instance_ids
@@ -4995,9 +5526,30 @@ class SNSChaosExperiment(ChaosExperiment):
             attrs = self.sns.get_subscription_attributes(
                 SubscriptionArn=subscription_arn
             )
-            self.subscription_details = attrs["Attributes"]
-
             if not self.dry_run:
+                details = attrs["Attributes"]
+                request = {
+                    "TopicArn": details["TopicArn"],
+                    "Protocol": details["Protocol"],
+                    "Endpoint": details["Endpoint"],
+                }
+                if request["Protocol"] == "firehose":
+                    role = details.get("SubscriptionRoleArn")
+                    if not isinstance(role, str) or not role.startswith("arn:"):
+                        raise SafetyViolation(
+                            "Firehose subscription recovery requires its IAM role ARN"
+                        )
+                    request["Attributes"] = {"SubscriptionRoleArn": role}
+                # Refuse a snapshot we already know the identity boundary cannot
+                # recreate, before introducing an irreversible deletion.
+                validate_sdk_request_arns(
+                    "sns",
+                    "subscribe",
+                    request,
+                    self.expected_account,
+                    self.expected_region,
+                )
+                self.subscription_request = copy.deepcopy(request)
                 self.sns.unsubscribe(SubscriptionArn=subscription_arn)
                 result.affected_resources = [subscription_arn]
                 logger.info(f"Deleted subscription: {subscription_arn}")
@@ -5092,16 +5644,12 @@ class SNSChaosExperiment(ChaosExperiment):
     def rollback(self):
         """Rollback SNS experiments"""
         try:
-            if hasattr(self, "subscription_details"):
+            if hasattr(self, "subscription_request") and self.mutation_attempts:
                 # Re-create subscription
-                topic_arn = self.subscription_details["TopicArn"]
-                protocol = self.subscription_details["Protocol"]
-                endpoint = self.subscription_details["Endpoint"]
-
-                self.sns.subscribe(
-                    TopicArn=topic_arn, Protocol=protocol, Endpoint=endpoint
+                self.sns.subscribe(**copy.deepcopy(self.subscription_request))
+                logger.info(
+                    f"Re-created subscription for topic {self.subscription_request['TopicArn']}"
                 )
-                logger.info(f"Re-created subscription for topic {topic_arn}")
 
             if hasattr(self, "topic_arn") and hasattr(self, "owned_policy_statement"):
                 current = self.sns.get_topic_attributes(TopicArn=self.topic_arn)[
@@ -5356,8 +5904,15 @@ class ELBChaosExperiment(ChaosExperiment):
                     "ELB did not return one matching rule with actions"
                 )
             if response["Rules"]:
-                self.original_actions = response["Rules"][0]["Actions"]
+                self.original_actions = copy.deepcopy(response["Rules"][0]["Actions"])
                 self.rule_arn = rule_arn
+                validate_sdk_request_arns(
+                    "elbv2",
+                    "modify_rule",
+                    {"RuleArn": rule_arn, "Actions": self.original_actions},
+                    self.expected_account,
+                    self.expected_region,
+                )
 
                 if not self.dry_run:
                     # Modify to return error
@@ -6273,7 +6828,7 @@ class CloudFrontChaosExperiment(ChaosExperiment):
         self, distribution_id: str, paths: list[str] | None = None
     ) -> ExperimentResult:
         """Create cache invalidation"""
-        paths = paths or ["/*"]
+        paths = ["/*"] if paths is None else paths
         experiment_id = _experiment_id("cloudfront-invalidate")
         result = ExperimentResult(
             experiment_id=experiment_id,
@@ -6282,22 +6837,34 @@ class CloudFrontChaosExperiment(ChaosExperiment):
         )
 
         try:
+            selectors = canonical_child_selectors(
+                ChaosType.CLOUDFRONT_CACHE_INVALIDATE,
+                {"distribution_id": distribution_id, "paths": paths},
+            )
+            paths = selectors["paths"]
+            approved = self._require_derived_scope(
+                ChaosType.CLOUDFRONT_CACHE_INVALIDATE, {**self.config, **selectors}
+            )
             if not self.dry_run:
-                response = self.cloudfront.create_invalidation(
-                    DistributionId=distribution_id,
-                    InvalidationBatch={
+                request = {
+                    "DistributionId": distribution_id,
+                    "InvalidationBatch": {
                         "Paths": {"Quantity": len(paths), "Items": paths},
                         "CallerReference": f"chaos-{experiment_id}",
                     },
-                )
-                result.affected_resources = [distribution_id]
+                }
+                with self._approved_sdk_request(
+                    "cloudfront", "create_invalidation", request
+                ) as admitted:
+                    response = self.cloudfront.create_invalidation(**admitted)
+                result.affected_resources = sorted(approved)
                 result.additional_info["invalidation_id"] = response["Invalidation"][
                     "Id"
                 ]
                 logger.info(f"Created invalidation for distribution {distribution_id}")
             else:
                 logger.info("DRY RUN: Would invalidate cache")
-                result.affected_resources = [distribution_id]
+                result.affected_resources = sorted(approved)
 
             result.status = "completed"
 
@@ -6527,6 +7094,20 @@ class WAFChaosExperiment(ChaosExperiment):
         )
 
         try:
+            selectors = canonical_child_selectors(
+                ChaosType.WAF_IP_SET_MODIFY,
+                {
+                    "ip_set_id": ip_set_id,
+                    "ip_set_name": ip_set_name,
+                    "scope": scope,
+                    "addresses_to_add": addresses_to_add,
+                },
+            )
+            addresses_to_add = selectors["addresses_to_add"]
+            approved = self._require_derived_scope(
+                ChaosType.WAF_IP_SET_MODIFY, {**self.config, **selectors}
+            )
+            self.ip_set_authorized_selectors = copy.deepcopy(selectors)
             response = self.wafv2.get_ip_set(
                 Scope=scope,
                 Name=ip_set_name,
@@ -6561,13 +7142,16 @@ class WAFChaosExperiment(ChaosExperiment):
                 }
                 if self.ip_set_description is not None:
                     request["Description"] = self.ip_set_description
-                self.wafv2.update_ip_set(**request)
+                with self._approved_sdk_request(
+                    "wafv2", "update_ip_set", request, selectors
+                ) as admitted:
+                    self.wafv2.update_ip_set(**admitted)
                 self.ip_set_write_confirmed = True
-                result.affected_resources = [ip_set_id]
+                result.affected_resources = sorted(approved)
                 logger.info(f"Added {len(addresses_to_add)} addresses to IP set")
             else:
                 logger.info("DRY RUN: Would modify IP set")
-                result.affected_resources = [ip_set_id]
+                result.affected_resources = sorted(approved)
 
             result.status = "completed"
 
@@ -6645,7 +7229,10 @@ class WAFChaosExperiment(ChaosExperiment):
                     "Addresses": request["Addresses"],
                     "Description": current_description,
                 }
-                self.wafv2.update_ip_set(**request)
+                with self._approved_sdk_request(
+                    "wafv2", "update_ip_set", request, self.ip_set_authorized_selectors
+                ) as admitted:
+                    self.wafv2.update_ip_set(**admitted)
                 logger.info("Removed experiment-owned IP set additions")
 
         except Exception as exc:
@@ -6777,13 +7364,28 @@ class KMSChaosExperiment(ChaosExperiment):
         )
 
         try:
+            if not self.dry_run:
+                validate_kms_key_arn(
+                    key_id, self.expected_account, self.expected_region
+                )
+                self._require_derived_scope(
+                    ChaosType.KMS_GRANT_REVOKE,
+                    {**self.config, "key_id": key_id, "grant_id": grant_id},
+                )
             grants = self.kms.list_grants(KeyId=key_id, GrantId=grant_id).get(
                 "Grants", []
             )
-            if len(grants) != 1 or str(grants[0].get("GrantId")) != grant_id:
+            if (
+                len(grants) != 1
+                or str(grants[0].get("GrantId")) != grant_id
+                or (not self.dry_run and grants[0].get("KeyId") != key_id)
+            ):
                 raise ConfigurationError("The selected KMS grant does not exist")
             if not self.dry_run:
-                self.kms.revoke_grant(KeyId=key_id, GrantId=grant_id)
+                with self._approved_sdk_request(
+                    "kms", "revoke_grant", {"KeyId": key_id, "GrantId": grant_id}
+                ) as admitted:
+                    self.kms.revoke_grant(**admitted)
                 result.affected_resources = [f"{key_id}/{grant_id}"]
                 logger.info(f"Revoked grant {grant_id} for key {key_id}")
             else:
@@ -7305,10 +7907,37 @@ class ECRChaosExperiment(ChaosExperiment):
         )
 
         try:
+            if not self.dry_run:
+                validate_digest_image_ids(image_ids)
+                self._require_derived_scope(
+                    ChaosType.ECR_IMAGE_DELETE,
+                    {
+                        **self.config,
+                        "repository_name": repository_name,
+                        "image_ids": image_ids,
+                    },
+                )
             image_details = self.ecr.describe_images(
+                registryId=self.expected_account,
                 repositoryName=repository_name,
                 imageIds=image_ids,
             ).get("imageDetails", [])
+            if not self.dry_run:
+                expected_digests = {item["imageDigest"] for item in image_ids}
+                if (
+                    not isinstance(image_details, list)
+                    or len(image_details) != len(expected_digests)
+                    or {detail.get("imageDigest") for detail in image_details}
+                    != expected_digests
+                    or any(
+                        detail.get("registryId") != self.expected_account
+                        or detail.get("repositoryName") != repository_name
+                        for detail in image_details
+                    )
+                ):
+                    raise SafetyViolation(
+                        "ECR image metadata differs from the reviewed registry, repository or digests"
+                    )
             missing_images = []
             for image_id in image_ids:
                 tag = image_id.get("imageTag")
@@ -7328,12 +7957,34 @@ class ECRChaosExperiment(ChaosExperiment):
             self.repository_name = repository_name
 
             if not self.dry_run:
-                deletion = self.ecr.batch_delete_image(
-                    repositoryName=repository_name, imageIds=image_ids
-                )
+                with self._approved_sdk_request(
+                    "ecr",
+                    "batch_delete_image",
+                    {
+                        "registryId": self.expected_account,
+                        "repositoryName": repository_name,
+                        "imageIds": image_ids,
+                    },
+                ) as admitted:
+                    deletion = self.ecr.batch_delete_image(**admitted)
                 if deletion.get("failures"):
                     raise RuntimeError(
                         "ECR reported one or more image deletion failures"
+                    )
+                deleted = deletion.get("imageIds")
+                if (
+                    not isinstance(deleted, list)
+                    or not deleted
+                    or len(deleted) > 100
+                    or any(
+                        not isinstance(item, dict)
+                        or item.get("imageDigest") not in expected_digests
+                        for item in deleted
+                    )
+                    or {item["imageDigest"] for item in deleted} != expected_digests
+                ):
+                    raise SafetyViolation(
+                        "ECR response does not prove deletion of exactly the reviewed digests"
                     )
                 result.affected_resources = [
                     f"{repository_name}/{img.get('imageTag', img.get('imageDigest'))}"
@@ -8554,6 +9205,11 @@ class ChaosOrchestrator:
             for key in selector_fields.get(config.get("type"), ())
             if key in config
         }
+        if config.get("type") in {
+            ChaosType.CLOUDFRONT_CACHE_INVALIDATE.value,
+            ChaosType.WAF_IP_SET_MODIFY.value,
+        }:
+            selector = canonical_child_selectors(ChaosType(config["type"]), config)
         if config.get("type") == ChaosType.VPC_NACL_BLOCK_TRAFFIC.value:
             selector = {
                 "rule_number": config.get("rule_number", 100),
@@ -8607,6 +9263,17 @@ class ChaosOrchestrator:
         if experiment_type == ChaosType.EBS_DETACH_VOLUME:
             derived_target_scope(experiment_type, config)
             return 2
+        if experiment_type in {
+            ChaosType.CLOUDFRONT_CACHE_INVALIDATE,
+            ChaosType.WAF_IP_SET_MODIFY,
+        }:
+            selectors = canonical_child_selectors(experiment_type, config)
+            key = (
+                "paths"
+                if experiment_type == ChaosType.CLOUDFRONT_CACHE_INVALIDATE
+                else "addresses_to_add"
+            )
+            return 1 + len(selectors[key])
         primary_keys = PRIMARY_TARGET_KEYS.get(experiment_type)
         if primary_keys is None:
             primary_keys = tuple(
@@ -8632,6 +9299,27 @@ class ChaosOrchestrator:
         if not self.live or experiment_type == ChaosType.FIS_TEMPLATE:
             return
         safety = self.config.get("safety", {})
+        validate_experiment_arns(
+            config,
+            getattr(
+                self,
+                "expected_account",
+                self.config.get("global", {}).get("account_id"),
+            ),
+            getattr(self, "region", DEFAULT_REGION),
+        )
+        if experiment_type == ChaosType.ECR_IMAGE_DELETE:
+            validate_digest_image_ids(config.get("image_ids"))
+        if experiment_type == ChaosType.KMS_GRANT_REVOKE:
+            validate_kms_key_arn(
+                config.get("key_id"),
+                getattr(
+                    self,
+                    "expected_account",
+                    self.config.get("global", {}).get("account_id"),
+                ),
+                self.region,
+            )
         break_glass = config.get("break_glass_principal_arn")
         if break_glass and str(break_glass) != str(self.operator_principal_arn):
             raise SafetyViolation(
@@ -10046,6 +10734,13 @@ def validate_config_data(config: dict[str, Any]) -> None:
             if type_name not in valid_type_names:
                 raise ConfigurationError(f"{location}.type is invalid: {type_name!r}")
             experiment_type = ChaosType(type_name)
+            try:
+                validate_experiment_arns(experiment, account_id, region)
+            except SafetyViolation as exc:
+                raise ConfigurationError(
+                    f"{experiment_type.value.split('_', 1)[0].upper()} target: {exc}"
+                ) from None
+            canonical_child_selectors(experiment_type, experiment)
             derived_target_scope(experiment_type, experiment)
             metadata = experiment_metadata(experiment_type)
             if (
@@ -10395,6 +11090,14 @@ def confirmation_token(
         ChaosType(item["type"]) for item in suites[suite_name]["experiments"]
     ]
     for item in suites[suite_name]["experiments"]:
+        if item["type"] == ChaosType.ECR_IMAGE_DELETE.value:
+            validate_digest_image_ids(item.get("image_ids"))
+        if item["type"] == ChaosType.KMS_GRANT_REVOKE.value:
+            validate_kms_key_arn(
+                item.get("key_id"),
+                config["global"].get("account_id"),
+                config["global"].get("region", DEFAULT_REGION),
+            )
         if item["type"] == ChaosType.SQS_QUEUE_PURGE.value:
             values = {**config["global"], **item}
             validate_queue_identity(

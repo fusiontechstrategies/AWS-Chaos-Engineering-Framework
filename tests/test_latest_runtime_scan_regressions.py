@@ -32,13 +32,13 @@ def writes(aws):
     ]
 
 
-def termination(aws, expected=None):
+def termination(aws, expected=None, *, dry_run=False):
     config = {
-        "dry_run": False,
+        "dry_run": dry_run,
         "instance_ids": [INSTANCE_ID],
         "delete_on_termination_volumes": expected or {INSTANCE_ID: [VOLUME_ID]},
     }
-    safety = FakeSafetyController(aws, live=True)
+    safety = FakeSafetyController(aws, live=not dry_run)
     safety.config["target_allowlist"] = [INSTANCE_ID, VOLUME_ID]
     safety.config["max_blast_radius"] = 2
     return framework.EC2ChaosExperiment(config, safety)
@@ -67,7 +67,7 @@ def termination_response(aws):
 def test_termination_refuses_unapproved_or_incomplete_derived_scope(attack):
     aws = FakeAWS(reject_writes=False)
     response = termination_response(aws)
-    item = termination(aws)
+    item = termination(aws, dry_run=attack not in {"child_allowlist", "radius"})
     instance = response["Reservations"][0]["Instances"][0]
     if attack == "child_allowlist":
         item.safety_controller.config["target_allowlist"] = [INSTANCE_ID]
@@ -94,23 +94,21 @@ def test_termination_refuses_unapproved_or_incomplete_derived_scope(attack):
     assert not item.mutation_attempts
 
 
-def test_termination_binds_deleted_volumes_in_evidence_and_approval():
+def test_termination_plan_binds_deleted_volumes_in_evidence():
     aws = FakeAWS(reject_writes=False)
     response = termination_response(aws)
     aws.read_overrides[("ec2", "describe_instances")] = [
         copy.deepcopy(response),
         response,
     ]
-    item = termination(aws)
+    item = termination(aws, dry_run=True)
     result = item.terminate_instances([INSTANCE_ID])
     assert result.status == "completed"
     assert set(result.affected_resources) == {INSTANCE_ID, VOLUME_ID}
     assert result.additional_info["delete_on_termination_volumes"] == {
         INSTANCE_ID: [VOLUME_ID]
     }
-    assert writes(aws) == [
-        ("ec2", "terminate_instances", {"InstanceIds": [INSTANCE_ID]})
-    ]
+    assert writes(aws) == []
 
 
 def test_termination_rechecks_relationship_after_other_baseline_reads():
@@ -204,20 +202,26 @@ def test_detach_write_contains_exact_reviewed_attachment_tuple():
 @pytest.mark.parametrize(
     "kind", [framework.ChaosType.EC2_TERMINATE, framework.ChaosType.EBS_DETACH_VOLUME]
 )
-def test_live_token_requires_child_approval_and_binds_relationship(kind):
+def test_child_relationship_scope_and_live_token_restrictions(kind):
     config = framework.yaml.safe_load(framework.SAMPLE_CONFIG)
     config["global"]["account_id"] = ACCOUNT_ID
     suite = next(iter(config["experiment_suites"]))
     action = {"type": kind.value, **action_configs()[kind]}
     config["experiment_suites"][suite]["experiments"] = [action]
-    original = framework.confirmation_token(config, suite)
     if kind == framework.ChaosType.EC2_TERMINATE:
+        original_scope = framework.ChaosOrchestrator._target_values(action)
+        with pytest.raises(framework.ConfigurationError):
+            framework.confirmation_token(config, suite)
         action["delete_on_termination_volumes"][INSTANCE_ID] = [VOLUME_ID]
+        assert framework.ChaosOrchestrator._target_values(action) != original_scope
+        with pytest.raises(framework.ConfigurationError):
+            framework.confirmation_token(config, suite)
         field = "delete_on_termination_volumes"
     else:
+        original = framework.confirmation_token(config, suite)
         action["attachment"]["device"] = "/dev/xvdz"
         field = "attachment"
-    assert original != framework.confirmation_token(config, suite)
+        assert original != framework.confirmation_token(config, suite)
     del action[field]
     with pytest.raises(framework.ConfigurationError):
         framework.confirmation_token(config, suite)

@@ -1,12 +1,12 @@
 # Runtime approval and recovery boundaries
 
-## Explicit EC2 and EBS relationships
+## Explicit EC2 plans and EBS relationships
 
-Before generating a live token, review read-only AWS inventory and record the
-complete relationship in the configuration. The token includes these fields;
-changing any relationship changes the token. Token generation remains offline.
-The framework resolves the relationships again immediately before a mutation and
-refuses missing, duplicate, unexpected, or changed resources.
+Review read-only AWS inventory and record the complete relationship in the
+configuration. EBS live approval binds the attachment fields and resolves them
+again before a conditional detach request. EC2 termination retains read-only
+planning but cannot produce a live token. Missing, duplicate, unexpected, or
+changed resources are refused in the corresponding inventory checks.
 
 For EC2 termination, list every selected instance as a key in
 `delete_on_termination_volumes`, including an empty list when no attached EBS
@@ -21,8 +21,8 @@ delete_on_termination_volumes:
 
 Both the instance and every listed volume must appear in
 `safety.target_allowlist`. `max_blast_radius` counts their combined unique IDs;
-the example requires at least two. Both irreversible approval gates still apply.
-Result evidence includes the observed deletion map and all materially affected
+the example accounts for two. These fields provide planning evidence and never
+authorize live termination. Plan evidence includes the observed deletion map and all materially affected
 IDs. The framework creates no implicit backup or snapshot. AWS permanently
 deletes attached EBS volumes whose deletion flag is true; instance-store data
 also disappears. See the [AWS termination API](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_TerminateInstances.html).
@@ -43,9 +43,13 @@ Root volumes, multiple attachments, and changed attachment state are refused.
 The final AWS request includes `VolumeId`, `InstanceId`, and `Device`, which binds
 the write to the approved attachment. See the [AWS detach API](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DetachVolume.html).
 
-The termination API has no child-resource revision condition. Maintain an
-exclusive change window for EC2 attachment/deletion flags through termination;
-the final read does not provide a distributed lock against another AWS writer.
+The termination API has no child-resource revision condition. A final read or a
+local process lock cannot prevent another AWS principal from attaching a volume
+or changing its deletion flag before termination. Live confirmation, handler and
+SDK dispatch are therefore disabled, including direct and recovery calls. No
+configuration assertion grants an exception. Re-enabling live termination needs
+an independently enforceable AWS-side boundary that prevents those concurrent
+changes, or conditional termination support from AWS.
 
 ## Continuous forward safety checks
 
@@ -87,6 +91,7 @@ recovery sets the process-wide live-execution latch and blocks later live work.
 The following types support dry-run planning and advertise `live_supported: false`:
 
 - `vpc_nacl_block_traffic`
+- `ec2_terminate` (immutable child authorization cannot be proven)
 - `sqs_queue_policy_restrict`, `sqs_message_delay`, `sqs_visibility_timeout`
 - `kms_key_disable`, `kms_key_policy_restrict`
 - `iam_policy_detach`, `iam_role_modify`, `iam_user_access_key_deactivate`
@@ -118,6 +123,7 @@ coordinates. Source lines, arbitrary parser problem text, and source buffers are
 never emitted, including malformed password, token, external-ID, or secret-key
 lines.
 
-All remediation regressions use deterministic fake AWS clients and temporary
-local inputs. They establish local control-flow and request-shape behavior;
+Remediation regressions use deterministic fake AWS clients, actual offline
+botocore operation models with Stubber, and temporary local inputs. They
+establish local control-flow, SDK validation and request-shape behavior;
 they do not establish outcomes from a live AWS experiment.

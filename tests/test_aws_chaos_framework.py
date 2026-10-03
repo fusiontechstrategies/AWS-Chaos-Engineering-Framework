@@ -82,6 +82,10 @@ class FakeAWS:
         )
 
         responses: dict[tuple[str, str], Any] = {
+            ("ecr", "batch_delete_image"): {
+                "failures": [],
+                "imageIds": [{"imageDigest": "sha256:" + "1" * 64}],
+            },
             ("ec2", "describe_security_groups"): {
                 "SecurityGroups": [
                     {
@@ -474,6 +478,7 @@ class FakeAWS:
                 "Grants": [
                     {
                         "GrantId": "0123456789abcdef0123456789abcdef",
+                        "KeyId": f"arn:aws-us-gov:kms:{REGION}:{ACCOUNT_ID}:key/01234567-89ab-cdef-0123-456789abcdef",
                         "GranteePrincipal": BREAK_GLASS_ARN,
                         "Operations": ["Decrypt"],
                     }
@@ -532,6 +537,8 @@ class FakeAWS:
                 "imageDetails": [
                     {
                         "imageDigest": "sha256:" + "1" * 64,
+                        "registryId": ACCOUNT_ID,
+                        "repositoryName": "chaos-test-repository",
                         "imageTags": ["chaos-test"],
                     }
                 ]
@@ -586,6 +593,9 @@ class FakeClient:
     def __init__(self, aws: FakeAWS, service: str):
         self.aws = aws
         self.service = service
+        self.meta = SimpleNamespace(
+            region_name="aws-us-gov-global" if service == "iam" else REGION
+        )
         self.exceptions = SimpleNamespace(
             ClientError=FakeClientError,
             NoSuchBucketPolicy=FakeClientError,
@@ -857,7 +867,7 @@ def action_configs() -> dict[framework.ChaosType, dict[str, Any]]:
             "break_glass_principal_arn": BREAK_GLASS_ARN,
         },
         framework.ChaosType.KMS_GRANT_REVOKE: {
-            "key_id": "alias/chaos-test",
+            "key_id": f"arn:aws-us-gov:kms:{REGION}:{ACCOUNT_ID}:key/01234567-89ab-cdef-0123-456789abcdef",
             "grant_id": "0123456789abcdef0123456789abcdef",
         },
         framework.ChaosType.IAM_POLICY_DETACH: {
@@ -922,6 +932,10 @@ def make_experiment(
     if experiment_type in {
         framework.ChaosType.EC2_TERMINATE,
         framework.ChaosType.EBS_DETACH_VOLUME,
+        framework.ChaosType.CLOUDFRONT_CACHE_INVALIDATE,
+        framework.ChaosType.WAF_IP_SET_MODIFY,
+        framework.ChaosType.ECR_IMAGE_DELETE,
+        framework.ChaosType.KMS_GRANT_REVOKE,
     }:
         orchestrator.safety_controller.config["target_allowlist"] = sorted(
             framework.ChaosOrchestrator._target_values(

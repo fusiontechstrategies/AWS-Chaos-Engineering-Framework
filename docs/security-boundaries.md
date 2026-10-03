@@ -1,9 +1,71 @@
 # Live experiment security boundaries
 
 Live execution requires exact authorization for both parent resources and child
-selectors. WAF rule names, shard IDs, repository image digests/tags, route
+selectors. WAF rule names, shard IDs, repository image digests, route
 destinations, and S3 prefixes must appear in `safety.target_allowlist` alongside
 their parent resources. Unknown nested selectors fail closed.
+
+ARN-valued targets must match the reviewed AWS partition, service, account and
+region before offline approval and live dispatch. IAM and CloudFront use explicit
+global-region exceptions; AWS-managed IAM policy ARNs are allowed only in policy
+fields. S3 bucket ARNs omit region and account and retain the independent
+ExpectedBucketOwner check. Direct SDK mutations and recovery enforce the same
+identity boundary; a matching literal allowlist entry cannot approve a foreign
+ARN. Cross-account target resources are unsupported.
+
+The mutation proxy checks the actual SDK client's region metadata as well as
+literal ARNs. IAM uses its partition-specific global endpoint; CloudFront uses
+the commercial global endpoint. A global ARN exception does not establish
+service availability in GovCloud. AWS documents that [CloudFront operates in
+the commercial partition](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/setting-up-cloudfront.html).
+WAF `CLOUDFRONT` scope requires a separately reviewed `us-east-1` configuration.
+Nested request inspection refuses cycles, repeated containers, depths above 16
+and traversals above 20,000 nodes before recording a mutation attempt. Request
+string values and serialized protected requests each have a 1 MiB aggregate
+budget. Reviewed cross-service references are classified by operation and exact
+SDK field path. ELB Cognito authentication references must match the same owner,
+partition and region before a fault is introduced or recovery is attempted.
+Lambda environment variable values are application strings, not target ARNs;
+the function identity and execution-role ARN still require identity admission.
+SNS Firehose subscriptions admit the IAM role only in the documented
+`Attributes.SubscriptionRoleArn` field for that protocol. The role and endpoint
+must match the reviewed owner and partition. The role's final name and optional
+path must also satisfy the [IAM role name and path constraints](https://docs.aws.amazon.com/IAM/latest/APIReference/API_CreateRole.html),
+including their separate 64-character and 512-character limits. Before deleting a subscription, its
+saved topic, protocol, endpoint and mandatory Firehose role are checked against
+the same admission rules and copied for attempted recreation. Deletion remains
+an irreversible operation: recreation does not prove restoration of the original
+subscription ARN, delivery history or every subscription attribute. See the
+[SNS subscription API](https://docs.aws.amazon.com/sns/latest/api/API_Subscribe.html).
+
+KMS grant revocation, ECR digest deletion, CloudFront invalidation and WAF IP-set
+updates require a one-use dispatch context created by their public experiment
+handlers. It binds a detached canonical request to the exact reviewed targets
+and selectors before the proxy records or sends it. Raw calls to those four SDK
+operations are refused, even with an allowlisted parent or during recovery.
+WAF recovery can remove only confirmed owned additions and preserves unrelated
+current addresses. These internal controls protect the supported APIs; they are
+not a Python sandbox against code that changes private framework objects.
+
+Live KMS grant revocation requires the complete immutable key ARN in both the
+configuration and exact allowlist, together with the grant ID. Bare key IDs and
+aliases are planning only. The grant lookup must return exactly that key ARN and
+grant ID. This follows the [KMS key identity contract](https://docs.aws.amazon.com/kms/latest/APIReference/API_RevokeGrant.html)
+without resolving a movable alias before deletion.
+
+Live ECR image deletion requires unique explicit `imageDigest` values in the
+reviewed configuration and target allowlist. Tag selectors remain planning only.
+No live handler resolves a tag and then deletes its current occupant. Digest
+deletion removes the image and all its tags, so operators must review that
+distinct operation deliberately. The SDK proxy binds the registry account and
+rejects tags even for direct library calls.
+Both the describe and delete requests specify the reviewed registry account.
+Describe responses must identify exactly the approved repository, registry and
+digests. Delete responses must prove exactly the approved digest set with no
+reported failures. A digest can have several returned tag entries, as the
+[ECR API example](https://docs.aws.amazon.com/AmazonECR/latest/APIReference/API_BatchDeleteImage.html)
+shows. Missing or foreign response evidence is a failed result even if AWS may
+already have performed the irreversible deletion; mutation records are retained.
 
 Throttle experiments only reduce existing capacity. EFS throughput changes require
 an existing provisioned mode and a smaller positive provisioned throughput. Lambda
@@ -61,10 +123,18 @@ limits. Editing any of these invalidates the token. Runtime-only approval flags
 are excluded because they are supplied by the CLI independently.
 
 SG rules, NACL rule/protocol/CIDR/direction, RDS parameter arrays, Lambda environment
-changes and ELB descriptors are approved using canonical selector digests in
+changes, ELB descriptors, CloudFront invalidation paths and WAF IP-set scope/CIDRs
+are approved using canonical selector digests in
 `safety.target_allowlist`. Print them offline with
 `python aws_chaos_framework.py --config example-config.yaml --suite <suite> --show-target-selectors`.
 Include each `selector:<type>:<sha256>` value alongside the parent resources.
+CloudFront literal paths are sorted and deduplicated without decoding or changing
+their characters. WAF CIDRs use canonical network notation, sorted without
+duplicates. Parent identity and WAF scope are included in their digests. Both
+actions count one parent plus every unique child path or CIDR toward blast radius,
+require these approvals for direct class calls, and include the approved digest
+in affected-resource evidence. An omitted CloudFront path list approves `/*`;
+an explicitly empty list is refused.
 For live ELB removal, provide `target_descriptors` with exact Id, Port and returned
 AvailabilityZone. An ID alone cannot distinguish multiple registrations.
 S3 object deletion requires a non-empty reviewed prefix; whole-bucket deletion is
