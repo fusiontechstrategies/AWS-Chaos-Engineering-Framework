@@ -132,8 +132,8 @@ def test_ec2_termination_creates_no_implicit_volume_copies():
     assert item.terminate_instances(**config).status == "completed"
     writes = [
         (operation, request)
-        for _, operation, request in aws.calls
-        if not operation.startswith(framework.READ_ONLY_OPERATION_PREFIXES)
+        for service, operation, request in aws.calls
+        if operation not in framework.READ_ONLY_OPERATIONS.get(service, ())
     ]
     assert writes == [("terminate_instances", {"InstanceIds": config["instance_ids"]})]
 

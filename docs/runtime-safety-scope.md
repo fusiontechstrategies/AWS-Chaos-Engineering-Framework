@@ -73,6 +73,10 @@ claim the recovery exception or bypass the process stop through an ownerless
 write.
 S3 proxy calls are limited to the twelve direct owner-bound operations used by
 the supported experiments; raw SDK delegates and unreviewed S3 methods refuse.
+Other SDK reads also use exact reviewed per-service operation names. Effectful
+`test_*` calls and unreviewed `get_*` calls do not bypass mutation checks. Raw SDK
+waiter/presign delegates and non-EC2 paginators are disabled; EC2 pagination is
+restricted to the seven reviewed VPC inventory operations.
 
 EC2 recovery requires the exact selected instance set on every read. Empty,
 partial, duplicated, or extra responses cannot establish recovery. An unverified

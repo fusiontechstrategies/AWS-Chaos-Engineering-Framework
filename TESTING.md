@@ -16,6 +16,11 @@ request shapes and 403 refusal without network calls. Deterministic threaded and
 same-thread signal simulations exercise stop admission, latch activation,
 in-flight completion and continued recovery. Redaction cases include complete
 registered account-prefixed targets and longer unregistered ARN controls.
+Actual SDK Stubber controls also cover effectful StepFunctions TestState,
+ElastiCache TestFailover, CodeCommit TestRepositoryTriggers and STS
+GetSessionToken before/after stop, without an owner, in plan/recovery mode, and
+with tracked live admission. Reviewed safety/identity reads remain available
+after stop; only reviewed EC2 inventory paginator operations can return delegates.
 
 ## 2.0.3 release-readiness gate
 

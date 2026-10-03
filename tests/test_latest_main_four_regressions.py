@@ -2,6 +2,7 @@
 
 import copy
 import io
+import json
 import shutil
 import subprocess
 import sys
@@ -74,7 +75,12 @@ def test_ownerless_controller_safety_identity_reads_remain_usable_after_stop():
     assert controller.client("cloudwatch").describe_alarms()["MetricAlarms"]
     assert controller.client("guardduty").list_detectors()["DetectorIds"]
     assert controller.client("securityhub").get_findings()["Findings"] == []
-    assert all(call[1].startswith(f.READ_ONLY_OPERATION_PREFIXES) for call in aws.calls)
+    assert [(service, name) for service, name, _ in aws.calls] == [
+        ("sts", "get_caller_identity"),
+        ("cloudwatch", "describe_alarms"),
+        ("guardduty", "list_detectors"),
+        ("securityhub", "get_findings"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -151,6 +157,209 @@ def test_ec2_readonly_approval_inventory_paginator_remains_supported():
         assert list(
             controller.client("ec2").get_paginator("describe_instances").paginate()
         ) == [{"Reservations": []}]
+        stub.assert_no_pending_responses()
+
+
+# These requests are serviced by Botocore's actual operation/model machinery in
+# the positive controls, and by no AWS endpoint in any case.
+EFFECTFUL_READLIKE_CASES = [
+    (
+        "stepfunctions",
+        "test_state",
+        {
+            "definition": json.dumps(
+                {
+                    "Type": "Task",
+                    "Resource": "arn:aws-us-gov:states:::lambda:invoke",
+                    "Parameters": {
+                        "FunctionName": "arn:aws-us-gov:lambda:"
+                        + REGION
+                        + ":"
+                        + ACCOUNT_ID
+                        + ":function:offline"
+                    },
+                    "End": True,
+                }
+            ),
+            "roleArn": "arn:aws-us-gov:iam::" + ACCOUNT_ID + ":role/offline",
+        },
+        {"status": "SUCCEEDED", "output": "{}"},
+    ),
+    (
+        "elasticache",
+        "test_failover",
+        {"ReplicationGroupId": "offline", "NodeGroupId": "0001"},
+        {},
+    ),
+    (
+        "codecommit",
+        "test_repository_triggers",
+        {
+            "repositoryName": "offline",
+            "triggers": [
+                {
+                    "name": "offline",
+                    "destinationArn": "arn:aws-us-gov:sns:"
+                    + REGION
+                    + ":"
+                    + ACCOUNT_ID
+                    + ":offline",
+                    "events": ["all"],
+                }
+            ],
+        },
+        {"successfulExecutions": ["offline"], "failedExecutions": []},
+    ),
+    ("sts", "get_session_token", {}, {}),
+]
+
+
+def stub_controller(service):
+    raw = boto3.client(
+        service,
+        region_name=REGION,
+        aws_access_key_id="offline",
+        aws_secret_access_key="offline",
+    )
+    controller = f.SafetyController(
+        {},
+        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        REGION,
+        True,
+        expected_account=ACCOUNT_ID,
+    )
+    controller.check_safety_conditions = lambda: (True, [])
+    return controller, raw
+
+
+@pytest.mark.parametrize(
+    "service,operation,call_request,response", EFFECTFUL_READLIKE_CASES
+)
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "ownerless",
+        "ownerless_stopped",
+        "plan",
+        "plan_recovery",
+        "plan_stopped",
+        "live_stopped",
+    ],
+)
+def test_effectful_readlike_sdk_calls_do_not_bypass_admission(
+    service, operation, call_request, response, mode
+):
+    controller, raw = stub_controller(service)
+    owner = (
+        None
+        if mode.startswith("ownerless")
+        else f.ChaosExperiment({"dry_run": mode.startswith("plan")}, controller)
+    )
+    if mode == "plan_recovery":
+        owner._in_rollback = True
+    if mode.endswith("stopped"):
+        controller.emergency_stop_all()
+        assert controller.emergency_stop.is_set()
+    error = f.EmergencyStop if mode == "live_stopped" else f.SafetyViolation
+    # No stub response exists; leaking dispatch would raise Botocore's
+    # UnStubbedResponseError instead of the requested refusal.
+    with Stubber(raw), pytest.raises(error):
+        getattr(controller.client(service, owner), operation)(**call_request)
+    if owner is not None:
+        assert not owner.mutation_attempts
+        assert not owner.mutation_operations
+
+
+@pytest.mark.parametrize(
+    "service,operation,call_request,response", EFFECTFUL_READLIKE_CASES
+)
+def test_effectful_readlike_actual_sdk_dispatch_is_tracked_when_admitted(
+    service, operation, call_request, response
+):
+    controller, raw = stub_controller(service)
+    owner = f.ChaosExperiment({"dry_run": False}, controller)
+    with Stubber(raw) as stub:
+        stub.add_response(operation, response, call_request)
+        assert (
+            getattr(controller.client(service, owner), operation)(**call_request)
+            == response
+        )
+        stub.assert_no_pending_responses()
+    assert owner.mutation_attempts == [service + "." + operation]
+    assert owner.mutation_operations == [service + "." + operation]
+
+
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize(
+    "service,operation,arguments",
+    [
+        ("ec2", "get_paginator", ["describe_regions"]),
+        ("ec2", "get_paginator", ["reboot_instances"]),
+        ("ec2", "get_waiter", ["instance_running"]),
+        ("ec2", "generate_presigned_url", ["describe_instances"]),
+        ("efs", "get_paginator", ["describe_file_systems"]),
+    ],
+)
+def test_non_s3_delegates_cannot_return_an_unreviewed_raw_operation(
+    owned, service, operation, arguments
+):
+    controller, raw = stub_controller(service)
+    owner = f.ChaosExperiment({"dry_run": False}, controller) if owned else None
+    with Stubber(raw), pytest.raises(f.SafetyViolation):
+        getattr(controller.client(service, owner), operation)(*arguments)
+
+
+@pytest.mark.parametrize(
+    "call_request",
+    [
+        ([], {}),
+        (["describe_instances", "extra"], {}),
+        ([], {"operation_name": "describe_instances", "extra": True}),
+        ([[]], {}),
+    ],
+)
+def test_reviewed_ec2_paginator_rejects_ambiguous_request_shape(call_request):
+    controller, raw = stub_controller("ec2")
+    args, kwargs = call_request
+    with Stubber(raw), pytest.raises(f.SafetyViolation):
+        controller.client("ec2").get_paginator(*args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "service,operation,call_request,response",
+    [
+        (
+            "sts",
+            "get_caller_identity",
+            {},
+            {
+                "Account": ACCOUNT_ID,
+                "Arn": "arn:aws-us-gov:iam::" + ACCOUNT_ID + ":user/offline",
+                "UserId": "offline",
+            },
+        ),
+        ("cloudwatch", "describe_alarms", {}, {"MetricAlarms": []}),
+        ("guardduty", "list_findings", {"DetectorId": "offline"}, {"FindingIds": []}),
+        ("securityhub", "get_findings", {}, {"Findings": []}),
+        (
+            "codecommit",
+            "get_repository_triggers",
+            {"repositoryName": "offline"},
+            {"configurationId": "offline", "triggers": []},
+        ),
+    ],
+)
+def test_actual_reviewed_safety_identity_and_baseline_reads_work_after_stop(
+    service, operation, call_request, response
+):
+    controller, raw = stub_controller(service)
+    controller.emergency_stop_all()
+    assert controller.emergency_stop.is_set()
+    with Stubber(raw) as stub:
+        stub.add_response(operation, response, call_request)
+        assert (
+            getattr(controller.client(service), operation)(**call_request) == response
+        )
         stub.assert_no_pending_responses()
 
 

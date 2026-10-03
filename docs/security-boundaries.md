@@ -85,7 +85,12 @@ including calls marked as recovery. Planning never grants write authority.
 The S3 proxy accepts only the twelve direct bucket operations used by the
 supported experiments. Raw SDK paginators, waiters, presigned URL/post helpers
 and other bucket methods are refused because they can retain an unwrapped SDK
-client or omit the approved owner. EC2's read-only approval-inventory paginator
+client or omit the approved owner. SDK reads are classified by an exact reviewed
+per-service operation list, not `get_`, `test_` or other name prefixes. Effectful
+TestState, TestFailover and TestRepositoryTriggers calls and credential-issuing
+GetSessionToken calls receive normal owner, plan, stop and tracking checks. Raw
+non-S3 waiter/presign helpers and non-EC2 paginators are disabled. EC2 paginator
+requests accept only the seven reviewed VPC inventory operations. EC2's read-only approval-inventory paginator
 remains supported.
 
 ## Concurrent changes and recovery evidence

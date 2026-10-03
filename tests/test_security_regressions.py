@@ -463,8 +463,8 @@ def test_extension_recovery_requires_original_post_state(action):
             orchestrator._execute_experiment(item, kind, values)
         assert not item.mutation_attempts
         assert all(
-            operation.startswith(framework.READ_ONLY_OPERATION_PREFIXES)
-            for _, operation, _ in aws.calls
+            operation in framework.READ_ONLY_OPERATIONS.get(service, ())
+            for service, operation, _ in aws.calls
         )
         return
     result = orchestrator._execute_experiment(item, kind, values)
@@ -476,7 +476,7 @@ def test_extension_recovery_requires_original_post_state(action):
     respond = aws.respond
 
     def missing_state(service, operation, request):
-        if operation.startswith(framework.READ_ONLY_OPERATION_PREFIXES):
+        if operation in framework.READ_ONLY_OPERATIONS.get(service, ()):
             return {}
         return respond(service, operation, request)
 

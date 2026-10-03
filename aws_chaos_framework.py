@@ -53,18 +53,94 @@ TOOL_NAME = "AWS Chaos Engineering Framework"
 MAX_CONFIG_BYTES = 1_048_576
 DEFAULT_REGION = "us-gov-west-1"
 GOVCLOUD_REGIONS = frozenset({"us-gov-west-1", "us-gov-east-1"})
-READ_ONLY_OPERATION_PREFIXES = (
-    "batch_get_",
-    "can_paginate",
-    "describe_",
-    "generate_presigned_",
-    "get_",
-    "head_",
-    "list_",
-    "lookup_",
-    "search_",
-    "test_",
-    "validate_",
+# SDK names are not an effect classification: TestState/TestFailover and even
+# credential-issuing Get* APIs have side effects. Only these reviewed reads bypass
+# ownership, plan-mode and forward-mutation dispatch checks.
+READ_ONLY_OPERATIONS = {
+    "appstream": frozenset({"describe_fleets", "list_associated_fleets"}),
+    "cloudfront": frozenset({"get_distribution_config"}),
+    "cloudwatch": frozenset({"describe_alarms"}),
+    "codecommit": frozenset({"get_repository_triggers"}),
+    "ds": frozenset({"describe_conditional_forwarders", "describe_trusts"}),
+    "ec2": frozenset(
+        {
+            "describe_instances",
+            "describe_network_acls",
+            "describe_route_tables",
+            "describe_security_groups",
+            "describe_subnets",
+            "describe_volumes",
+            "describe_vpc_endpoints",
+            "describe_vpc_peering_connections",
+            "describe_vpcs",
+        }
+    ),
+    "ecr": frozenset({"describe_images", "get_repository_policy"}),
+    "ecs": frozenset(
+        {
+            "describe_container_instances",
+            "describe_services",
+            "describe_task_definition",
+            "describe_tasks",
+        }
+    ),
+    "efs": frozenset({"describe_file_systems", "describe_mount_targets"}),
+    "elbv2": frozenset(
+        {
+            "describe_rules",
+            "describe_target_group_attributes",
+            "describe_target_groups",
+            "describe_target_health",
+        }
+    ),
+    "fis": frozenset({"get_experiment", "get_experiment_template"}),
+    "guardduty": frozenset({"list_detectors", "list_findings"}),
+    "iam": frozenset({"get_role", "list_access_keys", "list_attached_role_policies"}),
+    "kinesis": frozenset({"describe_stream", "describe_stream_summary"}),
+    "kms": frozenset({"describe_key", "get_key_policy", "list_grants"}),
+    "lambda": frozenset({"get_function_concurrency", "get_function_configuration"}),
+    "opensearch": frozenset({"describe_domain"}),
+    "rds": frozenset(
+        {
+            "describe_db_clusters",
+            "describe_db_instances",
+            "describe_db_parameters",
+        }
+    ),
+    "s3": frozenset(
+        {
+            "get_bucket_encryption",
+            "get_bucket_lifecycle_configuration",
+            "get_bucket_policy",
+            "get_bucket_versioning",
+            "list_objects_v2",
+        }
+    ),
+    "securityhub": frozenset({"get_findings"}),
+    "ses": frozenset({"describe_configuration_set"}),
+    "sns": frozenset({"get_subscription_attributes", "get_topic_attributes"}),
+    "sqs": frozenset({"get_queue_attributes"}),
+    "sts": frozenset({"get_caller_identity"}),
+    "wafv2": frozenset({"get_ip_set", "get_web_acl"}),
+}
+EC2_INVENTORY_PAGINATOR_OPERATIONS = frozenset(
+    {
+        "describe_instances",
+        "describe_network_acls",
+        "describe_route_tables",
+        "describe_security_groups",
+        "describe_subnets",
+        "describe_vpc_endpoints",
+        "describe_vpc_peering_connections",
+    }
+)
+SDK_DELEGATE_OPERATIONS = frozenset(
+    {
+        "get_paginator",
+        "get_waiter",
+        "generate_presigned_url",
+        "generate_presigned_post",
+    }
 )
 SECRET_KEY_PATTERN = re.compile(
     r"(?:secret|password|token|credential|private|access[_-]?key|session[_-]?key)",
@@ -998,7 +1074,28 @@ class AwsClientProxy:
             raise SafetyViolation(
                 "S3 proxy permits only reviewed owner-bound bucket operations"
             )
-        read_only = name.startswith(READ_ONLY_OPERATION_PREFIXES)
+        if callable(attribute) and name in SDK_DELEGATE_OPERATIONS:
+            if self._service != "ec2" or name != "get_paginator":
+                raise SafetyViolation("Unreviewed raw SDK delegates are disabled")
+
+            def reviewed_paginator(*args: Any, **kwargs: Any) -> Any:
+                if len(args) == 1 and not kwargs:
+                    operation = args[0]
+                elif not args and set(kwargs) == {"operation_name"}:
+                    operation = kwargs["operation_name"]
+                else:
+                    raise SafetyViolation(
+                        "EC2 paginator requires one reviewed operation"
+                    )
+                if (
+                    not isinstance(operation, str)
+                    or operation not in EC2_INVENTORY_PAGINATOR_OPERATIONS
+                ):
+                    raise SafetyViolation("EC2 paginator operation is not reviewed")
+                return attribute(operation)
+
+            return reviewed_paginator
+        read_only = name in READ_ONLY_OPERATIONS.get(self._service, ())
         bind_s3_owner = self._service == "s3" and name in S3_OWNER_BOUND_OPERATIONS
         if not callable(attribute) or (read_only and not bind_s3_owner):
             return attribute
