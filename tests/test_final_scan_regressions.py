@@ -129,13 +129,19 @@ def test_ec2_termination_creates_no_implicit_volume_copies():
     item._get_instance_volumes = lambda *_: (_ for _ in ()).throw(
         AssertionError("Implicit volume expansion")
     )
-    assert item.terminate_instances(**config).status == "completed"
+    assert item.terminate_instances(**config).status == "failed"
     writes = [
         (operation, request)
         for service, operation, request in aws.calls
         if operation not in framework.READ_ONLY_OPERATIONS.get(service, ())
     ]
-    assert writes == [("terminate_instances", {"InstanceIds": config["instance_ids"]})]
+    assert writes == []
+    plan = make_experiment(framework.ChaosType.EC2_TERMINATE, config, aws, dry_run=True)
+    assert plan.terminate_instances(**config).status == "completed"
+    assert not any(
+        operation in {"terminate_instances", "create_snapshot"}
+        for _, operation, _ in aws.calls
+    )
 
 
 def test_staggered_same_volume_workers_restore_the_authoritative_pre_state():

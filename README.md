@@ -154,7 +154,7 @@ python .\aws_chaos_framework.py --list-experiments
 
 The catalog intentionally includes some gated entries. An action is not live-supported when it cannot provide a real fault, bounded targeting, or an honest recovery contract. Host-level EC2 faults remain represented through read-only `fis_template` planning until an immutable start boundary is available.
 
-EC2 termination approval includes every volume marked for deletion, and EBS detach approval includes the exact instance/device attachment. Eleven temporary network, queue, key, credential, policy, and trigger operations retain dry-run planning while live execution is refused because AWS provides no conditional ownership proof for safe concurrent recovery. See [runtime approval and recovery boundaries](docs/runtime-safety-scope.md) for required fields, affected-resource counting, safety polling, and the complete restriction list.
+EC2 termination is planning only: AWS cannot bind a termination request to the reviewed block-device relationships. The plan still identifies every volume marked for deletion. EBS detach approval includes the exact instance/device attachment. Eleven temporary network, queue, key, credential, policy, and trigger operations also retain planning while live execution is refused because AWS provides no conditional ownership proof for safe concurrent recovery. See [runtime approval and recovery boundaries](docs/runtime-safety-scope.md) for required fields, affected-resource counting, safety polling, and the complete restriction list.
 
 ## Evidence and privacy
 
