@@ -349,7 +349,7 @@ def test_draft_body_mismatch_cleans_only_the_returned_immutable_id(
     notes = tmp_path / "notes.md"
     notes.write_text("Ordinary body")
     calls = []
-    monkeypatch.setattr(draft, "load_integrity", lambda: MagicMock())
+    monkeypatch.setattr(draft, "load_integrity", MagicMock)
 
     def remote(arguments):
         calls.append(arguments)
