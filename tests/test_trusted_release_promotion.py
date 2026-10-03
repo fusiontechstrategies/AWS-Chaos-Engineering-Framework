@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -378,18 +379,20 @@ class TrustedPromotionTests(unittest.TestCase):
                 )
             remote.assert_not_called()
 
-    def test_symlinked_notes_ancestor_is_rejected_before_creation(self):
+    def test_synthetic_notes_ancestor_metadata_is_rejected_before_creation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            target = root / "target"
-            target.mkdir()
-            (target / "notes.md").write_text("Reviewed notes", encoding="utf-8")
-            link = root / "link"
-            try:
-                link.symlink_to(target, target_is_directory=True)
-            except OSError as error:
-                self.skipTest(f"Host cannot create test directory symlink: {error}")
+            link = root / "synthetic-link"
+            original_lstat = Path.lstat
+
+            def metadata(path):
+                if path == link:
+                    return os.stat_result((stat.S_IFLNK, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+                return original_lstat(path)
+
+            # Narrowed validation uses metadata only, not a physical link or race.
             with (
+                patch.object(Path, "lstat", metadata),
                 patch.object(draft, "load_integrity", return_value=MagicMock()),
                 patch.object(draft, "gh") as remote,
                 self.assertRaisesRegex(ValueError, "bounded regular data file"),

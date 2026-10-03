@@ -1207,41 +1207,18 @@ def test_configuration_rejects_gated_action() -> None:
         framework.validate_config_data(config)
 
 
-def test_live_s3_policy_preserves_policy_and_rolls_back_exactly() -> None:
-    fake_aws = FakeAWS(reject_writes=False)
-    respond = fake_aws.respond
-
-    def current_policy(service, operation, request):
-        writes = [call for call in fake_aws.calls if call[1] == "put_bucket_policy"]
-        if operation == "get_bucket_policy" and writes:
-            fake_aws.calls.append((service, operation, request))
-            return {"Policy": writes[-1][2]["Policy"]}
-        return respond(service, operation, request)
-
-    fake_aws.respond = current_policy
-    action_config = action_configs()[framework.ChaosType.S3_BUCKET_POLICY_DENY]
-    experiment = make_experiment(
-        framework.ChaosType.S3_BUCKET_POLICY_DENY,
-        action_config,
-        fake_aws,
-        dry_run=False,
+def test_live_s3_policy_is_planning_only_without_conditional_update() -> None:
+    aws = FakeAWS(reject_writes=False)
+    values = action_configs()[framework.ChaosType.S3_BUCKET_POLICY_DENY]
+    item = make_experiment(
+        framework.ChaosType.S3_BUCKET_POLICY_DENY, values, aws, dry_run=False
     )
-
-    result = experiment.deny_bucket_policy(**action_config)
-    experiment.run_rollback()
-
-    assert result.status == "completed"
-    writes = [call for call in fake_aws.calls if call[1] == "put_bucket_policy"]
-    assert len(writes) == 2
-    applied = json.loads(writes[0][2]["Policy"])
-    assert any(item.get("Sid") == "ExistingAccess" for item in applied["Statement"])
-    deny = next(
-        item for item in applied["Statement"] if item.get("Sid") == "ChaosFrameworkDeny"
-    )
-    assert deny["Condition"]["ArnNotEquals"]["aws:PrincipalArn"] == BREAK_GLASS_ARN
-    assert json.loads(writes[1][2]["Policy"]) == json.loads(experiment.original_policy)
-    assert experiment.mutation_attempts == ["s3.put_bucket_policy"]
-    assert experiment.rollback_attempts == ["s3.put_bucket_policy"]
+    result = item.deny_bucket_policy(**values)
+    assert result.status == "failed"
+    assert not item.mutation_attempts
+    assert not any(c[1] == "put_bucket_policy" for c in aws.calls)
+    item.run_rollback()
+    assert not item.rollback_verified
 
 
 def test_live_route_removal_restores_exact_route() -> None:
@@ -1390,48 +1367,17 @@ def test_live_efs_throughput_waits_and_restores_original_mode() -> None:
     assert experiment.rollback_verified is True
 
 
-def test_live_opensearch_reduction_waits_and_restores_node_count() -> None:
-    fake_aws = FakeAWS(reject_writes=False)
-    initial = fake_aws.respond("opensearch", "describe_domain", {})
-    changed = {
-        "DomainStatus": {
-            "DomainName": "chaos-test-domain",
-            "Processing": False,
-            "ClusterConfig": {"InstanceCount": 1},
-        }
-    }
-    restored = {
-        "DomainStatus": {
-            "DomainName": "chaos-test-domain",
-            "Processing": False,
-            "ClusterConfig": {"InstanceCount": 2},
-        }
-    }
-    fake_aws.read_overrides[("opensearch", "describe_domain")] = [
-        initial,
-        changed,
-        changed,
-        restored,
-    ]
-    fake_aws.calls.clear()
-    action_config = action_configs()[
-        framework.ChaosType.OPENSEARCH_CLUSTER_CONFIG_MODIFY
-    ]
-    experiment = make_experiment(
-        framework.ChaosType.OPENSEARCH_CLUSTER_CONFIG_MODIFY,
-        action_config,
-        fake_aws,
-        dry_run=False,
-    )
-
-    result = experiment.modify_cluster_config(**action_config)
-    experiment.run_rollback()
-
-    assert result.status == "completed"
-    updates = [call for call in fake_aws.calls if call[1] == "update_domain_config"]
-    assert updates[0][2]["ClusterConfig"] == {"InstanceCount": 1}
-    assert updates[1][2]["ClusterConfig"] == {"InstanceCount": 2}
-    assert experiment.rollback_verified is True
+def test_live_opensearch_count_is_planning_only_without_conditional_update() -> None:
+    aws = FakeAWS(reject_writes=False)
+    kind = framework.ChaosType.OPENSEARCH_CLUSTER_CONFIG_MODIFY
+    values = action_configs()[kind]
+    item = make_experiment(kind, values, aws, dry_run=False)
+    result = item.modify_cluster_config(**values)
+    assert result.status == "failed"
+    assert not any(c[1] == "update_domain_config" for c in aws.calls)
+    with pytest.raises(framework.SafetyViolation, match="unsupported"):
+        item.run_rollback()
+    assert not item.rollback_verified
 
 
 def test_live_appstream_stop_waits_and_restores_running_state() -> None:
@@ -1499,7 +1445,7 @@ def test_live_waf_rule_change_uses_lock_token_and_restores() -> None:
     original = fake_aws.respond("wafv2", "get_web_acl", {})
     changed = copy.deepcopy(original)
     changed["WebACL"]["Rules"][0]["Action"] = {"Count": {}}
-    fake_aws.read_overrides[("wafv2", "get_web_acl")] = [original, changed]
+    fake_aws.read_overrides[("wafv2", "get_web_acl")] = [original, changed, changed]
     action_config = action_configs()[framework.ChaosType.WAF_RULE_MODIFY]
     experiment = make_experiment(
         framework.ChaosType.WAF_RULE_MODIFY,

@@ -27,6 +27,7 @@ _verifier_module = importlib.util.module_from_spec(_verifier_spec)
 _verifier_spec.loader.exec_module(_verifier_module)
 verify_distribution = _verifier_module.verify_distribution
 archive_budget = _verifier_module.archive_budget
+source_files = _verifier_module.source_files
 
 
 PROJECT_DISPLAY_NAME = "AWS Chaos Engineering Framework"
@@ -73,7 +74,7 @@ def sha256_file(path: Path) -> str:
 
 
 def read_project_version(project_root: Path) -> str:
-    text = (project_root / "pyproject.toml").read_text(encoding="utf-8")
+    text = source_files.read_text(project_root, "pyproject.toml", 1_048_576)
     project = re.search(r"(?ms)^\[project\]\s*$.*?(?=^\[|\Z)", text)
     require(project is not None, "pyproject.toml has no [project] table")
     match = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', project.group(0))
@@ -82,14 +83,14 @@ def read_project_version(project_root: Path) -> str:
 
 
 def read_runtime_version(project_root: Path) -> str:
-    text = (project_root / RUNTIME_SOURCE).read_text(encoding="utf-8")
+    text = source_files.read_text(project_root, RUNTIME_SOURCE)
     matches = re.findall(r'(?m)^__version__\s*=\s*"([^"]+)"\s*$', text)
     require(len(matches) == 1, "Runtime must define one __version__ string")
     return matches[0]
 
 
 def read_release_date(project_root: Path, version: str) -> str:
-    changelog = (project_root / "CHANGELOG.md").read_text(encoding="utf-8")
+    changelog = source_files.read_text(project_root, "CHANGELOG.md")
     matches = re.findall(
         rf"(?m)^## {re.escape(version)} - ([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})$",
         changelog,
@@ -111,9 +112,9 @@ def normalize_distribution_name(name: str) -> str:
 def parse_runtime_dependencies(project_root: Path) -> list[dict[str, str]]:
     dependencies: list[dict[str, str]] = []
     normalized_names: set[str] = set()
-    for raw_line in (
-        (project_root / "requirements.txt").read_text(encoding="utf-8").splitlines()
-    ):
+    for raw_line in source_files.read_text(
+        project_root, "requirements.txt", 1_048_576
+    ).splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -167,10 +168,8 @@ def validate_source_identity(
         "Runtime and requested versions differ",
     )
     release_date = read_release_date(project_root, version)
-    notes = project_root / ".github" / "release-notes" / f"v{version}.md"
-    require(
-        notes.is_file() and not notes.is_symlink(),
-        f"Release notes are missing: {notes}",
+    source_files.read_bytes(
+        project_root, f".github/release-notes/v{version}.md", 1_048_576
     )
     return release_date
 
@@ -509,7 +508,7 @@ def prepare_release(
     source_commit: str,
     source_date_epoch: int,
 ) -> tuple[Path, ...]:
-    project_root = project_root.resolve(strict=True)
+    project_root = project_root.absolute()
     dist_directory = dist_directory.resolve(strict=True)
     output_directory = output_directory.resolve(strict=False)
     release_date = validate_source_identity(project_root, version, tag, source_commit)
@@ -545,7 +544,7 @@ def prepare_release(
         runtime.is_file() and not runtime.is_symlink(),
         "Runtime source must be a regular file",
     )
-    runtime_value = runtime.read_bytes()
+    runtime_value = source_files.read_bytes(project_root, RUNTIME_SOURCE)
     dependencies = parse_runtime_dependencies(project_root)
 
     asset_names = expected_asset_names(version)

@@ -657,8 +657,13 @@ def test_all_s3_bucket_reads_writes_and_verifications_bind_captured_owner(operat
     # An unrelated later mapping edit cannot replace the authenticated account.
     owner.config["account_id"] = "999999999999"
     proxy = f.AwsClientProxy("s3", client, owner)
-    getattr(proxy, operation)(Bucket=BUCKET)
-    assert calls == [{"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT_ID}]
+    if "s3." + operation in f.CONCURRENCY_UNSAFE_MUTATIONS:
+        with pytest.raises(f.SafetyViolation, match="conditional ownership proof"):
+            getattr(proxy, operation)(Bucket=BUCKET)
+        assert not calls
+    else:
+        getattr(proxy, operation)(Bucket=BUCKET)
+        assert calls == [{"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT_ID}]
     model = botocore.session.get_session().get_service_model("s3")
     api = next(
         name for name in model.operation_names if botocore.xform_name(name) == operation
