@@ -90,7 +90,10 @@ per-service operation list, not `get_`, `test_` or other name prefixes. Effectfu
 TestState, TestFailover and TestRepositoryTriggers calls and credential-issuing
 GetSessionToken calls receive normal owner, plan, stop and tracking checks. Raw
 non-S3 waiter/presign helpers and non-EC2 paginators are disabled. EC2 paginator
-requests accept only the seven reviewed VPC inventory operations. EC2's read-only approval-inventory paginator
+requests accept only the seven reviewed VPC inventory operations. Known unsupported SDK methods remain callable on attribute lookup, but their
+replacement refuses invocation without exposing the raw SDK method. Unknown
+attributes retain ordinary `AttributeError` and `getattr` default behavior.
+EC2's read-only approval-inventory paginator
 remains supported.
 
 ## Concurrent changes and recovery evidence

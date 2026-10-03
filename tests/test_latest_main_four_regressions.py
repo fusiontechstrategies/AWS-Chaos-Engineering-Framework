@@ -363,6 +363,121 @@ def test_actual_reviewed_safety_identity_and_baseline_reads_work_after_stop(
         stub.assert_no_pending_responses()
 
 
+@pytest.mark.parametrize(
+    "mode", ["ownerless", "live", "plan", "live_stopped", "plan_recovery_stopped"]
+)
+@pytest.mark.parametrize(
+    "service,operation,args,kwargs",
+    [
+        ("s3", "get_paginator", ["list_objects_v2"], {}),
+        ("s3", "get_waiter", ["bucket_exists"], {}),
+        (
+            "s3",
+            "generate_presigned_url",
+            ["get_object"],
+            {"Params": {"Bucket": BUCKET, "Key": "offline"}},
+        ),
+        ("s3", "generate_presigned_post", [BUCKET, "offline"], {}),
+        ("s3", "get_object", [], {"Bucket": BUCKET, "Key": "offline"}),
+        ("ec2", "get_waiter", ["instance_running"], {}),
+        ("ec2", "generate_presigned_url", ["describe_instances"], {}),
+        ("efs", "get_paginator", ["describe_file_systems"], {}),
+    ],
+)
+def test_real_sdk_unsupported_lookup_preserves_protocol_but_call_refuses(
+    mode, service, operation, args, kwargs
+):
+    controller, raw = stub_controller(service)
+    owner = (
+        None
+        if mode == "ownerless"
+        else f.ChaosExperiment({"dry_run": mode.startswith("plan")}, controller)
+    )
+    if "recovery" in mode:
+        owner._in_rollback = True
+    if mode.endswith("stopped"):
+        controller.emergency_stop_all()
+        assert controller.emergency_stop.is_set()
+    proxy = controller.client(service, owner)
+    sentinel = object()
+    with Stubber(raw):
+        assert hasattr(proxy, operation)
+        refused = getattr(proxy, operation, sentinel)
+        assert refused is not sentinel and callable(refused)
+        # Supported introspection does not return the SDK method/delegate.
+        with pytest.raises(f.SafetyViolation):
+            refused(*args, **kwargs)
+    assert controller.emergency_stop.is_set() == mode.endswith("stopped")
+    if owner is not None:
+        assert not owner.mutation_attempts and not owner.mutation_operations
+        assert not owner.rollback_attempts and not owner.rollback_operations
+
+
+@pytest.mark.parametrize("service", ["ec2", "s3"])
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("stopped", [False, True])
+def test_real_sdk_unknown_attributes_obey_attributeerror_and_default_protocol(
+    service, owned, stopped
+):
+    controller, raw = stub_controller(service)
+    owner = f.ChaosExperiment({"dry_run": False}, controller) if owned else None
+    if stopped:
+        controller.emergency_stop_all()
+    proxy = controller.client(service, owner)
+    sentinel = object()
+    unknown = "offline_nonexistent_sdk_operation"
+    with Stubber(raw):
+        assert not hasattr(proxy, unknown)
+        assert getattr(proxy, unknown, sentinel) is sentinel
+        with pytest.raises(AttributeError):
+            getattr(proxy, unknown)
+        with pytest.raises(AttributeError):
+            _ = proxy.offline_nonexistent_sdk_operation
+        assert proxy.meta is raw.meta
+    assert controller.emergency_stop.is_set() == stopped
+    if owner is not None:
+        assert not owner.mutation_attempts and not owner.mutation_operations
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_real_sdk_reviewed_paginator_lookup_and_calls_remain_readonly_after_stop(owned):
+    controller, raw = stub_controller("ec2")
+    owner = f.ChaosExperiment({"dry_run": True}, controller) if owned else None
+    controller.emergency_stop_all()
+    proxy = controller.client("ec2", owner)
+    with Stubber(raw) as stub:
+        stub.add_response("describe_instances", {"Reservations": []}, {})
+        assert hasattr(proxy, "get_paginator")
+        paginator_factory = getattr(proxy, "get_paginator", None)
+        assert callable(paginator_factory)
+        assert list(
+            paginator_factory(operation_name="describe_instances").paginate()
+        ) == [{"Reservations": []}]
+        stub.assert_no_pending_responses()
+    assert controller.emergency_stop.is_set()
+    if owner is not None:
+        assert not owner.mutation_attempts and not owner.mutation_operations
+
+
+def test_real_sdk_mutation_lookup_still_tracks_admission_and_refuses_after_latch():
+    service, operation, call_request, response = EFFECTFUL_READLIKE_CASES[0]
+    controller, raw = stub_controller(service)
+    owner = f.ChaosExperiment({"dry_run": False}, controller)
+    proxy = controller.client(service, owner)
+    with Stubber(raw) as stub:
+        stub.add_response(operation, response, call_request)
+        assert hasattr(proxy, operation)
+        call = getattr(proxy, operation, None)
+        assert callable(call) and call(**call_request) == response
+        stub.assert_no_pending_responses()
+        controller.emergency_stop_all()
+        assert controller.emergency_stop.is_set()
+        with pytest.raises(f.EmergencyStop):
+            getattr(proxy, operation)(**call_request)
+    assert owner.mutation_attempts == [service + "." + operation]
+    assert owner.mutation_operations == [service + "." + operation]
+
+
 def invoke_thread(action, errors):
     def invoke():
         try:
