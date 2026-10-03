@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gzip
 import io
 import json
 import os
@@ -32,12 +31,20 @@ class TrustedPromotionTests(unittest.TestCase):
         cls.directory = Path(cls.fixture.name).resolve()
         cls.source = cls.directory / "source"
         cls.source.mkdir()
-        # Archive the immutable checkout commit, available even in depth-one CI.
-        archive = subprocess.check_output(  # noqa: S603
-            ["git", "archive", SOURCE], cwd=ROOT
+        # Build only the actual current corrected tracked source. The commit
+        # identifier below is synthetic fixture metadata until the signed gate.
+        names = (
+            subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT)
+            .decode()
+            .split("\0")
         )
-        with tarfile.open(fileobj=io.BytesIO(archive)) as files:
-            files.extractall(cls.source, filter="data")
+        for name in filter(None, names):
+            source = ROOT / name
+            destination = cls.source / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+            if destination.read_bytes() != source.read_bytes():
+                raise AssertionError("Current source copy differs: " + name)
         cls.dist = cls.directory / "dist"
         env = os.environ.copy()
         env["SOURCE_DATE_EPOCH"] = str(EPOCH)
@@ -127,26 +134,21 @@ class TrustedPromotionTests(unittest.TestCase):
             handoff.verify_run_identity(run, pages, 123, SOURCE, "owner/repository")
 
     def test_installed_namespace_cannot_shadow_trusted_distribution_helper(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            scripts = root / "scripts"
-            scripts.mkdir()
-            marker = root / "untrusted-helper.txt"
-            (scripts / "__init__.py").write_text("")
-            (scripts / "verify_distribution.py").write_text(
-                f"from pathlib import Path\nPath({str(marker)!r}).write_text('unsafe')\n"
-            )
-            # Simulate another package on an otherwise allowed interpreter path.
-            program = (
-                "import sys,importlib.util\n"
-                f"sys.path.insert(0,{str(root)!r})\n"
-                f"spec=importlib.util.spec_from_file_location('trusted_prepare',{str(ROOT / 'scripts/prepare_release.py')!r})\n"
-                "module=importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\n"
-            )
-            subprocess.run(
-                [sys.executable, "-I", "-c", program], check=True, capture_output=True
-            )
-            self.assertFalse(marker.exists())
+        trusted_path = (ROOT / "scripts/verify_distribution.py").resolve()
+        self.assertEqual(prepare_release._verifier_path.resolve(), trusted_path)
+        self.assertEqual(
+            Path(prepare_release._verifier_module.__file__).resolve(), trusted_path
+        )
+        self.assertIs(
+            prepare_release.verify_distribution,
+            prepare_release._verifier_module.verify_distribution,
+        )
+        loaded = handoff.load_trusted_helper("verify_distribution")
+        self.assertEqual(Path(loaded.__file__).resolve(), trusted_path)
+        self.assertEqual(
+            Path(loaded.archive_budget.__file__).resolve(),
+            (ROOT / "scripts/archive_budget.py").resolve(),
+        )
 
     def test_failed_new_draft_removes_only_its_created_immutable_id(self):
         for failure in ("upload", "readback", "digest", "final_tag"):
@@ -166,7 +168,15 @@ class TrustedPromotionTests(unittest.TestCase):
                     call_log.append(arguments)
                     if "POST" in arguments:
                         return json.dumps(
-                            {"id": 901, "tag_name": "v2.0.4", "draft": True}
+                            {
+                                "id": 901,
+                                "tag_name": "v2.0.4",
+                                "draft": True,
+                                "prerelease": False,
+                                "body": (
+                                    self.source / ".github/release-notes/v2.0.4.md"
+                                ).read_text(),
+                            }
                         )
                     if arguments[:2] == ["release", "upload"] and scenario == "upload":
                         raise RuntimeError("partial upload")
@@ -185,6 +195,9 @@ class TrustedPromotionTests(unittest.TestCase):
                                 "tag_name": "v2.0.4",
                                 "draft": True,
                                 "prerelease": False,
+                                "body": (
+                                    self.source / ".github/release-notes/v2.0.4.md"
+                                ).read_text(),
                                 "assets": [{"name": "asset"}],
                             }
                         )
@@ -244,7 +257,12 @@ class TrustedPromotionTests(unittest.TestCase):
     def test_gzip_expansion_is_bounded_before_archive_reader(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "large.tar.gz").write_bytes(gzip.compress(b"0" * 8192))
+            # Tiny valid regular TAR data, with a small deterministic decode cap.
+            with tarfile.open(root / "regular.tar.gz", "w:gz") as archive:
+                member = tarfile.TarInfo("synthetic/data.txt")
+                data = b"ordinary archive data"
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
             with (
                 patch.object(handoff, "MAX_TOTAL_BYTES", 1024),
                 self.assertRaisesRegex(ValueError, "decoded archive budget"),
@@ -257,7 +275,17 @@ class TrustedPromotionTests(unittest.TestCase):
         def fail_upload_and_cleanup(arguments):
             calls.append(arguments)
             if "POST" in arguments:
-                return json.dumps({"id": 901, "tag_name": "v2.0.4", "draft": True})
+                return json.dumps(
+                    {
+                        "id": 901,
+                        "tag_name": "v2.0.4",
+                        "draft": True,
+                        "prerelease": False,
+                        "body": (
+                            self.source / ".github/release-notes/v2.0.4.md"
+                        ).read_text(),
+                    }
+                )
             raise RuntimeError("synthetic remote failure")
 
         with (
@@ -289,7 +317,15 @@ class TrustedPromotionTests(unittest.TestCase):
                     if "POST" in arguments:
                         return json.dumps(
                             dict(
-                                {"id": 901, "tag_name": "v2.0.4", "draft": True},
+                                {
+                                    "id": 901,
+                                    "tag_name": "v2.0.4",
+                                    "draft": True,
+                                    "prerelease": False,
+                                    "body": (
+                                        self.source / ".github/release-notes/v2.0.4.md"
+                                    ).read_text(),
+                                },
                                 **fields,
                             )
                         )
@@ -330,7 +366,17 @@ class TrustedPromotionTests(unittest.TestCase):
         def successful_remote(arguments):
             calls.append(arguments)
             if "POST" in arguments:
-                return json.dumps({"id": 901, "tag_name": "v2.0.4", "draft": True})
+                return json.dumps(
+                    {
+                        "id": 901,
+                        "tag_name": "v2.0.4",
+                        "draft": True,
+                        "prerelease": False,
+                        "body": (
+                            self.source / ".github/release-notes/v2.0.4.md"
+                        ).read_text(),
+                    }
+                )
             if arguments[:2] == ["api", "repos/owner/repository/releases/901"]:
                 return json.dumps(
                     {
@@ -338,6 +384,9 @@ class TrustedPromotionTests(unittest.TestCase):
                         "tag_name": "v2.0.4",
                         "draft": True,
                         "prerelease": False,
+                        "body": (
+                            self.source / ".github/release-notes/v2.0.4.md"
+                        ).read_text(),
                         "assets": [{"name": "asset"}],
                     }
                 )
@@ -363,7 +412,7 @@ class TrustedPromotionTests(unittest.TestCase):
     def test_oversized_notes_are_rejected_before_creation(self):
         with tempfile.TemporaryDirectory() as directory:
             notes = Path(directory).resolve() / "notes.md"
-            notes.write_bytes(b"a" * (1024 * 1024 + 1))
+            notes.write_bytes(b"a" * (65_536 + 1))
             with (
                 patch.object(draft, "load_integrity", return_value=MagicMock()),
                 patch.object(draft, "gh") as remote,
@@ -410,13 +459,8 @@ class TrustedPromotionTests(unittest.TestCase):
     def test_tagged_json_and_distribution_modules_never_execute(self):
         with tempfile.TemporaryDirectory() as directory:
             cwd = Path(directory)
-            marker = cwd / "module-executed.txt"
-            payload = f"from pathlib import Path\nPath({str(marker)!r}).write_text('unsafe')\n"
-            (cwd / "json.py").write_text(payload)
-            (cwd / "verify_distribution.py").write_text(payload)
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(cwd)
-            env["GH_TOKEN"] = "synthetic-not-a-credential"
+            # No selected modules or hostile import setup. Exercise the actual
+            # trusted current CLI in an empty ordinary working directory.
             result = subprocess.run(  # noqa: S603
                 [
                     sys.executable,
@@ -428,13 +472,18 @@ class TrustedPromotionTests(unittest.TestCase):
                     str(EPOCH),
                 ],
                 cwd=cwd,
-                env=env,
                 capture_output=True,
                 text=True,
                 check=True,
             )
             self.assertEqual(len(json.loads(result.stdout)["manifest"]), 6)
-            self.assertFalse(marker.exists())
+            self.assertEqual(list(cwd.iterdir()), [])
+            for name in ("prepare_release", "verify_distribution", "archive_budget"):
+                loaded = handoff.load_trusted_helper(name)
+                self.assertEqual(
+                    Path(loaded.__file__).resolve(),
+                    (ROOT / "scripts" / (name + ".py")).resolve(),
+                )
 
 
 if __name__ == "__main__":

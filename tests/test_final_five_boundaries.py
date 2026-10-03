@@ -32,13 +32,10 @@ def test_planning_only_metadata_and_handler_refusal(kind):
     assert kind in framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS
     assert framework.experiment_metadata(kind).rollback == "none"
     aws = FakeAWS(reject_writes=False)
-    values = action_configs()[kind]
-    item = make_experiment(kind, values, aws, dry_run=False)
-    with pytest.raises(framework.ConfigurationError, match="not safely executable"):
-        object.__new__(framework.ChaosOrchestrator)._execute_experiment(
-            item, kind, values
-        )
-    assert not item.mutation_attempts
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(kind, action_configs()[kind], aws, dry_run=False)
     assert not aws.calls
 
 
@@ -58,7 +55,7 @@ def test_planning_only_metadata_and_handler_refusal(kind):
 def test_direct_proxy_refuses_unsafe_forward_and_recovery(service, operation, recovery):
     aws = FakeAWS(reject_writes=False)
     kind = framework.ChaosType.S3_BUCKET_POLICY_DENY
-    item = make_experiment(kind, action_configs()[kind], aws, dry_run=False)
+    item = make_experiment(kind, action_configs()[kind], aws)
     item._in_rollback = recovery
     with pytest.raises(framework.SafetyViolation):
         getattr(item.client(service), operation)()
@@ -105,14 +102,21 @@ def test_legacy_recovery_state_does_not_restore_unconditionally(
     kind, attributes, dry_run
 ):
     aws = FakeAWS(reject_writes=False)
-    item = make_experiment(kind, action_configs()[kind], aws, dry_run=dry_run)
+    if not dry_run:
+        with pytest.raises(
+            framework.ConfigurationError, match="Live approval is unavailable"
+        ):
+            make_experiment(kind, action_configs()[kind], aws, dry_run=False)
+        assert not aws.calls
+        return
+    item = make_experiment(kind, action_configs()[kind], aws)
     for key, value in attributes.items():
         setattr(item, key, value)
     if dry_run:
         item.rollback()
     else:
         with pytest.raises(framework.SafetyViolation, match="unsupported"):
-            item.rollback()
+            item.run_rollback()
     assert not aws.calls
     assert not item.rollback_verified
 
@@ -157,14 +161,14 @@ def test_waf_rollback_needs_confirmed_forward_write(kind, method, outcome):
     assert item.rule_write_confirmed is (outcome == "confirmed")
     if outcome == "confirmed":
         assert result.status == "completed"
-        item.rollback()
+        item.run_rollback()
         assert len([c for c in aws.calls if c[1] == "update_web_acl"]) == 2
         assert all(c[2]["LockToken"] for c in aws.calls if c[1] == "update_web_acl")
     else:
         assert result.status == "failed"
         before_calls = len(aws.calls)
         with pytest.raises(framework.SafetyViolation, match="not confirmed"):
-            item.rollback()
+            item.run_rollback()
         assert len(aws.calls) == before_calls
 
 

@@ -12,10 +12,12 @@ import copy
 import json
 import os
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import boto3
 import pytest
@@ -198,8 +200,16 @@ class FakeAWS:
                 "VpcPeeringConnections": [
                     {
                         "VpcPeeringConnectionId": "pcx-0123456789abcdef0",
-                        "RequesterVpcInfo": {"VpcId": "vpc-0123456789abcdef0"},
-                        "AccepterVpcInfo": {"VpcId": "vpc-0fedcba9876543210"},
+                        "RequesterVpcInfo": {
+                            "OwnerId": ACCOUNT_ID,
+                            "Region": REGION,
+                            "VpcId": "vpc-0123456789abcdef0",
+                        },
+                        "AccepterVpcInfo": {
+                            "OwnerId": ACCOUNT_ID,
+                            "Region": REGION,
+                            "VpcId": "vpc-0123456789abcdef1",
+                        },
                         "Status": {"Code": "active"},
                     }
                 ]
@@ -616,6 +626,8 @@ class FakeSafetyController:
     def __init__(self, aws: FakeAWS, *, live: bool = False):
         self.aws = aws
         self.live = live
+        self.expected_account = ACCOUNT_ID
+        self.region = REGION
         self.emergency_stop = threading.Event()
         self.config = {
             "fail_closed": True,
@@ -718,7 +730,19 @@ def action_configs() -> dict[framework.ChaosType, dict[str, Any]]:
             "cidr_block": "192.0.2.0/24",
         },
         framework.ChaosType.VPC_PEERING_DELETE: {
-            "peering_connection_id": "pcx-0123456789abcdef0"
+            "peering_connection_id": "pcx-0123456789abcdef0",
+            "peering_endpoints": {
+                "requester": {
+                    "owner_id": ACCOUNT_ID,
+                    "region": REGION,
+                    "vpc_id": "vpc-0123456789abcdef0",
+                },
+                "accepter": {
+                    "owner_id": ACCOUNT_ID,
+                    "region": REGION,
+                    "vpc_id": "vpc-0123456789abcdef1",
+                },
+            },
         },
         framework.ChaosType.VPC_ENDPOINT_DELETE: {
             "endpoint_id": "vpce-0123456789abcdef0"
@@ -777,7 +801,8 @@ def action_configs() -> dict[framework.ChaosType, dict[str, Any]]:
             "expire_days": 1,
         },
         framework.ChaosType.SQS_QUEUE_PURGE: {
-            "queue_url": f"https://sqs.{REGION}.amazonaws.com/{ACCOUNT_ID}/chaos-test-queue"
+            "queue_url": f"https://sqs.{REGION}.amazonaws.com/{ACCOUNT_ID}/chaos-test-queue",
+            "queue_arn": f"arn:aws-us-gov:sqs:{REGION}:{ACCOUNT_ID}:chaos-test-queue",
         },
         framework.ChaosType.SQS_QUEUE_POLICY_RESTRICT: {
             "queue_url": f"https://sqs.{REGION}.amazonaws.com/{ACCOUNT_ID}/chaos-test-queue",
@@ -910,41 +935,86 @@ def action_configs() -> dict[framework.ChaosType, dict[str, Any]]:
     }
 
 
-def make_experiment(
+def make_orchestrator(
     experiment_type: framework.ChaosType,
     action_config: dict[str, Any],
     fake_aws: FakeAWS,
     *,
     dry_run: bool = True,
-) -> framework.ChaosExperiment:
-    """Create an experiment through the production dispatch table."""
-    orchestrator = object.__new__(framework.ChaosOrchestrator)
-    orchestrator.config = {
-        "global": {
-            "region": REGION,
-            "account_id": ACCOUNT_ID,
-            "dry_run": dry_run,
-            "operator_principal_arn": BREAK_GLASS_ARN,
-            "active_access_key_id": OTHER_ACCESS_KEY,
-        }
+) -> framework.ChaosOrchestrator:
+    """Use the public constructor with ordinary mocked identity and SDK clients."""
+    region = action_config.get(
+        "region",
+        "us-east-1"
+        if experiment_type == framework.ChaosType.CLOUDFRONT_CACHE_INVALIDATE
+        else REGION,
+    )
+    principal = action_config.get("operator_principal_arn", BREAK_GLASS_ARN)
+    if region not in framework.GOVCLOUD_REGIONS:
+        principal = principal.replace("arn:aws-us-gov:", "arn:aws:")
+    reviewed = {
+        "type": experiment_type.value,
+        **{
+            key: value
+            for key, value in action_config.items()
+            if key not in {"region", "account_id", "dry_run"}
+        },
     }
-    orchestrator.safety_controller = FakeSafetyController(fake_aws, live=not dry_run)
-    if experiment_type in {
-        framework.ChaosType.EC2_TERMINATE,
-        framework.ChaosType.EBS_DETACH_VOLUME,
-        framework.ChaosType.CLOUDFRONT_CACHE_INVALIDATE,
-        framework.ChaosType.WAF_IP_SET_MODIFY,
-        framework.ChaosType.ECR_IMAGE_DELETE,
-        framework.ChaosType.KMS_GRANT_REVOKE,
-    }:
-        orchestrator.safety_controller.config["target_allowlist"] = sorted(
-            framework.ChaosOrchestrator._target_values(
-                {"type": experiment_type.value, **action_config}
-            )
+    targets = framework.ChaosOrchestrator._target_values(reviewed)
+    radius = framework.ChaosOrchestrator._blast_radius(experiment_type, reviewed)
+    safety = FakeSafetyController(fake_aws, live=not dry_run).config
+    safety.update(
+        target_allowlist=sorted(targets),
+        max_blast_radius=max(1, radius),
+        allow_irreversible=True,
+    )
+    config = {
+        "global": {"region": region, "account_id": ACCOUNT_ID},
+        "safety": safety,
+        "experiment_suites": {"ordinary": {"experiments": [reviewed]}},
+    }
+    if isinstance(fake_aws, FakeAWS) and region not in framework.GOVCLOUD_REGIONS:
+        fake_aws.client("cloudfront").meta.region_name = "aws-global"
+    frozen = SimpleNamespace(
+        access_key=action_config.get("active_access_key_id", OTHER_ACCESS_KEY),
+        token="ordinary-synthetic-session",
+    )
+    identity = SimpleNamespace(
+        get_caller_identity=lambda: {"Account": ACCOUNT_ID, "Arn": principal}
+    )
+    session = SimpleNamespace(
+        client=lambda service, **kwargs: (
+            identity if service == "sts" else fake_aws.client(service)
+        ),
+        get_credentials=lambda: SimpleNamespace(get_frozen_credentials=lambda: frozen),
+    )
+    fixture = tempfile.TemporaryDirectory(prefix="chaos-confirmed-current-")
+    config_path = Path(fixture.name) / "config.yaml"
+    config_path.write_text(framework.yaml.safe_dump(config), encoding="utf-8")
+    with (
+        patch.object(framework.boto3, "Session", lambda **kwargs: session),
+        patch.object(framework.signal, "signal"),
+        patch.object(framework.atexit, "register"),
+    ):
+        orchestrator = framework.ChaosOrchestrator(
+            str(config_path),
+            live=not dry_run,
+            allow_irreversible=True,
+            output_dir=str(Path(fixture.name) / "reports"),
         )
-        orchestrator.safety_controller.config["max_blast_radius"] = (
-            framework.ChaosOrchestrator._blast_radius(experiment_type, action_config)
-        )
+    orchestrator._ordinary_fixture = fixture
+    orchestrator.suite_name = "ordinary"
+    orchestrator.safety_controller.check_safety_conditions = lambda: (True, [])
+    orchestrator.confirmation = (
+        orchestrator.expected_confirmation("ordinary", True) if not dry_run else None
+    )
+    return orchestrator
+
+
+def make_experiment(experiment_type, action_config, fake_aws, *, dry_run=True):
+    orchestrator = make_orchestrator(
+        experiment_type, action_config, fake_aws, dry_run=dry_run
+    )
     experiment = orchestrator._create_experiment(experiment_type, action_config)
     experiment.rollback_mode = framework.experiment_metadata(experiment_type).rollback
     return experiment
@@ -1209,16 +1279,12 @@ def test_configuration_rejects_gated_action() -> None:
 
 def test_live_s3_policy_is_planning_only_without_conditional_update() -> None:
     aws = FakeAWS(reject_writes=False)
-    values = action_configs()[framework.ChaosType.S3_BUCKET_POLICY_DENY]
-    item = make_experiment(
-        framework.ChaosType.S3_BUCKET_POLICY_DENY, values, aws, dry_run=False
-    )
-    result = item.deny_bucket_policy(**values)
-    assert result.status == "failed"
-    assert not item.mutation_attempts
-    assert not any(c[1] == "put_bucket_policy" for c in aws.calls)
-    item.run_rollback()
-    assert not item.rollback_verified
+    kind = framework.ChaosType.S3_BUCKET_POLICY_DENY
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(kind, action_configs()[kind], aws, dry_run=False)
+    assert not aws.calls
 
 
 def test_live_route_removal_restores_exact_route() -> None:
@@ -1370,14 +1436,11 @@ def test_live_efs_throughput_waits_and_restores_original_mode() -> None:
 def test_live_opensearch_count_is_planning_only_without_conditional_update() -> None:
     aws = FakeAWS(reject_writes=False)
     kind = framework.ChaosType.OPENSEARCH_CLUSTER_CONFIG_MODIFY
-    values = action_configs()[kind]
-    item = make_experiment(kind, values, aws, dry_run=False)
-    result = item.modify_cluster_config(**values)
-    assert result.status == "failed"
-    assert not any(c[1] == "update_domain_config" for c in aws.calls)
-    with pytest.raises(framework.SafetyViolation, match="unsupported"):
-        item.run_rollback()
-    assert not item.rollback_verified
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(kind, action_configs()[kind], aws, dry_run=False)
+    assert not aws.calls
 
 
 def test_live_appstream_stop_waits_and_restores_running_state() -> None:
@@ -1472,33 +1535,27 @@ def test_iam_self_protection_blocks_active_role_and_access_key() -> None:
         "operator_principal_arn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ChaosTestRole",
         "dry_run": False,
     }
-    role_experiment = make_experiment(
-        framework.ChaosType.IAM_POLICY_DETACH,
-        role_config,
-        fake_aws,
-        dry_run=False,
-    )
-    role_result = role_experiment.detach_policy(
-        role_config["role_name"], role_config["policy_arn"]
-    )
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(
+            framework.ChaosType.IAM_POLICY_DETACH, role_config, fake_aws, dry_run=False
+        )
 
     key_config = {
         **action_configs()[framework.ChaosType.IAM_USER_ACCESS_KEY_DEACTIVATE],
         "active_access_key_id": TEST_ACCESS_KEY,
         "dry_run": False,
     }
-    key_experiment = make_experiment(
-        framework.ChaosType.IAM_USER_ACCESS_KEY_DEACTIVATE,
-        key_config,
-        fake_aws,
-        dry_run=False,
-    )
-    key_result = key_experiment.deactivate_access_key(
-        key_config["user_name"], key_config["access_key_id"]
-    )
-
-    assert role_result.status == "failed"
-    assert key_result.status == "failed"
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(
+            framework.ChaosType.IAM_USER_ACCESS_KEY_DEACTIVATE,
+            key_config,
+            fake_aws,
+            dry_run=False,
+        )
     assert not any(
         call[1] in {"detach_role_policy", "update_access_key"}
         for call in fake_aws.calls
@@ -1506,68 +1563,23 @@ def test_iam_self_protection_blocks_active_role_and_access_key() -> None:
 
 
 def test_fis_template_live_guardrails_require_stop_condition() -> None:
-    fake_aws = FakeAWS(reject_writes=False)
-    action_config = {
-        **action_configs()[framework.ChaosType.FIS_TEMPLATE],
-        "region": REGION,
-        "account_id": ACCOUNT_ID,
-        "dry_run": False,
-    }
-    experiment = make_experiment(
-        framework.ChaosType.FIS_TEMPLATE,
-        action_config,
-        fake_aws,
-        dry_run=False,
-    )
-    template = fake_aws.respond("fis", "get_experiment_template", {})[
-        "experimentTemplate"
-    ]
-    template["stopConditions"] = [{"source": "none"}]
-    fake_aws.read_overrides[("fis", "get_experiment_template")] = [
-        {"experimentTemplate": template}
-    ]
-    fake_aws.calls.clear()
-
-    result = experiment.run_template(action_config["experiment_template_id"])
-
-    assert result.status == "failed"
-    assert any("no CloudWatch alarm" in error for error in result.errors)
-    assert not any(call[1] == "start_experiment" for call in fake_aws.calls)
+    aws = FakeAWS(reject_writes=False)
+    kind = framework.ChaosType.FIS_TEMPLATE
+    with pytest.raises(
+        framework.ConfigurationError, match="Live FIS approval is disabled"
+    ):
+        make_experiment(kind, action_configs()[kind], aws, dry_run=False)
+    assert not aws.calls
 
 
 def test_fis_template_live_start_is_disabled_without_immutable_binding() -> None:
-    fake_aws = FakeAWS(reject_writes=False)
-    fake_aws.read_overrides[("fis", "get_experiment")] = [
-        {"experiment": {"state": {"status": "completed"}}}
-    ]
-    original_respond = fake_aws.respond
-
-    def respond(service: str, operation: str, request: dict[str, Any]) -> Any:
-        if service == "fis" and operation == "start_experiment":
-            fake_aws.calls.append((service, operation, request))
-            return {"experiment": {"id": "EXP1234567890abcdef0"}}
-        return original_respond(service, operation, request)
-
-    fake_aws.respond = respond  # type: ignore[method-assign]
-    action_config = {
-        **action_configs()[framework.ChaosType.FIS_TEMPLATE],
-        "region": REGION,
-        "account_id": ACCOUNT_ID,
-        "dry_run": False,
-    }
-    experiment = make_experiment(
-        framework.ChaosType.FIS_TEMPLATE,
-        action_config,
-        fake_aws,
-        dry_run=False,
-    )
-
-    result = experiment.run_template(action_config["experiment_template_id"])
-
-    assert result.status == "failed"
-    assert any("immutable reviewed template" in error for error in result.errors)
-    assert not any(call[1] == "start_experiment" for call in fake_aws.calls)
-    assert experiment.mutation_operations == []
+    aws = FakeAWS(reject_writes=False)
+    kind = framework.ChaosType.FIS_TEMPLATE
+    with pytest.raises(
+        framework.ConfigurationError, match="Live FIS approval is disabled"
+    ):
+        make_experiment(kind, action_configs()[kind], aws, dry_run=False)
+    assert not aws.calls
 
 
 @pytest.mark.parametrize(
