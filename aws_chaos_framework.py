@@ -988,6 +988,16 @@ class AwsClientProxy:
 
     def __getattr__(self, name: str) -> Any:
         attribute = getattr(self._client, name)
+        if (
+            callable(attribute)
+            and self._service == "s3"
+            and name not in S3_OWNER_BOUND_OPERATIONS
+        ):
+            # Raw SDK paginator/waiter/presign helpers retain an unwrapped client.
+            # Only the reviewed direct bucket operations are supported here.
+            raise SafetyViolation(
+                "S3 proxy permits only reviewed owner-bound bucket operations"
+            )
         read_only = name.startswith(READ_ONLY_OPERATION_PREFIXES)
         bind_s3_owner = self._service == "s3" and name in S3_OWNER_BOUND_OPERATIONS
         if not callable(attribute) or (read_only and not bind_s3_owner):

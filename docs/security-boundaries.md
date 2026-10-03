@@ -82,6 +82,11 @@ dispatch. The controller's captured account alone does not grant an ownerless
 client experiment approval or recovery authority.
 Owned plan-mode clients permit reads but refuse direct mutation dispatch,
 including calls marked as recovery. Planning never grants write authority.
+The S3 proxy accepts only the twelve direct bucket operations used by the
+supported experiments. Raw SDK paginators, waiters, presigned URL/post helpers
+and other bucket methods are refused because they can retain an unwrapped SDK
+client or omit the approved owner. EC2's read-only approval-inventory paginator
+remains supported.
 
 ## Concurrent changes and recovery evidence
 

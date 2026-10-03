@@ -94,6 +94,66 @@ def test_plan_owner_cannot_dispatch_direct_mutation_even_as_recovery(
     assert not owner.mutation_attempts
 
 
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize(
+    "operation,arguments",
+    [
+        ("get_paginator", ["list_objects_v2"]),
+        ("get_waiter", ["bucket_exists"]),
+        ("generate_presigned_url", ["get_object"]),
+        ("generate_presigned_post", [BUCKET, "key"]),
+        ("head_bucket", []),
+        ("get_object", []),
+        ("list_objects", []),
+    ],
+)
+def test_raw_s3_delegates_and_unreviewed_bucket_methods_refuse(
+    owned, operation, arguments
+):
+    raw = boto3.client(
+        "s3",
+        region_name=REGION,
+        aws_access_key_id="offline",
+        aws_secret_access_key="offline",
+    )
+    controller = f.SafetyController(
+        {},
+        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        REGION,
+        True,
+        expected_account=ACCOUNT_ID,
+    )
+    owner = f.ChaosExperiment({"dry_run": False}, controller) if owned else None
+    with Stubber(raw) as stub:
+        # No response is authorized. Any leaked delegate/call must fail this guard
+        # before it can obtain an unwrapped operation or reach the SDK endpoint.
+        with pytest.raises(f.SafetyViolation, match="only reviewed owner-bound"):
+            getattr(controller.client("s3", owner), operation)(*arguments)
+        stub.assert_no_pending_responses()
+
+
+def test_ec2_readonly_approval_inventory_paginator_remains_supported():
+    raw = boto3.client(
+        "ec2",
+        region_name=REGION,
+        aws_access_key_id="offline",
+        aws_secret_access_key="offline",
+    )
+    controller = f.SafetyController(
+        {},
+        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        REGION,
+        True,
+        expected_account=ACCOUNT_ID,
+    )
+    with Stubber(raw) as stub:
+        stub.add_response("describe_instances", {"Reservations": []}, {})
+        assert list(
+            controller.client("ec2").get_paginator("describe_instances").paginate()
+        ) == [{"Reservations": []}]
+        stub.assert_no_pending_responses()
+
+
 def invoke_thread(action, errors):
     def invoke():
         try:

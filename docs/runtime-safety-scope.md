@@ -71,6 +71,8 @@ Controller-only clients without an experiment owner support safety and identity
 reads; they refuse all mutations and account-bound S3 bucket reads. They cannot
 claim the recovery exception or bypass the process stop through an ownerless
 write.
+S3 proxy calls are limited to the twelve direct owner-bound operations used by
+the supported experiments; raw SDK delegates and unreviewed S3 methods refuse.
 
 EC2 recovery requires the exact selected instance set on every read. Empty,
 partial, duplicated, or extra responses cannot establish recovery. An unverified
