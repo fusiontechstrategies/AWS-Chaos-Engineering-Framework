@@ -83,7 +83,9 @@ def _exact(handle, count):
     return value
 
 
-def zip_preflight(handle, size, max_member_bytes=None, max_expanded_bytes=None):
+def zip_preflight(
+    handle, size, max_member_bytes=None, max_expanded_bytes=None, max_members=None
+):
     """Inspect bounded raw central records before ZipFile builds its object list."""
     tail_size = min(size, 65557)
     handle.seek(size - tail_size)
@@ -102,7 +104,9 @@ def zip_preflight(handle, size, max_member_bytes=None, max_expanded_bytes=None):
         count != 0xFFFF and central_size != 0xFFFFFFFF and central_offset != 0xFFFFFFFF,
         "ZIP64 archives are outside the reviewed archive budget",
     )
-    require(count <= MAX_MEMBERS, "ZIP exceeds the member count budget")
+    require(
+        count <= _limit(max_members, MAX_MEMBERS), "ZIP exceeds the member count budget"
+    )
     require(
         central_size <= MAX_METADATA_TOTAL
         and central_offset + central_size == size - tail_size + offset
@@ -192,10 +196,11 @@ def open_zip(
     *,
     max_member_bytes=None,
     max_expanded_bytes=None,
+    max_members=None,
 ):
     try:
         with snapshot(path) as (raw, size):
-            zip_preflight(raw, size, max_member_bytes, max_expanded_bytes)
+            zip_preflight(raw, size, max_member_bytes, max_expanded_bytes, max_members)
             with zipfile.ZipFile(raw) as archive:
                 yield archive
     except ArchiveBudgetError as error:

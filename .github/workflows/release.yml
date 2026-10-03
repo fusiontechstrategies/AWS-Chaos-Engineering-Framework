@@ -155,4 +155,5 @@ jobs:
           name: release-assets
           path: release-assets/
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14

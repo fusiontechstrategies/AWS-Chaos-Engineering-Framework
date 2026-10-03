@@ -121,3 +121,52 @@ The prior successful trusted publication is historical identity evidence, not a
 fresh inspection of the PyPI maintainer account. Recheck current registration
 before authorizing any future publication; code changes and successful CI do not
 authorize a dispatch or prove that external PyPI account state is unchanged.
+
+## Admission before release artifact extraction
+
+The default-branch verifier fetches the outer Actions artifact through the
+[GitHub artifact API](https://docs.github.com/en/rest/actions/artifacts?apiVersion=2022-11-28),
+using the authenticated immutable artifact ID/run/name and SHA-256 digest.
+Metadata is capped at 128 KiB. The raw ZIP transport is capped at 64 MiB, with a
+15-second individual socket timeout and a 120-second read deadline. Reads use
+`read1` and check the deadline between transport blocks; a single blocked read
+can add up to the socket timeout. GitHub API credentials are sent only to the
+fixed HTTPS API host and never forwarded to its storage redirect. A second
+redirect is refused.
+
+Before `ZipFile` constructs entries or any file is materialized, the shared raw
+central-directory preflight limits the outer archive to six members. Flat,
+regular, portable, distinct leaves are required. Expanded contents are capped
+at 8 MiB per member, 32 MiB total and a 200:1 member compression ratio, including
+actual bounded reads and CRC checks. Admission and digest failures create no
+output directory. Existing output directories are refused rather than replaced.
+Materialization uses create-new files inside a new job-owned directory and cleans
+only that new directory on a write failure. Runner/workspace ownership remains a
+prerequisite; this is not a sandbox for an arbitrary concurrently hostile host.
+
+Only the verifier's reconstructed and matched six subjects are uploaded as a
+new `verified-release-<producer-run>` artifact. Protected attestation and draft
+jobs download that verifier-produced ID from the current promotion run, bind its
+upload digest, repeat bounded outer admission, then repeat source/subject checks
+after environment approval. They never extract the original producer artifact.
+Both uploads use compression level zero as an additional practical bound;
+independent download/preflight checks are still required.
+
+## Tagged source is admitted data
+
+The trusted `source_files.py` helper admits every tagged metadata/runtime/source
+input before parsing or retaining it. It rejects links, reparse points,
+nonregular objects and oversized metadata before opening; the held descriptor
+must also be regular and within its fixed byte budget. Actual reads use bounded
+chunks and must match the descriptor's admitted size. Source files are capped at
+8 MiB, packaging metadata/requirements at 1 MiB, manifests at 64 KiB and draft
+notes at 64 KiB. Note-directory enumeration is bounded to 128 entries before
+canonical release-note names are admitted.
+
+POSIX traversal uses retained no-follow directory descriptors and relative leaf
+opens. Native Windows traversal retains no-reparse filesystem handles without
+write/delete sharing while the leaf is read, then checks native disk/object type
+and CRT descriptor metadata. Current tests cover ordinary files and synthetic
+rejected metadata, not hostile filesystem race or special-file demonstrations.
+The tagged checkout and runner remain data owned by the verification job;
+privileged Python helpers still load by exact sibling path under isolated mode.

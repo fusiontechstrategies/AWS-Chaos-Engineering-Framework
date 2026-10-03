@@ -90,7 +90,9 @@ recovery sets the process-wide live-execution latch and blocks later live work.
 
 The following types support dry-run planning and advertise `live_supported: false`:
 
-- `vpc_nacl_block_traffic`
+- `s3_bucket_policy_deny`, `sns_topic_policy_restrict`
+- `ebs_throttle_iops`, `opensearch_cluster_config_modify`
+- `vpc_security_group_modify`, `vpc_nacl_block_traffic`
 - `ec2_terminate` (immutable child authorization cannot be proven)
 - `sqs_queue_policy_restrict`, `sqs_message_delay`, `sqs_visibility_timeout`
 - `kms_key_disable`, `kms_key_policy_restrict`
@@ -127,3 +129,30 @@ Remediation regressions use deterministic fake AWS clients, actual offline
 botocore operation models with Stubber, and temporary local inputs. They
 establish local control-flow, SDK validation and request-shape behavior;
 they do not establish outcomes from a live AWS experiment.
+
+## Policy, scalar and ambiguous-forward limits
+
+S3/SNS whole-policy replacements, EBS IOPS changes, OpenSearch node-count changes,
+and security-group ingress removal/restoration are planning and dry-run operations
+only. Their service APIs do not provide the conditional revision/ownership proof
+needed for safe shared-resource recovery. A local process lock, named policy
+statement, matching scalar, immediate reread or declared maintenance window does
+not close that AWS-side boundary. No configuration assertion grants live support.
+Eligibility, live tokens, direct SDK writes and legacy recovery paths refuse them.
+Dry-run recovery performs no SDK changes and is not evidence of live restoration.
+
+See the actual request contracts for [S3 policy](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketPolicy.html),
+[SNS attributes](https://docs.aws.amazon.com/sns/latest/api/API_SetTopicAttributes.html),
+[EBS modification](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyVolume.html)
+and [OpenSearch configuration](https://docs.aws.amazon.com/opensearch-service/latest/APIReference/API_UpdateDomainConfig.html).
+
+WAF rule/rate updates retain the service's required
+[LockToken](https://docs.aws.amazon.com/waf/latest/APIReference/API_UpdateWebACL.html).
+Recovery additionally requires a successful forward return and a unique matching
+post-state. An exception or unconfirmed post-state requires manual reconciliation;
+an absent/changed value is never used to infer that this execution owned a write.
+The marker resets before each new attempt. Recovery reads current settings,
+preserves unrelated fields, refuses conflicting selected values and supplies that
+read's LockToken. An optimistic-lock failure remains a failure, not permission to
+retry an unconditional overwrite. This does not infer the intent of a later
+principal deliberately writing the identical selected value.

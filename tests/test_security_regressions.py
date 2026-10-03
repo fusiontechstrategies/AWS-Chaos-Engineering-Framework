@@ -34,42 +34,28 @@ def test_absent_ingress_rule_never_creates_access_on_rollback():
     )
 
 
-def test_lost_revoke_response_restores_only_observed_preexisting_rule():
+def test_unsupported_ingress_never_infers_forward_or_restore_ownership():
     aws = FakeAWS(reject_writes=False)
-    before = aws.respond("ec2", "describe_security_groups", {})
-    aws.read_overrides[("ec2", "describe_security_groups")] = [
-        before,
-        {"SecurityGroups": [{"IpPermissions": []}]},
-    ]
-    respond = aws.respond
-
-    def lost(service, operation, request):
-        if operation == "revoke_security_group_ingress":
-            raise TimeoutError("response lost after write")
-        return respond(service, operation, request)
-
-    aws.respond = lost
     item, values = experiment(framework.ChaosType.VPC_SECURITY_GROUP_MODIFY, aws)
     assert item.modify_security_group(**values).status == "failed"
     item.run_rollback()
-    restores = [
-        request
-        for _, operation, request in aws.calls
-        if operation == "authorize_security_group_ingress"
-    ]
-    assert restores[0]["IpPermissions"] == before["SecurityGroups"][0]["IpPermissions"]
+    assert not item.ingress_write_confirmed
+    assert not hasattr(item, "removed_rule")
+    assert not any(
+        operation.startswith(("authorize_", "revoke_")) for _, operation, _ in aws.calls
+    )
 
 
 def test_emergency_stop_blocks_forward_write_but_allows_recovery():
     aws = FakeAWS(reject_writes=False)
-    item, _ = experiment(framework.ChaosType.VPC_SECURITY_GROUP_MODIFY, aws)
+    item, _ = experiment(framework.ChaosType.EC2_STOP, aws)
     item.safety_controller.emergency_stop.set()
     with pytest.raises(framework.EmergencyStop):
-        item.ec2.revoke_security_group_ingress(GroupId="sg-test", IpPermissions=[])
+        item.ec2.stop_instances(InstanceIds=[INSTANCE_ID])
     assert not item.mutation_attempts
     item._in_rollback = True
-    item.ec2.authorize_security_group_ingress(GroupId="sg-test", IpPermissions=[])
-    assert item.rollback_attempts == ["ec2.authorize_security_group_ingress"]
+    item.ec2.start_instances(InstanceIds=[INSTANCE_ID])
+    assert item.rollback_attempts == ["ec2.start_instances"]
 
 
 def test_efs_throttle_cannot_increase_capacity():
@@ -100,7 +86,7 @@ def test_waf_recovery_preserves_concurrent_unrelated_change():
     changed = copy.deepcopy(before)
     changed["WebACL"]["Rules"][0]["Action"] = {"Count": {}}
     changed["WebACL"]["Description"] = "New operator description"
-    aws.read_overrides[("wafv2", "get_web_acl")] = [before, changed]
+    aws.read_overrides[("wafv2", "get_web_acl")] = [before, changed, changed]
     item, values = experiment(framework.ChaosType.WAF_RULE_MODIFY, aws)
     assert item.modify_rule(**values).status == "completed"
     item.run_rollback()
@@ -458,6 +444,16 @@ def test_extension_recovery_requires_original_post_state(action):
         owned = copy.deepcopy(before)
         owned["containerInstances"][0]["status"] = "DRAINING"
         aws.read_overrides[("ecs", "describe_container_instances")] = [before, owned]
+    if action in {"waf_rule_modify", "waf_rate_limit_modify"}:
+        before = aws.respond("wafv2", "get_web_acl", {})
+        owned = copy.deepcopy(before)
+        if action == "waf_rule_modify":
+            owned["WebACL"]["Rules"][0]["Action"] = {"Count": {}}
+        else:
+            owned["WebACL"]["Rules"][0]["Statement"]["RateBasedStatement"]["Limit"] = (
+                action_configs()[kind]["limit"]
+            )
+        aws.read_overrides[("wafv2", "get_web_acl")] = [before, owned, owned, before]
     item, values = experiment(kind, aws)
     orchestrator = object.__new__(framework.ChaosOrchestrator)
     if kind in framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS:
@@ -868,7 +864,13 @@ def test_offline_config_and_token_bind_typed_arn(kind, key, service, resource, c
     config = config_for(values)
     if change == "valid":
         framework.validate_config_data(config)
-        assert framework.confirmation_token(config, "reviewed").startswith("LIVE")
+        if framework.ChaosType(kind) in framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS:
+            with pytest.raises(
+                framework.ConfigurationError, match="Live approval is unavailable"
+            ):
+                framework.confirmation_token(config, "reviewed")
+        else:
+            assert framework.confirmation_token(config, "reviewed").startswith("LIVE")
     else:
         with pytest.raises(framework.ConfigurationError):
             framework.validate_config_data(config)
@@ -1746,7 +1748,7 @@ def test_sdk_request_budget_covers_root_keys_and_aggregate_text(attack):
     values = {
         "root_width": {str(i): "x" for i in range(20001)},
         "key_bytes": {"x" * (framework.MAX_CONFIG_BYTES + 1): "small"},
-        "value_bytes": {"small": "é" * (framework.MAX_CONFIG_BYTES // 2 + 1)},
+        "value_bytes": {"small": "Ã©" * (framework.MAX_CONFIG_BYTES // 2 + 1)},
         "aggregate_bytes": {
             "a": "x" * (framework.MAX_CONFIG_BYTES // 2),
             "b": "y" * (framework.MAX_CONFIG_BYTES // 2),

@@ -632,14 +632,22 @@ def test_direct_forward_or_legacy_cleanup_cannot_clobber_concurrent_state(
 ):
     aws = FakeAWS(reject_writes=False)
     safety = FakeSafetyController(aws, live=True)
-    owner = framework.ChaosExperiment({"dry_run": False}, safety)
+    owner = framework.ChaosExperiment(
+        {"account_id": ACCOUNT_ID, "dry_run": False}, safety
+    )
+    owner.expected_account = ACCOUNT_ID
     owner._in_rollback = rollback
     service, method = operation.split(".")
     current = {"concurrent_principal": "must remain unchanged"}
     original = copy.deepcopy(current)
     proxy = owner.client(service)
     with pytest.raises(framework.SafetyViolation, match="conditional ownership proof"):
-        getattr(proxy, method)(SyntheticState=current)
+        request = (
+            {"Bucket": "owned-test-bucket"}
+            if service == "s3"
+            else {"SyntheticState": current}
+        )
+        getattr(proxy, method)(**request)
     assert current == original
     assert not aws.calls
     assert not owner.mutation_attempts and not owner.rollback_attempts

@@ -88,17 +88,19 @@ call begins after that activation. A request arriving after the final admission
 check can precede the start of that accepted call; the latch remains inactive
 until it returns. Signals on the dispatching thread defer activation to that
 same return boundary. SDK requests are not cancelled, and stop activation may
-wait for their configured timeouts and retries. Recovery writes remain available.
+wait for their configured timeouts and retries. Only supported recovery writes remain available.
 Unknown FIS start outcomes require operator reconciliation.
 Terminal FIS status alone does not prove resource recovery. ECS recovery requires
 restored running capacity, no pending tasks or failed deployments, and one stable
 deployment. Failed recovery remains a failed result.
 
-Rollback restores verified pre-state rather than supplied YAML. WAF rollback
-patches only the experiment-owned field and refuses conflicting changes. ELB
-recovery retains port and availability-zone identity. NACL recovery resolves the
-subnet's current association ID. Security-group recovery only restores an actual
-permission observed before the experiment and confirmed absent after revocation.
+Supported rollback restores verified pre-state rather than supplied YAML. WAF
+rule/rate rollback requires a successful forward return and uniquely verified
+post-state, patches only the selected field, refuses conflicting changes and
+uses the fresh service LockToken. Ambiguous writes require manual reconciliation.
+ELB recovery retains port and availability-zone identity. NACL recovery resolves
+the subnet's current association ID. Security-group ingress removal and recovery
+are planning only because their APIs cannot prove conditional write ownership.
 
 Release verification rejects unexpected archive members, including startup hooks,
 unreviewed build scripts, native binaries, and executable wheel data directories.
@@ -170,12 +172,18 @@ remains supported.
 
 Recovery for EFS throughput, RDS parameters, S3 versioning/encryption
 and Lambda fields checks current state against original or
-experiment-owned state before restoring. Conflicting operator changes fail closed.
+experiment-owned state before restoring. Conflicting operator state observed by
+those checks is refused. These reads alone do not prevent later external writes.
 Lambda writes also use RevisionId and preserve unrelated environment variables.
-S3/SNS policy recovery removes only the exact experiment-owned statement and keeps
-unrelated concurrent statements. API operations without a conditional revision
-parameter still require an exclusive change window: read-before-write checks do
-not make those AWS APIs atomic. Live FIS execution remains disabled rather than trusting an unverified exclusive-change assertion.
+S3/SNS whole-policy changes, EBS IOPS changes, OpenSearch node-count changes and
+security-group ingress changes retain planning and dry runs only. Live tokens,
+direct SDK dispatch and legacy recovery refuse these operations. Matching values,
+statement identifiers, a local lock or a declared exclusive window do not prove
+AWS-side ownership, and no configuration assertion grants an exception. Dry-run
+recovery changes no resource and cannot establish live restoration. Live FIS
+execution also remains disabled rather than trusting an unverified assertion.
+Other read-before-write checks are not AWS compare-and-swap operations; only
+actual service revision conditions provide that conditional boundary.
 
 All live experiments are serialized from pre-state capture through verified
 recovery, including direct worker calls and separate orchestrators in the same

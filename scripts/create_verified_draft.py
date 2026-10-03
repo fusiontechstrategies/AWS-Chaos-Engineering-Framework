@@ -23,6 +23,16 @@ def load_integrity():
     return module
 
 
+def load_source_reader():
+    path = Path(__file__).resolve().with_name("source_files.py")
+    spec = importlib.util.spec_from_file_location("trusted_source_files", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("Trusted source reader is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def gh(arguments):
     executable = shutil.which("gh")
     if executable is None:
@@ -38,13 +48,10 @@ def create_draft(assets, notes, repository, tag, commit, manifest):
     integrity = load_integrity()
     integrity.verify_assets(assets, manifest)
     integrity.verify_tag(repository, tag, commit)
-    if (
-        notes.is_symlink()
-        or any(parent.is_symlink() for parent in notes.parents)
-        or not notes.is_file()
-        or notes.stat().st_size > 1024 * 1024
-    ):
-        raise ValueError("Release notes must be a bounded regular data file")
+    try:
+        notes_text = load_source_reader().read_text(notes.parent, notes.name, 65_536)
+    except (ValueError, OSError) as error:
+        raise ValueError("Release notes must be a bounded regular data file") from error
     release_id = None
     try:
         created = json.loads(
@@ -65,7 +72,7 @@ def create_draft(assets, notes, repository, tag, commit, manifest):
                     "-F",
                     "prerelease=false",
                     "-F",
-                    "body=@" + str(notes),
+                    "body=" + notes_text,
                 ]
             )
         )

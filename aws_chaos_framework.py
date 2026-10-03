@@ -518,6 +518,11 @@ FIS_PREFERRED_EXPERIMENTS = frozenset(
 
 CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
     {
+        ChaosType.S3_BUCKET_POLICY_DENY,
+        ChaosType.SNS_TOPIC_POLICY_RESTRICT,
+        ChaosType.EBS_THROTTLE_IOPS,
+        ChaosType.OPENSEARCH_CLUSTER_CONFIG_MODIFY,
+        ChaosType.VPC_SECURITY_GROUP_MODIFY,
         ChaosType.EC2_TERMINATE,
         ChaosType.VPC_NACL_BLOCK_TRAFFIC,
         ChaosType.SQS_QUEUE_POLICY_RESTRICT,
@@ -537,6 +542,13 @@ CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
 # read/write race. Keep planning, but do not create a fault requiring this recovery.
 CONCURRENCY_UNSAFE_MUTATIONS = frozenset(
     {
+        "s3.put_bucket_policy",
+        "s3.delete_bucket_policy",
+        "sns.set_topic_attributes",
+        "ec2.modify_volume",
+        "opensearch.update_domain_config",
+        "ec2.revoke_security_group_ingress",
+        "ec2.authorize_security_group_ingress",
         "ec2.terminate_instances",
         "ec2.create_network_acl_entry",
         "ec2.delete_network_acl_entry",
@@ -1566,10 +1578,7 @@ class AwsClientProxy:
             if (self._service, name) in PROTECTED_MUTATION_TYPES:
                 self._owner._consume_sdk_request(self._service, name, kwargs)
             if self._owner is not None:
-                if (
-                    not self._owner.dry_run
-                    and f"{self._service}.{name}" in CONCURRENCY_UNSAFE_MUTATIONS
-                ):
+                if f"{self._service}.{name}" in CONCURRENCY_UNSAFE_MUTATIONS:
                     raise SafetyViolation(
                         "Live mutation is disabled: AWS provides no conditional ownership proof for safe concurrent recovery"
                     )
@@ -3174,6 +3183,7 @@ class EBSChaosExperiment(ChaosExperiment):
                         "The selected EBS volume has no IOPS value"
                     )
                 self.volume_id = volume_id
+                self.requested_iops = iops
                 minimum_iops = 3_000 if volume.get("VolumeType") == "gp3" else 100
                 if not minimum_iops <= iops < self.original_iops:
                     raise ConfigurationError(
@@ -3210,6 +3220,9 @@ class EBSChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback EBS experiments"""
+        if self.dry_run:
+            # A simulation authorizes no SDK recovery and proves no live restoration.
+            return
         try:
             if hasattr(self, "volume_id") and hasattr(self, "original_instance"):
                 volumes = self.ec2.describe_volumes(VolumeIds=[self.volume_id]).get(
@@ -3261,12 +3274,8 @@ class EBSChaosExperiment(ChaosExperiment):
                 )
 
             if hasattr(self, "original_iops") and self.original_iops:
-                # Restore original IOPS
-                self.ec2.modify_volume(VolumeId=self.volume_id, Iops=self.original_iops)
-                self._wait_for_iops(self.volume_id, self.original_iops, False)
-                self.rollback_verified = True
-                logger.info(
-                    f"Restored IOPS to {self.original_iops} for volume {self.volume_id}"
+                raise SafetyViolation(
+                    "EBS IOPS live recovery is unsupported; reconcile manually"
                 )
 
         except Exception as e:
@@ -3680,6 +3689,9 @@ class VPCChaosExperiment(ChaosExperiment):
             start_time=utc_now(),
         )
 
+        self.ingress_write_confirmed = False
+        if hasattr(self, "removed_rule"):
+            del self.removed_rule
         try:
             self.group_id = group_id
             groups = self.ec2.describe_security_groups(GroupIds=[group_id]).get(
@@ -3720,19 +3732,24 @@ class VPCChaosExperiment(ChaosExperiment):
             actual_rule = copy.deepcopy(matches[0])
 
             if not self.dry_run:
-                try:
-                    response = self.ec2.revoke_security_group_ingress(
-                        GroupId=group_id, IpPermissions=[actual_rule]
-                    )
-                finally:
-                    remaining = self.ec2.describe_security_groups(
-                        GroupIds=[group_id]
-                    ).get("SecurityGroups", [])
-                    if len(remaining) == 1 and not any(
+                self.ingress_write_confirmed = False
+                response = self.ec2.revoke_security_group_ingress(
+                    GroupId=group_id, IpPermissions=[actual_rule]
+                )
+                remaining = self.ec2.describe_security_groups(GroupIds=[group_id]).get(
+                    "SecurityGroups", []
+                )
+                if (
+                    response.get("Return") is True
+                    and not response.get("UnknownIpPermissions")
+                    and len(remaining) == 1
+                    and not any(
                         permission_identity(rule) == wanted
                         for rule in remaining[0].get("IpPermissions", [])
-                    ):
-                        self.removed_rule = actual_rule
+                    )
+                ):
+                    self.removed_rule = actual_rule
+                    self.ingress_write_confirmed = True
                 if not hasattr(self, "removed_rule") or response.get(
                     "UnknownIpPermissions"
                 ):
@@ -3954,6 +3971,9 @@ class VPCChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback VPC experiments"""
+        if self.dry_run:
+            # A simulation authorizes no SDK recovery and proves no live restoration.
+            return
         try:
             if hasattr(self, "original_association_id") and hasattr(
                 self, "original_nacl_id"
@@ -4031,11 +4051,9 @@ class VPCChaosExperiment(ChaosExperiment):
                 logger.info("Restored route table")
 
             if hasattr(self, "group_id") and hasattr(self, "removed_rule"):
-                # Re-add the removed rule
-                self.ec2.authorize_security_group_ingress(
-                    GroupId=self.group_id, IpPermissions=[self.removed_rule]
+                raise SafetyViolation(
+                    "Security-group live recovery is unsupported; reconcile manually"
                 )
-                logger.info(f"Restored rule to security group: {self.group_id}")
 
             if hasattr(self, "nacl_id") and hasattr(self, "rule_number"):
                 # Remove the deny rule
@@ -5179,6 +5197,9 @@ class S3ChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Restore only owned S3 changes, refusing conflicting concurrent state."""
+        if self.dry_run:
+            # A simulation authorizes no SDK recovery and proves no live restoration.
+            return
         if hasattr(self, "owned_lifecycle"):
             raise SafetyViolation(
                 "Lifecycle expiration is irreversible; settings restoration cannot recover deleted objects"
@@ -5187,30 +5208,9 @@ class S3ChaosExperiment(ChaosExperiment):
             return
         bucket = self.bucket_name
         if hasattr(self, "owned_policy_statement"):
-            current = self.s3.get_bucket_policy(Bucket=bucket)["Policy"]
-            restored = remove_owned_policy_statement(
-                current, self.owned_policy_statement
+            raise SafetyViolation(
+                "S3 policy live recovery is unsupported; reconcile manually"
             )
-            if restored != json.loads(current):
-                if restored["Statement"]:
-                    self.s3.put_bucket_policy(
-                        Bucket=bucket, Policy=json.dumps(restored)
-                    )
-                    observed = json.loads(
-                        self.s3.get_bucket_policy(Bucket=bucket)["Policy"]
-                    )
-                    if observed != restored:
-                        raise SafetyViolation("S3 policy recovery is not verified")
-                else:
-                    self.s3.delete_bucket_policy(Bucket=bucket)
-                    try:
-                        self.s3.get_bucket_policy(Bucket=bucket)
-                    except self.s3.exceptions.ClientError as error:
-                        if error.response["Error"]["Code"] != "NoSuchBucketPolicy":
-                            raise
-                    else:
-                        raise SafetyViolation("S3 policy deletion is not verified")
-            self.rollback_verified = True
         if hasattr(self, "original_versioning"):
             current = self.s3.get_bucket_versioning(Bucket=bucket).get("Status")
             if restoration_required(current, self.original_versioning, "Suspended"):
@@ -5643,6 +5643,9 @@ class SNSChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback SNS experiments"""
+        if self.dry_run:
+            # A simulation authorizes no SDK recovery and proves no live restoration.
+            return
         try:
             if hasattr(self, "subscription_request") and self.mutation_attempts:
                 # Re-create subscription
@@ -5652,26 +5655,9 @@ class SNSChaosExperiment(ChaosExperiment):
                 )
 
             if hasattr(self, "topic_arn") and hasattr(self, "owned_policy_statement"):
-                current = self.sns.get_topic_attributes(TopicArn=self.topic_arn)[
-                    "Attributes"
-                ]["Policy"]
-                restored = remove_owned_policy_statement(
-                    current, self.owned_policy_statement
+                raise SafetyViolation(
+                    "SNS policy live recovery is unsupported; reconcile manually"
                 )
-                if restored != json.loads(current):
-                    self.sns.set_topic_attributes(
-                        TopicArn=self.topic_arn,
-                        AttributeName="Policy",
-                        AttributeValue=json.dumps(restored),
-                    )
-                observed = json.loads(
-                    self.sns.get_topic_attributes(TopicArn=self.topic_arn)[
-                        "Attributes"
-                    ]["Policy"]
-                )
-                if observed != restored:
-                    raise SafetyViolation("SNS policy recovery is not verified")
-                self.rollback_verified = True
 
         except Exception as e:
             logger.error(f"Error during SNS rollback: {e}")
@@ -6710,28 +6696,15 @@ class OpenSearchChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback OpenSearch experiments"""
+        if self.dry_run:
+            # A simulation authorizes no SDK recovery and proves no live restoration.
+            return
         try:
             if hasattr(self, "original_instance_count") and hasattr(
                 self, "domain_name"
             ):
-                current = self._wait_for_domain_idle(self.domain_name, False)
-                current_count = current.get("ClusterConfig", {}).get("InstanceCount")
-                if current_count != self.original_instance_count:
-                    self.opensearch.update_domain_config(
-                        DomainName=self.domain_name,
-                        ClusterConfig={"InstanceCount": self.original_instance_count},
-                    )
-                    restored = self._wait_for_domain_idle(self.domain_name, False)
-                    if (
-                        restored.get("ClusterConfig", {}).get("InstanceCount")
-                        != self.original_instance_count
-                    ):
-                        raise RuntimeError(
-                            "OpenSearch rollback could not verify the data-node count"
-                        )
-                self.rollback_verified = True
-                logger.info(
-                    f"Restored instance count to {self.original_instance_count}"
+                raise SafetyViolation(
+                    "OpenSearch scalar live recovery is unsupported; reconcile manually"
                 )
 
         except Exception as e:
@@ -6947,6 +6920,33 @@ class WAFChaosExperiment(ChaosExperiment):
                 request[field_name] = web_acl[field_name]
         self.wafv2.update_web_acl(**request)
 
+    def _confirm_rule_write(self) -> None:
+        response = self.wafv2.get_web_acl(
+            Scope=self.web_acl_scope, Name=self.web_acl_name, Id=self.web_acl_id
+        )
+        rules = [
+            rule
+            for rule in response["WebACL"].get("Rules", [])
+            if rule.get("Name") == self.changed_rule_name
+        ]
+        if len(rules) != 1:
+            raise SafetyViolation(
+                "WAF forward result cannot be uniquely verified; reconcile manually"
+            )
+        value = (
+            rules[0].get("Action")
+            if self.changed_rule_field == "Action"
+            else rules[0]
+            .get("Statement", {})
+            .get("RateBasedStatement", {})
+            .get("Limit")
+        )
+        if value != self.changed_rule_value:
+            raise SafetyViolation(
+                "WAF forward post-state was not verified; reconcile manually"
+            )
+        self.rule_write_confirmed = True
+
     def _load_web_acl(
         self,
         web_acl_id: str,
@@ -6981,6 +6981,7 @@ class WAFChaosExperiment(ChaosExperiment):
             start_time=utc_now(),
         )
 
+        self.rule_write_confirmed = False
         try:
             web_acl, lock_token = self._load_web_acl(web_acl_id, web_acl_name, scope)
             action_key = self.ACTIONS.get(action.upper())
@@ -7007,6 +7008,7 @@ class WAFChaosExperiment(ChaosExperiment):
                 self.changed_rule_value = {action_key: {}}
                 matching_rule["Action"] = {action_key: {}}
                 self._web_acl_update(web_acl, lock_token)
+                self._confirm_rule_write()
                 result.affected_resources = [web_acl_id]
                 logger.info(f"Modified rule {rule_name} to {action}")
             else:
@@ -7041,6 +7043,7 @@ class WAFChaosExperiment(ChaosExperiment):
             start_time=utc_now(),
         )
 
+        self.rule_write_confirmed = False
         try:
             web_acl, lock_token = self._load_web_acl(web_acl_id, web_acl_name, scope)
             matching_rule = next(
@@ -7065,6 +7068,7 @@ class WAFChaosExperiment(ChaosExperiment):
                 self.changed_rule_value = limit
                 rate_statement["Limit"] = limit
                 self._web_acl_update(web_acl, lock_token)
+                self._confirm_rule_write()
             result.affected_resources = [web_acl_id]
             result.status = "completed"
 
@@ -7169,6 +7173,10 @@ class WAFChaosExperiment(ChaosExperiment):
         """Rollback WAF experiments"""
         try:
             if hasattr(self, "changed_rule_name") and hasattr(self, "web_acl_id"):
+                if not getattr(self, "rule_write_confirmed", False):
+                    raise SafetyViolation(
+                        "WAF forward write was not confirmed; no cleanup is authorized, reconcile manually"
+                    )
                 response = self.wafv2.get_web_acl(
                     Scope=self.web_acl_scope,
                     Name=self.web_acl_name,

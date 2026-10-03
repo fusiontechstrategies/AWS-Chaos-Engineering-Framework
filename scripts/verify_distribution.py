@@ -20,6 +20,15 @@ if _budget_spec is None or _budget_spec.loader is None:
 archive_budget = importlib.util.module_from_spec(_budget_spec)
 _budget_spec.loader.exec_module(archive_budget)
 
+_source_path = Path(__file__).resolve().with_name("source_files.py")
+_source_spec = importlib.util.spec_from_file_location(
+    "trusted_source_files", _source_path
+)
+if _source_spec is None or _source_spec.loader is None:
+    raise ImportError("Trusted bounded source reader is unavailable")
+source_files = importlib.util.module_from_spec(_source_spec)
+_source_spec.loader.exec_module(source_files)
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10; supplied by the pinned build lock.
@@ -62,6 +71,9 @@ APPROVED_SOURCE_PATHS = frozenset(
         "requirements-runtime-lock.txt",
         "requirements.txt",
         "scripts/archive_budget.py",
+        "scripts/download_release_artifact.py",
+        "scripts/source_files.py",
+        "tests/test_final_five_boundaries.py",
         "scripts/create_verified_draft.py",
         "scripts/normalize_sdist.py",
         "scripts/normalize_wheel.py",
@@ -101,11 +113,10 @@ GENERATED_SDIST_PATHS = frozenset({"PKG-INFO", "setup.cfg"}) | {
 
 
 def _approved_project(repository_root: Path) -> dict:
-    pyproject = repository_root / "pyproject.toml"
-    if pyproject.is_symlink() or pyproject.stat().st_size > 1_048_576:
-        raise ValueError("unsafe packaging metadata source")
     try:
-        document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        document = tomllib.loads(
+            source_files.read_text(repository_root, "pyproject.toml", 1_048_576)
+        )
     except (ValueError, UnicodeError) as exc:
         raise ValueError("invalid packaging metadata") from exc
     if document.get("build-system") != APPROVED_BUILD_SYSTEM:
@@ -139,7 +150,10 @@ def _approved_project(repository_root: Path) -> dict:
         or project.get("requires-python") != ">=3.10,<3.15"
         or not isinstance(project.get("version"), str)
         or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", project["version"])
-        or any((repository_root / name).exists() for name in ("setup.py", "setup.cfg"))
+        or any(
+            source_files.is_present(repository_root, name)
+            for name in ("setup.py", "setup.cfg")
+        )
     ):
         raise ValueError("unreviewed static project metadata or legacy build hook")
     return project
@@ -150,12 +164,15 @@ def _project_version(pyproject_path: Path) -> str:
 
 
 def _approved_source_files(repository_root: Path) -> set[str]:
-    if (repository_root / "MANIFEST.in").read_text(
-        encoding="utf-8"
-    ).strip() != APPROVED_MANIFEST:
+    if (
+        source_files.read_text(repository_root, "MANIFEST.in", 65_536).strip()
+        != APPROVED_MANIFEST
+    ):
         raise ValueError("source manifest differs from the trusted packaging policy")
     reviewed = {
-        name for name in APPROVED_SOURCE_PATHS if (repository_root / name).exists()
+        name
+        for name in APPROVED_SOURCE_PATHS
+        if source_files.is_present(repository_root, name)
     }
     required = {
         MODULE_NAME,
@@ -172,14 +189,15 @@ def _approved_source_files(repository_root: Path) -> set[str]:
         raise ValueError("selected source is missing required packaging inputs")
     # Historical release notes are data. Only one leaf with a canonical version
     # name is permitted; source-controlled patterns never extend executable paths.
-    for path in (repository_root / ".github/release-notes").glob("*.md"):
-        if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+\.md", path.name):
-            raise ValueError("unreviewed release-note filename")
-        reviewed.add(path.relative_to(repository_root).as_posix())
+    if source_files.is_present(
+        repository_root, ".github/release-notes", directory=True
+    ):
+        for name in source_files.source_names(repository_root, ".github/release-notes"):
+            if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+\.md", name):
+                raise ValueError("unreviewed release-note filename")
+            reviewed.add(".github/release-notes/" + name)
     for name in reviewed:
-        path = repository_root / name
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > 8_388_608:
-            raise ValueError("source packaging input is not a bounded regular file")
+        source_files.read_bytes(repository_root, name)
     return reviewed
 
 
@@ -211,7 +229,7 @@ def _verify_package_metadata(
         raise ValueError(
             "generated package metadata differs from static project metadata"
         )
-    readme = _normal_text((repository_root / "README.md").read_bytes())
+    readme = _normal_text(source_files.read_bytes(repository_root, "README.md"))
     if message.get_payload().rstrip("\n") != readme.rstrip("\n"):
         raise ValueError("generated package description differs from static README")
     if set(project["dependencies"]) != _runtime_requirements(
@@ -237,7 +255,9 @@ def _assert_safe_names(names: list[str]) -> None:
 def _runtime_requirements(requirements_path: Path) -> set[str]:
     return {
         line.strip()
-        for line in requirements_path.read_text(encoding="utf-8").splitlines()
+        for line in source_files.read_text(
+            requirements_path.parent, requirements_path.name, 1_048_576
+        ).splitlines()
         if line.strip() and not line.lstrip().startswith(("#", "-r "))
     }
 
@@ -292,7 +312,7 @@ def validate_entry_points(entry_points: str, repository_root: Path) -> None:
         or dict(parser["console_scripts"]) != expected
     ):
         raise ValueError("wheel entry point metadata is ambiguous")
-    project = (repository_root / "pyproject.toml").read_text(encoding="utf-8")
+    project = source_files.read_text(repository_root, "pyproject.toml", 1_048_576)
     tables = re.findall(r"(?ms)^\[project\.scripts\]\s*\n(.*?)(?=^\[|\Z)", project)
     if (
         len(tables) != 1
@@ -339,7 +359,7 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
         validate_record(values, info + "RECORD")
         if MODULE_NAME not in names:
             raise ValueError(f"wheel is missing {MODULE_NAME}")
-        if values[MODULE_NAME] != (repository_root / MODULE_NAME).read_bytes():
+        if values[MODULE_NAME] != source_files.read_bytes(repository_root, MODULE_NAME):
             raise ValueError(
                 "wheel runtime module does not match the repository source"
             )
@@ -439,9 +459,8 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
             contents = archive_budget.read_member(stream, member.size, budget)
             if len(contents) != member.size:
                 raise ValueError("source distribution member size differs from bytes")
-            if (
-                relative in reviewed
-                and contents != (repository_root / relative).read_bytes()
+            if relative in reviewed and contents != source_files.read_bytes(
+                repository_root, relative
             ):
                 raise ValueError(
                     f"source distribution content differs from the repository: {relative}"
@@ -493,7 +512,7 @@ def main() -> None:
     args = parser.parse_args()
     repository_root = (
         args.repository_root or Path(__file__).resolve().parents[1]
-    ).resolve()
+    ).absolute()
     wheel, sdist = verify_distribution(args.dist_dir.resolve(), repository_root)
     print(f"Verified {wheel.name}")
     print(f"Verified {sdist.name}")

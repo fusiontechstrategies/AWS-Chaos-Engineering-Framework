@@ -144,86 +144,22 @@ def test_ec2_termination_creates_no_implicit_volume_copies():
     )
 
 
-def test_staggered_same_volume_workers_restore_the_authoritative_pre_state():
+def test_same_volume_workers_cannot_dispatch_planning_only_iops_changes():
     aws = FakeAWS(reject_writes=False)
-    baseline = aws.respond("ec2", "describe_volumes", {})
-    baseline["Volumes"][0]["Iops"] = 3000
-    state = copy.deepcopy(baseline)
-    original = aws.respond
-    first_mutated = threading.Event()
-    release_first = threading.Event()
-    second_started = threading.Event()
-    second_mutated = threading.Event()
-    writes = []
-    captures = []
-
-    def model(service, operation, request):
-        if service == "ec2" and operation == "describe_volumes":
-            aws.calls.append((service, operation, request))
-            captures.append(state["Volumes"][0]["Iops"])
-            return copy.deepcopy(state)
-        if service == "ec2" and operation == "modify_volume":
-            aws.calls.append((service, operation, request))
-            value = request["Iops"]
-            state["Volumes"][0]["Iops"] = value
-            writes.append(value)
-            if value == 100:
-                first_mutated.set()
-                assert release_first.wait(5)
-            if value == 200:
-                second_mutated.set()
-            return {}
-        return original(service, operation, request)
-
-    aws.respond = model
-    first, second = worker(aws), worker(aws)
-    # Separate orchestrators and direct worker calls exercise the process-wide
-    # guard, beyond the live suite's single-worker scheduler.
-    results = []
-    failures = []
-
-    def run(item, value):
-        try:
-            if value == 200:
-                second_started.set()
-            results.append(
-                item._run_single_experiment(
-                    {
-                        "type": "ebs_throttle_iops",
-                        "volume_id": "vol-0123456789abcdef0",
-                        "iops": value,
-                        "auto_rollback": True,
-                    }
-                )
-            )
-        except Exception as error:
-            failures.append(error)
-
-    threads = [
-        threading.Thread(target=run, args=(first, 100)),
-        threading.Thread(target=run, args=(second, 200)),
-    ]
-    threads[0].start()
-    try:
-        assert first_mutated.wait(5)
-        threads[1].start()
-        assert second_started.wait(5)
-        assert not second_mutated.wait(0.15)
-    finally:
-        release_first.set()
-        for thread in threads:
-            if thread.ident:
-                thread.join(5)
-    assert not failures
-    assert all(not thread.is_alive() for thread in threads)
-    assert len(results) == 2
-    assert all(
-        result.status == "completed" and result.rollback_successful
-        for result in results
-    )
-    assert state["Volumes"][0]["Iops"] == 3000
-    assert writes == [100, 3000, 200, 3000]
-    assert captures[0] == 3000
+    for value in (100, 200):
+        item = worker(aws)
+        result = item._run_single_experiment(
+            {
+                "type": "ebs_throttle_iops",
+                "volume_id": "vol-0123456789abcdef0",
+                "iops": value,
+                "auto_rollback": True,
+            }
+        )
+        assert result.status == "failed"
+        assert result.rollback_successful is None
+        assert not item.active_experiments
+    assert not aws.calls
 
 
 def synthetic_live_suite(item, experiments, delay=0):
@@ -250,40 +186,43 @@ def synthetic_live_suite(item, experiments, delay=0):
 
 def test_failed_recovery_blocks_continue_policy_and_separate_orchestrators():
     aws = FakeAWS(reject_writes=False)
-    state = aws.respond("ec2", "describe_volumes", {})
-    state["Volumes"][0]["Iops"] = 3000
+    state = aws.respond("lambda", "get_function_configuration", {})
+    state["MemorySize"] = 512
+    state["RevisionId"] = "initial-revision"
     original = aws.respond
     writes = []
 
     def model(service, operation, request):
-        if service == "ec2" and operation == "describe_volumes":
+        if service == "lambda" and operation == "get_function_configuration":
             aws.calls.append((service, operation, request))
             return copy.deepcopy(state)
-        if service == "ec2" and operation == "modify_volume":
+        if service == "lambda" and operation == "update_function_configuration":
             aws.calls.append((service, operation, request))
-            value = request["Iops"]
+            assert request["RevisionId"] == state["RevisionId"]
+            value = request["MemorySize"]
             writes.append(value)
-            if value == 3000:
+            if value == 512:
                 raise RuntimeError("Synthetic recovery failed before restoration")
-            state["Volumes"][0]["Iops"] = value
+            state["MemorySize"] = value
+            state["RevisionId"] = "updated-revision"
             return {}
         return original(service, operation, request)
 
     aws.respond = model
     configs = [
         {
-            "type": "ebs_throttle_iops",
-            "volume_id": "vol-0123456789abcdef0",
-            "iops": value,
+            "type": "lambda_memory_limit",
+            "function_name": "chaos-test-function",
+            "memory_mb": value,
             "auto_rollback": True,
         }
-        for value in (100, 200)
+        for value in (128, 256)
     ]
     first = worker(aws)
     synthetic_live_suite(first, configs)
     assert not first.run_experiment_suite("synthetic")
-    assert writes == [100, 3000]
-    assert state["Volumes"][0]["Iops"] == 100
+    assert writes == [128, 512]
+    assert state["MemorySize"] == 128
     assert len(first.results) == 1
     assert first.results[0].rollback_successful is False
     assert first.safety_controller.emergency_stop.is_set()
@@ -302,9 +241,9 @@ def test_disabled_live_automatic_recovery_is_rejected_before_sdk_calls():
     with pytest.raises(framework.SafetyViolation, match="cannot be disabled"):
         item._run_single_experiment(
             {
-                "type": "ebs_throttle_iops",
-                "volume_id": "vol-0123456789abcdef0",
-                "iops": 100,
+                "type": "lambda_memory_limit",
+                "function_name": "chaos-test-function",
+                "memory_mb": 128,
                 "auto_rollback": False,
             }
         )
@@ -316,20 +255,20 @@ def test_live_interexperiment_delay_starts_after_recovery_completes():
     item = worker(FakeAWS())
     configs = [
         {
-            "type": "ebs_throttle_iops",
-            "volume_id": "vol-0123456789abcdef0",
-            "iops": value,
+            "type": "lambda_memory_limit",
+            "function_name": "chaos-test-function",
+            "memory_mb": value,
         }
-        for value in (100, 200)
+        for value in (128, 256)
     ]
     synthetic_live_suite(item, configs, delay=7)
     trace = []
 
     def run(config):
-        trace.append(f"recovered-{config['iops']}")
+        trace.append(f"recovered-{config['memory_mb']}")
         return framework.ExperimentResult(
             "synthetic",
-            framework.ChaosType.EBS_THROTTLE_IOPS,
+            framework.ChaosType.LAMBDA_MEMORY_LIMIT,
             framework.utc_now(),
             status="completed",
             rollback_successful=True,
@@ -340,7 +279,7 @@ def test_live_interexperiment_delay_starts_after_recovery_completes():
         trace.append(f"delay-{seconds}") or False
     )
     assert item.run_experiment_suite("synthetic")
-    assert trace == ["recovered-100", "delay-7", "recovered-200"]
+    assert trace == ["recovered-128", "delay-7", "recovered-256"]
 
 
 @pytest.mark.parametrize(
