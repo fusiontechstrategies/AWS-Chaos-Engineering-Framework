@@ -7,6 +7,7 @@ import argparse
 import base64
 import csv
 import hashlib
+import importlib.util
 import io
 import os
 import re
@@ -16,6 +17,15 @@ import time
 import unicodedata
 import zipfile
 from pathlib import Path, PurePosixPath
+
+_budget_path = Path(__file__).resolve().with_name("archive_budget.py")
+_budget_spec = importlib.util.spec_from_file_location(
+    "trusted_archive_budget", _budget_path
+)
+if _budget_spec is None or _budget_spec.loader is None:
+    raise ImportError("Trusted archive budget helper is unavailable")
+archive_budget = importlib.util.module_from_spec(_budget_spec)
+_budget_spec.loader.exec_module(archive_budget)
 
 WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -82,12 +92,9 @@ def sha256_record_digest(value: bytes) -> str:
 
 
 def validate_record(values: dict[str, bytes], record_name: str) -> None:
-    try:
-        rows = list(
-            csv.reader(io.StringIO(values[record_name].decode("utf-8"), newline=""))
-        )
-    except UnicodeDecodeError as error:
-        raise WheelNormalizationError("Wheel RECORD is not UTF-8") from error
+    rows = list(
+        archive_budget.record_rows(values[record_name], WheelNormalizationError)
+    )
     recorded: dict[str, tuple[str, str]] = {}
     for row in rows:
         require(len(row) == 3, "Wheel RECORD contains a malformed row")
@@ -149,7 +156,8 @@ def expected_timestamp(source_date_epoch: int) -> tuple[int, int, int, int, int,
 def read_values(path: Path) -> dict[str, bytes]:
     values: dict[str, bytes] = {}
     portable_names: set[str] = set()
-    with zipfile.ZipFile(path) as archive:
+    with archive_budget.open_zip(path, WheelNormalizationError) as archive:
+        budget = archive_budget.MemberBudget()
         for member in archive.infolist():
             name = validate_member_name(member.filename)
             require(name not in values, f"Wheel contains a duplicate member: {name!r}")
@@ -167,7 +175,7 @@ def read_values(path: Path) -> dict[str, bytes]:
                 not stat.S_ISLNK(member.external_attr >> 16),
                 f"Wheel contains a symbolic link: {name!r}",
             )
-            value = archive.read(member)
+            value = archive_budget.read_zip_member(archive, member, budget)
             require(
                 len(value) == member.file_size, f"Wheel member is truncated: {name!r}"
             )
@@ -178,13 +186,14 @@ def read_values(path: Path) -> dict[str, bytes]:
 def verify_normalized(
     path: Path, expected_values: dict[str, bytes], timestamp: tuple[int, ...]
 ) -> None:
-    with zipfile.ZipFile(path) as archive:
+    with archive_budget.open_zip(path, WheelNormalizationError) as archive:
         require(archive.comment == b"", "Wheel has a noncanonical archive comment")
         members = archive.infolist()
         require(
             [member.filename for member in members] == sorted(expected_values),
             "Wheel members are not sorted",
         )
+        budget = archive_budget.MemberBudget()
         for member in members:
             name = member.filename
             require(
@@ -209,7 +218,8 @@ def verify_normalized(
                 f"Wheel member has a noncanonical mode: {name!r}",
             )
             require(
-                archive.read(member) == expected_values[name],
+                archive_budget.read_zip_member(archive, member, budget)
+                == expected_values[name],
                 f"Wheel member changed during normalization: {name!r}",
             )
 
@@ -258,7 +268,7 @@ def normalize_wheel(path: Path, source_date_epoch: int) -> str:
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return archive_budget.file_digest(path)
 
 
 def main() -> int:

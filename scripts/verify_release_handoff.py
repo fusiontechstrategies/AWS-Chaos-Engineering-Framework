@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import importlib.util
-import io
 import json
 import re
 import sys
-import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
@@ -28,36 +25,25 @@ def load_trusted_helper(name):
     return module
 
 
+archive_budget = load_trusted_helper("archive_budget")
+
+
 def preflight_archives(directory):
-    """Bound decoder output before the existing canonical archive verifier reads it."""
+    """Use the same pre-parser budgets as normalization and trusted verification."""
     for path in directory.iterdir():
         if path.name.endswith(".whl"):
-            # Canonical wheels are stored, so decoder expansion is not permitted.
-            with zipfile.ZipFile(path) as archive:
-                members = archive.infolist()
-                if (
-                    len(members) > 10000
-                    or any(
-                        m.compress_type != zipfile.ZIP_STORED
-                        or m.file_size > MAX_ASSET_BYTES
-                        for m in members
-                    )
-                    or sum(m.file_size for m in members) > MAX_TOTAL_BYTES
+            with archive_budget.open_zip(
+                path,
+                max_member_bytes=MAX_ASSET_BYTES,
+                max_expanded_bytes=MAX_TOTAL_BYTES,
+            ) as archive:
+                if any(
+                    m.compress_type != zipfile.ZIP_STORED for m in archive.infolist()
                 ):
-                    raise ValueError("Wheel handoff exceeds archive budget")
+                    raise ValueError("Wheel handoff is not stored canonically")
         else:
-            with gzip.open(path, "rb") as stream:
-                decoded = stream.read(MAX_TOTAL_BYTES + 1)
-            if len(decoded) > MAX_TOTAL_BYTES:
-                raise ValueError("Source handoff exceeds decoded archive budget")
-            with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:") as archive:
-                members = archive.getmembers()
-                if (
-                    len(members) > 10000
-                    or any(m.size < 0 or m.size > MAX_ASSET_BYTES for m in members)
-                    or sum(m.size for m in members) > MAX_TOTAL_BYTES
-                ):
-                    raise ValueError("Source handoff exceeds member budget")
+            with archive_budget.open_tar(path, max_stream_bytes=MAX_TOTAL_BYTES):
+                pass
 
 
 def verify_run_identity(run, artifact_pages, run_id, commit, repository):
