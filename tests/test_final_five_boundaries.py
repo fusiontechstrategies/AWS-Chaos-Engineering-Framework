@@ -417,3 +417,70 @@ def test_protected_jobs_consume_only_verifier_uploaded_artifact():
         for job in jobs.values()
         for s in job["steps"]
     )
+
+
+@pytest.mark.parametrize(
+    "fail_on,body_failure", [(None, False), (None, True), (2, False), (4, False)]
+)
+def test_posix_descriptor_chain_closes_acquired_objects_on_every_exit(
+    monkeypatch, fail_on, body_failure
+):
+    """Synthetic descriptor identities prove unwinding, not native hostile paths."""
+    from pathlib import PurePosixPath
+
+    acquired = []
+    closed = []
+    calls = []
+
+    def open_descriptor(path, flags, *, dir_fd=None):
+        calls.append((path, flags, dir_fd))
+        if len(calls) == fail_on:
+            raise OSError("ordinary acquisition failure")
+        descriptor = 100 + len(calls)
+        acquired.append(descriptor)
+        return descriptor
+
+    fake_os = SimpleNamespace(
+        name="posix",
+        O_RDONLY=0,
+        O_DIRECTORY=0x10000,
+        O_NOFOLLOW=0x20000,
+        O_NONBLOCK=0x40000,
+        open=open_descriptor,
+        close=closed.append,
+    )
+    monkeypatch.setattr(source_files, "os", fake_os)
+    if fail_on or body_failure:
+        with (
+            pytest.raises(OSError, match="ordinary"),
+            source_files._file_descriptor(
+                PurePosixPath("/owned/fixture"), ("data.txt",)
+            ),
+        ):
+            if body_failure:
+                raise OSError("ordinary bounded-read failure")
+    else:
+        with source_files._file_descriptor(
+            PurePosixPath("/owned/fixture"), ("data.txt",)
+        ) as descriptor:
+            assert descriptor == acquired[-1]
+            assert not closed
+    assert closed == list(reversed(acquired))
+    assert len(closed) == len(set(closed))
+    assert all(flags & fake_os.O_NOFOLLOW for _, flags, _ in calls)
+    assert calls[0][2] is None
+    for index, (_, _, parent) in enumerate(calls[1:], 1):
+        assert parent == acquired[index - 1]
+
+
+@pytest.mark.parametrize("newline", [b"\r\n", b"\r"])
+def test_admitted_text_matches_universal_newlines_without_altering_source_bytes(
+    tmp_path, newline
+):
+    data = newline.join([b"include README.md", b"include MANIFEST.in", b""])
+    (tmp_path / "MANIFEST.in").write_bytes(data)
+    assert (
+        source_files.read_text(tmp_path, "MANIFEST.in")
+        == "include README.md\ninclude MANIFEST.in\n"
+    )
+    assert source_files.read_bytes(tmp_path, "MANIFEST.in") == data

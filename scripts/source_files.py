@@ -51,7 +51,9 @@ def _limit(limit: int) -> int:
 @contextlib.contextmanager
 def _windows_handle(path: Path, directory: bool):
     import ctypes
-    from ctypes import wintypes
+    import ctypes.wintypes
+
+    wintypes = ctypes.wintypes
 
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = [
@@ -101,6 +103,16 @@ def _windows_handle(path: Path, directory: bool):
 
 
 @contextlib.contextmanager
+def _posix_directory(path, *, dir_fd=None):
+    """Retain one no-follow directory descriptor with explicit native ownership."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
 def _file_descriptor(root: Path, parts: tuple[str, ...]):
     if os.name == "nt":
         import msvcrt
@@ -118,7 +130,9 @@ def _file_descriptor(root: Path, parts: tuple[str, ...]):
             handle = stack.enter_context(_windows_handle(leaf, False))
             # Duplicate before CRT ownership transfers; the native lease stays held.
             import ctypes
-            from ctypes import wintypes
+            import ctypes.wintypes
+
+            wintypes = ctypes.wintypes
 
             kernel = ctypes.WinDLL("kernel32", use_last_error=True)
             kernel.GetCurrentProcess.restype = wintypes.HANDLE
@@ -152,13 +166,12 @@ def _file_descriptor(root: Path, parts: tuple[str, ...]):
             finally:
                 os.close(fd)
     else:
-        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         with contextlib.ExitStack() as stack:
-            parent_fd = os.open(root.anchor, directory_flags)
-            stack.callback(os.close, parent_fd)
+            parent_fd = stack.enter_context(_posix_directory(root.anchor))
             for part in (*root.parts[1:], *parts[:-1]):
-                parent_fd = os.open(part, directory_flags, dir_fd=parent_fd)
-                stack.callback(os.close, parent_fd)
+                parent_fd = stack.enter_context(
+                    _posix_directory(part, dir_fd=parent_fd)
+                )
             fd = os.open(
                 parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
             )
@@ -199,7 +212,9 @@ def read_bytes(root: Path, relative: str, max_bytes: int = MAX_SOURCE_BYTES) -> 
 
 
 def read_text(root: Path, relative: str, max_bytes: int = MAX_SOURCE_BYTES) -> str:
-    return read_bytes(root, relative, max_bytes).decode("utf-8")
+    # Preserve Path.read_text universal-newline semantics after bounded admission.
+    value = read_bytes(root, relative, max_bytes).decode("utf-8")
+    return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def is_present(root: Path, relative: str, directory: bool = False) -> bool:
@@ -231,15 +246,9 @@ def source_names(root: Path, relative: str) -> list[str]:
                 stack.enter_context(_windows_handle(ancestor, True))
             listing = directory
         else:
-            listing = os.open(
-                directory.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            )
-            stack.callback(os.close, listing)
+            listing = stack.enter_context(_posix_directory(directory.anchor))
             for part in directory.parts[1:]:
-                listing = os.open(
-                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=listing
-                )
-                stack.callback(os.close, listing)
+                listing = stack.enter_context(_posix_directory(part, dir_fd=listing))
         with os.scandir(listing) as entries:
             for entry in entries:
                 if len(names) >= MAX_SOURCE_ENTRIES:
