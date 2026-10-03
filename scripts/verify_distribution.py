@@ -5,14 +5,20 @@ from __future__ import annotations
 import argparse
 import base64
 import configparser
-import csv
 import email
 import hashlib
-import io
+import importlib.util
 import re
-import tarfile
-import zipfile
 from pathlib import Path, PurePosixPath
+
+_budget_path = Path(__file__).resolve().with_name("archive_budget.py")
+_budget_spec = importlib.util.spec_from_file_location(
+    "trusted_archive_budget", _budget_path
+)
+if _budget_spec is None or _budget_spec.loader is None:
+    raise ImportError("Trusted archive budget helper is unavailable")
+archive_budget = importlib.util.module_from_spec(_budget_spec)
+_budget_spec.loader.exec_module(archive_budget)
 
 try:
     import tomllib
@@ -55,6 +61,7 @@ APPROVED_SOURCE_PATHS = frozenset(
         "requirements-dev.txt",
         "requirements-runtime-lock.txt",
         "requirements.txt",
+        "scripts/archive_budget.py",
         "scripts/create_verified_draft.py",
         "scripts/normalize_sdist.py",
         "scripts/normalize_wheel.py",
@@ -65,6 +72,7 @@ APPROVED_SOURCE_PATHS = frozenset(
         "scripts/verify_release_handoff.py",
         "scripts/verify_release_integrity.py",
         "tests/conftest.py",
+        "tests/test_archive_budget.py",
         "tests/test_archive_security.py",
         "tests/test_aws_chaos_framework.py",
         "tests/test_final_nine_regressions.py",
@@ -236,15 +244,7 @@ def _runtime_requirements(requirements_path: Path) -> set[str]:
 
 def validate_record(values: dict[str, bytes], record_name: str) -> None:
     """Bind every canonical wheel member to exactly one safe SHA-256 RECORD row."""
-    try:
-        rows = list(
-            csv.reader(
-                io.StringIO(values[record_name].decode("utf-8"), newline=""),
-                strict=True,
-            )
-        )
-    except (UnicodeDecodeError, csv.Error) as exc:
-        raise ValueError("wheel RECORD is malformed") from exc
+    rows = list(archive_budget.record_rows(values[record_name]))
     if len(rows) != len(values):
         raise ValueError("wheel RECORD does not cover the exact member set")
     recorded = {}
@@ -305,7 +305,7 @@ def validate_entry_points(entry_points: str, repository_root: Path) -> None:
 
 def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None:
     _approved_project(repository_root)
-    with zipfile.ZipFile(wheel_path) as archive:
+    with archive_budget.open_zip(wheel_path) as archive:
         names = archive.namelist()
         _assert_safe_names(names)
         info = f"aws_chaos_engineering_framework-{version}.dist-info/"
@@ -331,7 +331,11 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
             or sum(member.file_size for member in members) > 33_554_432
         ):
             raise ValueError("wheel expanded members exceed the verification budget")
-        values = {name: archive.read(name) for name in names}
+        budget = archive_budget.MemberBudget()
+        values = {
+            member.filename: archive_budget.read_zip_member(archive, member, budget)
+            for member in members
+        }
         validate_record(values, info + "RECORD")
         if MODULE_NAME not in names:
             raise ValueError(f"wheel is missing {MODULE_NAME}")
@@ -396,7 +400,8 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
     values = {}
     names = []
     total_size = 0
-    with tarfile.open(sdist_path, mode="r:gz") as archive:
+    with archive_budget.open_tar(sdist_path) as archive:
+        budget = archive_budget.MemberBudget()
         for member in archive:
             names.append(member.name)
             if len(names) > 128:
@@ -431,7 +436,7 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
             stream = archive.extractfile(member)
             if stream is None:
                 raise ValueError("source distribution member is unreadable")
-            contents = stream.read(member.size + 1)
+            contents = archive_budget.read_member(stream, member.size, budget)
             if len(contents) != member.size:
                 raise ValueError("source distribution member size differs from bytes")
             if (

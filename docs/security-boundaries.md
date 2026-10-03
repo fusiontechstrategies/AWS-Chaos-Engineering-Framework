@@ -228,6 +228,39 @@ WAF IP-set recovery removes only addresses introduced by a confirmed successful 
 
 ## Console privacy and publish payloads
 
+### Archive resource admission
+
+Normalization, package verification, release inventory and handoff share the
+independently trusted `scripts/archive_budget.py` reader. It is loaded from its
+exact sibling path, including under isolated Python; installed packages and the
+working directory cannot select an alternate helper. Input bytes are captured
+once into an owned temporary descriptor, so a changed input cannot substitute
+metadata after admission.
+
+Compressed input is capped at 64 MiB. Expanded file data is capped at 8 MiB per
+member and 32 MiB in aggregate, with at most 128 files/directories. ZIP central
+records are checked before constructing `ZipFile`; only stored and DEFLATE
+compression are supported, and multipart/ZIP64 archives are refused. Each ZIP
+member also has a 200:1 expansion limit.
+
+Gzip decoding writes at most 40 MiB to a seekable temporary stream and enforces
+the same 200:1 archive ratio. Before `tarfile` reads metadata, physical TAR headers
+are capped at 384, metadata chains at eight, individual extension metadata at
+64 KiB and aggregate metadata at 1 MiB. PAX records are bounded to 128 per
+extension, names to 4 KiB, and sparse formats are refused. A bounded PAX size must
+equal the physical header's size. Ordinary PAX metadata and long names remain
+supported. The decompressed stream includes headers, padding and end records in
+its budget. Wheel RECORD parsing is separately capped at 128 rows.
+
+Member reads use bounded chunks and verify actual bytes against the admitted
+size. Normalized TAR and gzip output are streamed rather than assembled as a
+second full TAR buffer. Existing canonical content, hash, source-provenance and
+atomic replacement checks remain; failed admission or verification does not
+replace the input. These are fixed resource bounds, not an execution sandbox or
+a claim about arbitrary filesystems. See Python's [ZIP](https://docs.python.org/3/library/zipfile.html),
+[TAR](https://docs.python.org/3/library/tarfile.html) and [gzip](https://docs.python.org/3/library/gzip.html)
+interfaces.
+
 Console target registries are scoped to a run and worker, bounded to 4,096 values,
 and include identifiers of every length. Exact identifier boundaries preserve
 unrelated words. CR, LF, tabs, terminal escapes, and Unicode control characters

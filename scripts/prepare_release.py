@@ -5,10 +5,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-import csv
 import hashlib
 import importlib.util
-import io
 import json
 import re
 import stat
@@ -28,6 +26,7 @@ if _verifier_spec is None or _verifier_spec.loader is None:
 _verifier_module = importlib.util.module_from_spec(_verifier_spec)
 _verifier_spec.loader.exec_module(_verifier_module)
 verify_distribution = _verifier_module.verify_distribution
+archive_budget = _verifier_module.archive_budget
 
 
 PROJECT_DISPLAY_NAME = "AWS Chaos Engineering Framework"
@@ -233,7 +232,7 @@ def wheel_inventory(
     expected_timestamp = list(time.gmtime(max(source_date_epoch, 315532800))[:6])
     expected_timestamp[5] -= expected_timestamp[5] % 2
     expected_zip_timestamp = tuple(expected_timestamp)
-    with zipfile.ZipFile(path) as archive:
+    with archive_budget.open_zip(path, ReleaseError) as archive:
         require(archive.comment == b"", "Wheel has a noncanonical archive comment")
         members = archive.infolist()
         require(
@@ -241,6 +240,7 @@ def wheel_inventory(
             == sorted(member.filename for member in members),
             "Wheel members are not sorted canonically",
         )
+        budget = archive_budget.MemberBudget()
         for member in members:
             name = record_portable_name(member.filename, names, portable_names)
             require(
@@ -275,7 +275,7 @@ def wheel_inventory(
                 stat.S_ISREG(mode) and stat.S_IMODE(mode) == 0o644,
                 f"Wheel member has a noncanonical mode: {name!r}",
             )
-            value = archive.read(member)
+            value = archive_budget.read_zip_member(archive, member, budget)
             require(
                 len(value) == member.file_size, f"Wheel member is truncated: {name!r}"
             )
@@ -295,11 +295,7 @@ def validate_wheel_record(values: dict[str, bytes]) -> None:
     record_names = [name for name in values if name.endswith(".dist-info/RECORD")]
     require(len(record_names) == 1, "Wheel must contain exactly one RECORD file")
     record_name = record_names[0]
-    try:
-        rows = csv.reader(io.StringIO(values[record_name].decode("utf-8"), newline=""))
-        entries = list(rows)
-    except UnicodeDecodeError as error:
-        raise ReleaseError("Wheel RECORD is not UTF-8") from error
+    entries = list(archive_budget.record_rows(values[record_name], ReleaseError))
     recorded: dict[str, tuple[str, str]] = {}
     for row in entries:
         require(len(row) == 3, "Wheel RECORD contains a malformed row")
@@ -349,8 +345,9 @@ def sdist_inventory(
         struct.unpack("<I", gzip_header[4:8])[0] == source_date_epoch,
         "Source-distribution gzip timestamp does not match SOURCE_DATE_EPOCH",
     )
-    with tarfile.open(path, mode="r:gz") as archive:
-        for member in archive.getmembers():
+    with archive_budget.open_tar(path, ReleaseError) as archive:
+        budget = archive_budget.MemberBudget()
+        for member in archive:
             name = record_portable_name(member.name, names, portable_names)
             parts = archive_parts(name)
             require(
@@ -385,7 +382,7 @@ def sdist_inventory(
                 handle is not None,
                 f"Unable to read source-distribution member: {name!r}",
             )
-            value = handle.read()
+            value = archive_budget.read_member(handle, member.size, budget)
             require(
                 len(value) == member.size,
                 f"Source-distribution member is truncated: {name!r}",

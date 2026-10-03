@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import binascii
 import hashlib
+import importlib.util
 import os
 import re
 import struct
@@ -14,6 +15,15 @@ import tempfile
 import unicodedata
 from io import BytesIO
 from pathlib import Path
+
+_budget_path = Path(__file__).resolve().with_name("archive_budget.py")
+_budget_spec = importlib.util.spec_from_file_location(
+    "trusted_archive_budget", _budget_path
+)
+if _budget_spec is None or _budget_spec.loader is None:
+    raise ImportError("Trusted archive budget helper is unavailable")
+archive_budget = importlib.util.module_from_spec(_budget_spec)
+_budget_spec.loader.exec_module(archive_budget)
 
 
 class SdistNormalizationError(RuntimeError):
@@ -47,8 +57,9 @@ def read_members(path: Path) -> list[tuple[tarfile.TarInfo, bytes | None]]:
     members: list[tuple[tarfile.TarInfo, bytes | None]] = []
     names: set[str] = set()
     portable_names: set[str] = set()
-    with tarfile.open(path, mode="r:gz") as archive:
-        for member in archive.getmembers():
+    with archive_budget.open_tar(path, SdistNormalizationError) as archive:
+        budget = archive_budget.MemberBudget()
+        for member in archive:
             validate_member_name(member.name)
             name = member.name.rstrip("/")
             require(name not in names, f"Archive contains a duplicate member: {name!r}")
@@ -67,7 +78,7 @@ def read_members(path: Path) -> list[tuple[tarfile.TarInfo, bytes | None]]:
             if member.isfile():
                 handle = archive.extractfile(member)
                 require(handle is not None, f"Unable to read archive member: {name!r}")
-                value = handle.read()
+                value = archive_budget.read_member(handle, member.size, budget)
                 require(
                     len(value) == member.size, f"Archive member is truncated: {name!r}"
                 )
@@ -101,23 +112,39 @@ def normalize_generated_text(name: str, value: bytes) -> bytes:
     return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
 
 
-def build_stored_gzip(value: bytes, source_date_epoch: int) -> bytes:
-    """Build gzip bytes with fixed-size stored DEFLATE blocks and no zlib variance."""
-    output = bytearray(b"\x1f\x8b\x08\x00")
-    output.extend(struct.pack("<I", source_date_epoch))
-    output.extend(b"\x00\xff")
-    for offset in range(0, len(value), 0xFFFF):
-        block = value[offset : offset + 0xFFFF]
-        final = offset + len(block) == len(value)
-        output.append(1 if final else 0)
-        output.extend(struct.pack("<HH", len(block), len(block) ^ 0xFFFF))
-        output.extend(block)
-    if not value:
-        output.extend(b"\x01\x00\x00\xff\xff")
-    output.extend(
-        struct.pack("<II", binascii.crc32(value) & 0xFFFFFFFF, len(value) & 0xFFFFFFFF)
+def write_stored_gzip(source, output, source_date_epoch: int) -> None:
+    """Stream fixed-size stored DEFLATE blocks without a second full TAR buffer."""
+    output.write(
+        b"\x1f\x8b\x08\x00" + struct.pack("<I", source_date_epoch) + b"\x00\xff"
     )
-    return bytes(output)
+    source.seek(0)
+    block = source.read(0xFFFF)
+    total = crc = 0
+    if not block:
+        output.write(b"\x01\x00\x00\xff\xff")
+    while block:
+        following = source.read(0xFFFF)
+        total += len(block)
+        require(
+            total <= archive_budget.MAX_STREAM_BYTES,
+            "Normalized TAR exceeds its byte budget",
+        )
+        output.write(bytes((0 if following else 1,)))
+        output.write(struct.pack("<HH", len(block), len(block) ^ 0xFFFF))
+        output.write(block)
+        crc = binascii.crc32(block, crc)
+        block = following
+    output.write(struct.pack("<II", crc & 0xFFFFFFFF, total))
+
+
+def build_stored_gzip(value: bytes, source_date_epoch: int) -> bytes:
+    require(
+        len(value) <= archive_budget.MAX_STREAM_BYTES,
+        "Normalized TAR exceeds its byte budget",
+    )
+    output = BytesIO()
+    write_stored_gzip(BytesIO(value), output, source_date_epoch)
+    return output.getvalue()
 
 
 def normalize_sdist(path: Path, source_date_epoch: int) -> str:
@@ -146,36 +173,33 @@ def normalize_sdist(path: Path, source_date_epoch: int) -> str:
     os.close(descriptor)
     temporary_path = Path(temporary_name)
     try:
-        raw_tar = BytesIO()
-        with tarfile.open(
-            fileobj=raw_tar, mode="w", format=tarfile.PAX_FORMAT
-        ) as output:
-            for original, value in sorted(
-                normalized_inputs, key=lambda item: item[0].name
-            ):
-                normalized = tarfile.TarInfo(original.name.rstrip("/"))
-                normalized.mtime = source_date_epoch
-                normalized.uid = 0
-                normalized.gid = 0
-                normalized.uname = ""
-                normalized.gname = ""
-                normalized.pax_headers = {}
-                if original.isdir():
-                    normalized.type = tarfile.DIRTYPE
-                    normalized.mode = 0o755
-                    normalized.size = 0
-                    output.addfile(normalized)
-                else:
-                    require(value is not None, "Regular archive member has no data")
-                    normalized.type = tarfile.REGTYPE
-                    # Source-distribution members are data. Canonicalize their
-                    # mode so mounted filesystems cannot invent executability.
-                    normalized.mode = 0o644
-                    normalized.size = len(value)
-                    output.addfile(normalized, BytesIO(value))
-        temporary_path.write_bytes(
-            build_stored_gzip(raw_tar.getvalue(), source_date_epoch)
-        )
+        with tempfile.TemporaryFile() as raw_tar:
+            with tarfile.open(
+                fileobj=raw_tar, mode="w", format=tarfile.PAX_FORMAT
+            ) as output:
+                for original, value in sorted(
+                    normalized_inputs, key=lambda item: item[0].name
+                ):
+                    normalized = tarfile.TarInfo(original.name.rstrip("/"))
+                    normalized.mtime = source_date_epoch
+                    normalized.uid = 0
+                    normalized.gid = 0
+                    normalized.uname = ""
+                    normalized.gname = ""
+                    normalized.pax_headers = {}
+                    if original.isdir():
+                        normalized.type = tarfile.DIRTYPE
+                        normalized.mode = 0o755
+                        normalized.size = 0
+                        output.addfile(normalized)
+                    else:
+                        require(value is not None, "Regular archive member has no data")
+                        normalized.type = tarfile.REGTYPE
+                        normalized.mode = 0o644
+                        normalized.size = len(value)
+                        output.addfile(normalized, BytesIO(value))
+            with temporary_path.open("wb") as compressed:
+                write_stored_gzip(raw_tar, compressed, source_date_epoch)
         normalized_members = read_members(temporary_path)
         require(
             member_identity(normalized_members) == expected_identity,
@@ -185,7 +209,7 @@ def normalize_sdist(path: Path, source_date_epoch: int) -> str:
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = archive_budget.file_digest(path)
     return digest
 
 
