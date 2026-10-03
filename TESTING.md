@@ -1,28 +1,59 @@
 # Testing
 
-The final scan regression suite uses only synthetic resources. It covers both
-irreversible approval gates, absence of implicit EC2 volume copies, a staggered
-SQS rollback race across two real worker lifecycles, short and scoped target
-redaction, control-character output, all eight report-disclosure combinations,
-and actual post-verification package replacement and isolated-import probes.
-These offline checks do not establish deployed AWS permissions or service behavior.
+All repository and release tests are offline. They use synthetic identifiers,
+ordinary fake clients, actual botocore service models and Stubber, and small
+regular package fixtures. Public CI must never require credentials or contact
+an AWS account. Supported live simulations acquire authority through the actual
+public orchestrator, reviewed configuration and confirmation token. Direct live
+construction, premature/reentrant recovery and raw effectful calls assert early refusal; ordinary approved
+handler dispatch and owned recovery retain positive coverage.
 
-All repository and release tests are offline. They use deterministic fake AWS clients, synthetic identifiers, and generated package fixtures. Public CI must never require credentials or contact an AWS account.
+The final scan regression suite covers dual irreversible approval, absence of
+implicit EC2 volume copies, failed recovery latching, sequential recovery timing,
+scoped target redaction, control-character output and all eight report-disclosure
+combinations. Two historical method names remain for their defensive invariants:
+`test_actual_tag_verifier_replacement_cannot_survive_publish_digest_check` now
+uses a small ordinary copied-payload byte mismatch and the real current digest
+verifier; `test_publish_checker_is_isolated_from_tag_imports_and_binds_source_identity`
+now uses the real current isolated CLI from an empty directory, a static workflow
+launch assertion, and the original source-identity and exact member-set refusals.
+These methods do not execute generated replacement helpers or hostile shadow
+modules. Earlier runtime-v3 success is historical execution evidence and does not
+clear this final methodology.
 
-`tests/test_latest_main_four_regressions.py` covers the approved static sdist
-backend/member policy and generated metadata tampering without executing hostile
-build hooks. Real botocore service models and Stubber validate S3 owner-bound
-request shapes and 403 refusal without network calls. Deterministic threaded and
-same-thread signal simulations exercise stop admission, latch activation,
-in-flight completion and continued recovery. Redaction cases include complete
-registered account-prefixed targets and longer unregistered ARN controls.
-Actual SDK Stubber controls also cover effectful StepFunctions TestState,
-ElastiCache TestFailover, CodeCommit TestRepositoryTriggers and STS
-GetSessionToken before/after stop, without an owner, in plan/recovery mode, and
-with tracked live admission. Reviewed safety/identity reads remain available
-after stop; only reviewed EC2 inventory paginator operations can return delegates.
-SDK protocol controls cover real client `hasattr`, `getattr` defaults, unknown
-attributes, call-time unsupported-method refusal and unchanged stop/tracking.
+`tests/test_latest_main_four_regressions.py` retains exact static sdist
+backend/member/metadata policy refusals without running selected helpers.
+Actual botocore models validate owner-bound S3 reads, deletion and 403 refusal.
+Deterministic mocked lifecycle ordering and same-thread signals exercise stop
+admission, latch activation, in-flight completion and continued owned recovery.
+The old repeated Barrier race keeps its test name but uses deterministic
+lifecycle controls. Additional ordinary provider callbacks assert that public
+recovery refuses during forward work and nested recovery; successful and
+ambiguous-failure forward handlers then retain actual sequential owned recovery
+and separate phase accounting. These controls do not reproduce a thread race. Effectful read-like raw operations assert admission refusal;
+actual approved EC2 handler dispatch supplies the supported tracking counterpart.
+Reviewed identity/safety reads and narrow EC2 inventory paginators remain usable
+after stop. SDK protocol checks retain `hasattr`, `getattr` defaults, unknown
+attributes and call-time unsupported-method refusal.
+
+`tests/test_trusted_release_promotion.py` copies and builds the exact current
+tracked corrected source. Its preserved historical import test names check the
+real current verifier/helper origins and run the current isolated handoff CLI
+from an empty directory. No tagged or shadow modules execute. Its decoder budget
+case uses tiny valid regular TAR data and a small decode limit; the positive
+six-asset handoff, actual identity/member/digest refusals and draft cleanup gates
+remain. The final signed package gate separately binds the actual signed commit.
+Historical old-HEAD build and shadow-module setup evidence does not clear these
+current methods.
+
+Archive tests retain their named defensive invariants using small valid regular
+archives, deterministic small size/count limits and modeled decoder, member-type
+and metadata failures. They do not construct corrupt decoder streams, link or
+special-file archives, alternate-parser probes, source growth, shadow helpers or
+exhaustion demonstrations. These controls establish exercised current admission
+and refusal decisions. Native exploit, corrupt-stream, hostile-import, link and
+race behavior is outside this evidence; deployed AWS permissions and service
+behavior are not established.
 
 ## 2.0.3 release-readiness gate
 

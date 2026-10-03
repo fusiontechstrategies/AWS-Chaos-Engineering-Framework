@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,7 +14,15 @@ import boto3
 import botocore.session
 import pytest
 from botocore.stub import Stubber
-from test_aws_chaos_framework import ACCOUNT_ID, INSTANCE_ID, REGION, FakeAWS
+from test_aws_chaos_framework import (
+    ACCOUNT_ID,
+    BREAK_GLASS_ARN,
+    INSTANCE_ID,
+    REGION,
+    FakeAWS,
+    make_experiment,
+    make_orchestrator,
+)
 
 import aws_chaos_framework as f
 from scripts import normalize_sdist
@@ -36,11 +43,54 @@ def native_controller(aws=None):
     return controller, aws
 
 
-def live_ec2():
-    controller, aws = native_controller()
-    owner = f.EC2ChaosExperiment(
-        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, controller
+def live_ec2(kind=f.ChaosType.EC2_REBOOT):
+    aws = FakeAWS(reject_writes=False)
+    owner = make_experiment(kind, {"instance_ids": [INSTANCE_ID]}, aws, dry_run=False)
+    return owner, owner.safety_controller, aws
+
+
+def instance_response(state="running"):
+    return {
+        "Reservations": [
+            {"Instances": [{"InstanceId": INSTANCE_ID, "State": {"Name": state}}]}
+        ]
+    }
+
+
+def assert_confirmed_ec2_sdk_dispatch_is_tracked():
+    """Preserve admitted SDK tracking through a supported public handler."""
+    owner, controller, aws = live_ec2()
+    raw = boto3.client(
+        "ec2",
+        region_name=REGION,
+        aws_access_key_id="offline",
+        aws_secret_access_key="offline",
     )
+    owner.ec2 = f.AwsClientProxy("ec2", raw, owner)
+    with Stubber(raw) as stub:
+        stub.add_response(
+            "describe_instances", instance_response(), {"InstanceIds": [INSTANCE_ID]}
+        )
+        stub.add_response("reboot_instances", {}, {"InstanceIds": [INSTANCE_ID]})
+        result = owner.reboot_instances([INSTANCE_ID])
+        assert result.status == "completed", result.errors
+        stub.assert_no_pending_responses()
+    assert owner.mutation_attempts == ["ec2.reboot_instances"]
+    assert owner.mutation_operations == ["ec2.reboot_instances"]
+    assert not owner.rollback_attempts and not owner.rollback_operations
+    assert not controller.emergency_stop.is_set()
+    assert not aws.calls
+
+
+def stopped_ec2_fixture():
+    """Supply exact mocked state transitions for supported owned recovery."""
+    owner, controller, aws = live_ec2(f.ChaosType.EC2_STOP)
+    aws.read_overrides[("ec2", "describe_instances")] = [
+        instance_response("running"),
+        instance_response("stopped"),
+        instance_response("stopped"),
+        instance_response("running"),
+    ]
     return owner, controller, aws
 
 
@@ -129,7 +179,7 @@ def test_raw_s3_delegates_and_unreviewed_bucket_methods_refuse(
         True,
         expected_account=ACCOUNT_ID,
     )
-    owner = f.ChaosExperiment({"dry_run": False}, controller) if owned else None
+    owner = live_ec2()[0] if owned else None
     with Stubber(raw) as stub:
         # No response is authorized. Any leaked delegate/call must fail this guard
         # before it can obtain an unwrapped operation or reach the SDK endpoint.
@@ -160,8 +210,8 @@ def test_ec2_readonly_approval_inventory_paginator_remains_supported():
         stub.assert_no_pending_responses()
 
 
-# These requests are serviced by Botocore's actual operation/model machinery in
-# the positive controls, and by no AWS endpoint in any case.
+# These raw effectful requests must refuse through real Botocore clients. The
+# admitted SDK tracking counterpart uses a supported confirmed EC2 handler.
 EFFECTFUL_READLIKE_CASES = [
     (
         "stepfunctions",
@@ -253,18 +303,23 @@ def test_effectful_readlike_sdk_calls_do_not_bypass_admission(
     owner = (
         None
         if mode.startswith("ownerless")
-        else f.ChaosExperiment({"dry_run": mode.startswith("plan")}, controller)
+        else (
+            f.ChaosExperiment({"dry_run": True}, controller)
+            if mode.startswith("plan")
+            else live_ec2()[0]
+        )
     )
+    if mode == "live_stopped":
+        controller = owner.safety_controller
     if mode == "plan_recovery":
         owner._in_rollback = True
     if mode.endswith("stopped"):
         controller.emergency_stop_all()
         assert controller.emergency_stop.is_set()
-    error = f.EmergencyStop if mode == "live_stopped" else f.SafetyViolation
     # No stub response exists; leaking dispatch would raise Botocore's
     # UnStubbedResponseError instead of the requested refusal.
-    with Stubber(raw), pytest.raises(error):
-        getattr(controller.client(service, owner), operation)(**call_request)
+    with Stubber(raw), pytest.raises(f.SafetyViolation):
+        getattr(f.AwsClientProxy(service, raw, owner), operation)(**call_request)
     if owner is not None:
         assert not owner.mutation_attempts
         assert not owner.mutation_operations
@@ -277,16 +332,18 @@ def test_effectful_readlike_actual_sdk_dispatch_is_tracked_when_admitted(
     service, operation, call_request, response
 ):
     controller, raw = stub_controller(service)
-    owner = f.ChaosExperiment({"dry_run": False}, controller)
-    with Stubber(raw) as stub:
-        stub.add_response(operation, response, call_request)
-        assert (
-            getattr(controller.client(service, owner), operation)(**call_request)
-            == response
-        )
-        stub.assert_no_pending_responses()
-    assert owner.mutation_attempts == [service + "." + operation]
-    assert owner.mutation_operations == [service + "." + operation]
+    with pytest.raises(f.SafetyViolation, match="plan-only"):
+        f.ChaosExperiment({"dry_run": False}, controller)
+    owner, _, _ = live_ec2()
+    # Arbitrary effectful SDK calls have no public confirmed handler. Preserve
+    # their refusal independently of the supported admitted EC2 counterpart.
+    with (
+        Stubber(raw),
+        pytest.raises(f.SafetyViolation, match="active approved handler"),
+    ):
+        getattr(f.AwsClientProxy(service, raw, owner), operation)(**call_request)
+    assert not owner.mutation_attempts and not owner.mutation_operations
+    assert_confirmed_ec2_sdk_dispatch_is_tracked()
 
 
 @pytest.mark.parametrize("owned", [False, True])
@@ -304,7 +361,7 @@ def test_non_s3_delegates_cannot_return_an_unreviewed_raw_operation(
     owned, service, operation, arguments
 ):
     controller, raw = stub_controller(service)
-    owner = f.ChaosExperiment({"dry_run": False}, controller) if owned else None
+    owner = live_ec2()[0] if owned else None
     with Stubber(raw), pytest.raises(f.SafetyViolation):
         getattr(controller.client(service, owner), operation)(*arguments)
 
@@ -391,14 +448,20 @@ def test_real_sdk_unsupported_lookup_preserves_protocol_but_call_refuses(
     owner = (
         None
         if mode == "ownerless"
-        else f.ChaosExperiment({"dry_run": mode.startswith("plan")}, controller)
+        else (
+            f.ChaosExperiment({"dry_run": True}, controller)
+            if mode.startswith("plan")
+            else live_ec2()[0]
+        )
     )
+    if mode.startswith("live"):
+        controller = owner.safety_controller
     if "recovery" in mode:
         owner._in_rollback = True
     if mode.endswith("stopped"):
         controller.emergency_stop_all()
         assert controller.emergency_stop.is_set()
-    proxy = controller.client(service, owner)
+    proxy = f.AwsClientProxy(service, raw, owner)
     sentinel = object()
     with Stubber(raw):
         assert hasattr(proxy, operation)
@@ -420,7 +483,7 @@ def test_real_sdk_unknown_attributes_obey_attributeerror_and_default_protocol(
     service, owned, stopped
 ):
     controller, raw = stub_controller(service)
-    owner = f.ChaosExperiment({"dry_run": False}, controller) if owned else None
+    owner = live_ec2()[0] if owned else None
     if stopped:
         controller.emergency_stop_all()
     proxy = controller.client(service, owner)
@@ -460,56 +523,52 @@ def test_real_sdk_reviewed_paginator_lookup_and_calls_remain_readonly_after_stop
 
 
 def test_real_sdk_mutation_lookup_still_tracks_admission_and_refuses_after_latch():
-    service, operation, call_request, response = EFFECTFUL_READLIKE_CASES[0]
-    controller, raw = stub_controller(service)
-    owner = f.ChaosExperiment({"dry_run": False}, controller)
-    proxy = controller.client(service, owner)
+    operation = "reboot_instances"
+    _, raw = stub_controller("ec2")
+    owner, controller, _ = live_ec2()
+    later, _, later_aws = live_ec2()
+    owner.ec2 = proxy = f.AwsClientProxy("ec2", raw, owner)
     with Stubber(raw) as stub:
-        stub.add_response(operation, response, call_request)
+        stub.add_response(
+            "describe_instances", instance_response(), {"InstanceIds": [INSTANCE_ID]}
+        )
+        stub.add_response("reboot_instances", {}, {"InstanceIds": [INSTANCE_ID]})
         assert hasattr(proxy, operation)
         call = getattr(proxy, operation, None)
-        assert callable(call) and call(**call_request) == response
+        assert callable(call)
+        with pytest.raises(f.SafetyViolation, match="active approved handler"):
+            call(InstanceIds=[INSTANCE_ID])
+        result = owner.reboot_instances([INSTANCE_ID])
+        assert result.status == "completed", result.errors
         stub.assert_no_pending_responses()
         controller.emergency_stop_all()
         assert controller.emergency_stop.is_set()
-        with pytest.raises(f.EmergencyStop):
-            getattr(proxy, operation)(**call_request)
-    assert owner.mutation_attempts == [service + "." + operation]
-    assert owner.mutation_operations == [service + "." + operation]
-
-
-def invoke_thread(action, errors):
-    def invoke():
-        try:
-            action()
-        except Exception as error:  # Keep assertion failures visible in the main test.
-            errors.append(error)
-
-    worker = threading.Thread(target=invoke, daemon=True)
-    worker.start()
-    return worker
+        with pytest.raises(f.SafetyViolation, match="active approved handler"):
+            getattr(proxy, operation)(InstanceIds=[INSTANCE_ID])
+    refused = later.reboot_instances([INSTANCE_ID])
+    assert refused.status == "failed"
+    assert any("Emergency stop" in error for error in refused.errors)
+    assert owner.mutation_attempts == ["ec2.reboot_instances"]
+    assert owner.mutation_operations == ["ec2.reboot_instances"]
+    assert not later.mutation_attempts and not later.mutation_operations
+    assert not any(name == "reboot_instances" for _, name, _ in later_aws.calls)
 
 
 def test_stop_requested_after_admission_blocks_dispatch_and_latches_on_exit():
     owner, controller, aws = live_ec2()
-    errors = []
-    workers = []
     record = owner._record_mutation_attempt
 
     def stop_during_record(operation):
         record(operation)
-        workers.append(invoke_thread(controller.emergency_stop_all, errors))
-        assert controller.emergency_stop.wait(3)
+        controller.emergency_stop_all()
+        assert controller.emergency_stop.wait(0)
         # The request is immediate; stop activation waits for this admitted call.
         assert not controller.emergency_stop.is_set()
 
     owner._record_mutation_attempt = stop_during_record
-    with pytest.raises(f.EmergencyStop, match="admitted SDK dispatch"):
-        owner.ec2.reboot_instances(InstanceIds=[INSTANCE_ID])
-    for worker in workers:
-        worker.join(3)
-        assert not worker.is_alive()
-    assert not errors
+    result = owner.reboot_instances([INSTANCE_ID])
+    assert result.status == "failed"
+    assert any("admitted SDK dispatch" in error for error in result.errors)
     assert controller.emergency_stop.is_set()
     assert not any(name == "reboot_instances" for _, name, _ in aws.calls)
     assert owner.mutation_attempts == ["ec2.reboot_instances"]
@@ -517,132 +576,174 @@ def test_stop_requested_after_admission_blocks_dispatch_and_latches_on_exit():
 
 
 def test_same_thread_signal_request_is_deferred_without_dispatch_or_deadlock():
-    owner, controller, aws = live_ec2()
-    orchestrator = object.__new__(f.ChaosOrchestrator)
-    orchestrator.safety_controller = controller
+    aws = FakeAWS(reject_writes=False)
+    config = {"instance_ids": [INSTANCE_ID]}
+    orchestrator = make_orchestrator(f.ChaosType.EC2_REBOOT, config, aws, dry_run=False)
+    owner = orchestrator._create_experiment(f.ChaosType.EC2_REBOOT, config)
+    controller = orchestrator.safety_controller
     record = owner._record_mutation_attempt
 
     def signal_during_record(operation):
         record(operation)
+        # Ordinary callback simulation only; no operating-system signal is sent.
         orchestrator._signal_handler(f.signal.SIGTERM, None)
         assert controller.emergency_stop.stop_requested()
         assert not controller.emergency_stop.is_set()
 
     owner._record_mutation_attempt = signal_during_record
-    with pytest.raises(f.EmergencyStop):
-        owner.ec2.reboot_instances(InstanceIds=[INSTANCE_ID])
+    result = owner.reboot_instances([INSTANCE_ID])
+    assert result.status == "failed"
+    assert any("admitted SDK dispatch" in error for error in result.errors)
     assert controller.emergency_stop.is_set()
     assert not any(name == "reboot_instances" for _, name, _ in aws.calls)
+    assert owner.mutation_attempts == ["ec2.reboot_instances"]
+    assert not owner.mutation_operations
 
 
 def test_stop_waits_for_accepted_sdk_call_and_blocks_later_calls_but_not_recovery():
-    owner, controller, _ = live_ec2()
-    entered = threading.Event()
-    release = threading.Event()
+    owner, controller, aws = stopped_ec2_fixture()
+    later, _, later_aws = live_ec2()
+    # The stop request in the SDK callback prevents the forward state wait.
+    aws.read_overrides[("ec2", "describe_instances")] = [
+        instance_response("running"),
+        instance_response("stopped"),
+        instance_response("running"),
+    ]
     starts = []
-    errors = []
+    recovery_starts = []
+    respond = aws.respond
 
-    def admitted_call(**_kwargs):
-        starts.append(controller.emergency_stop.is_set())
-        entered.set()
-        assert release.wait(3)
-        return {}
+    def admitted_call(service, operation, request):
+        if operation == "stop_instances":
+            starts.append(controller.emergency_stop.is_set())
+            controller.emergency_stop_all()
+            assert controller.emergency_stop.wait(0)
+            assert not controller.emergency_stop.is_set()
+        elif operation == "start_instances":
+            recovery_starts.append(controller.emergency_stop.is_set())
+        return respond(service, operation, request)
 
-    owner.ec2 = f.AwsClientProxy(
-        "ec2",
-        SimpleNamespace(
-            meta=SimpleNamespace(region_name=REGION),
-            reboot_instances=admitted_call,
-            start_instances=lambda **_: {},
-        ),
-        owner,
-    )
-    worker = invoke_thread(
-        lambda: owner.ec2.reboot_instances(InstanceIds=[INSTANCE_ID]), errors
-    )
-    assert entered.wait(3)
-    stopper = invoke_thread(controller.emergency_stop_all, errors)
-    try:
-        assert controller.emergency_stop.wait(3)
-        assert not controller.emergency_stop.is_set()
-        assert stopper.is_alive()
-    finally:
-        release.set()
-        worker.join(3)
-        stopper.join(3)
-    assert not worker.is_alive() and not stopper.is_alive() and not errors
+    aws.respond = admitted_call
+    result = owner.stop_instances([INSTANCE_ID])
+    assert result.status == "failed"
+    assert any("Emergency stop" in error for error in result.errors)
     assert starts == [False]
     assert controller.emergency_stop.is_set()
-    with pytest.raises(f.EmergencyStop):
-        owner.ec2.reboot_instances(InstanceIds=[INSTANCE_ID])
+    refused = later.reboot_instances([INSTANCE_ID])
+    assert refused.status == "failed"
+    assert any("Emergency stop" in error for error in refused.errors)
+    assert not later.mutation_attempts and not later.mutation_operations
+    assert not any(name == "reboot_instances" for _, name, _ in later_aws.calls)
     owner._in_rollback = True
-    owner.ec2.start_instances(InstanceIds=[INSTANCE_ID])
+    try:
+        with pytest.raises(f.SafetyViolation, match="active approved handler"):
+            owner.ec2.start_instances(InstanceIds=[INSTANCE_ID])
+    finally:
+        owner._in_rollback = False
+    assert not owner.rollback_attempts and not owner.rollback_operations
+    owner.run_rollback()
+    assert owner.mutation_attempts == ["ec2.stop_instances"]
+    assert owner.mutation_operations == ["ec2.stop_instances"]
+    assert recovery_starts == [True]
+    assert owner.rollback_attempts == ["ec2.start_instances"]
     assert owner.rollback_operations == ["ec2.start_instances"]
+    assert owner.rollback_verified and not owner.rollback_errors
 
 
 def test_reentrant_stop_inside_already_started_sdk_call_latches_after_return():
-    owner, controller, _ = live_ec2()
+    owner, controller, aws = live_ec2()
+    later, _, _ = live_ec2()
     states = []
+    respond = aws.respond
 
-    def admitted_call(**_kwargs):
-        states.append(controller.emergency_stop.is_set())
-        controller.emergency_stop_all()
-        states.append(controller.emergency_stop.is_set())
-        return {}
+    def admitted_call(service, operation, request):
+        if operation == "reboot_instances":
+            states.append(controller.emergency_stop.is_set())
+            controller.emergency_stop_all()
+            states.append(controller.emergency_stop.is_set())
+        return respond(service, operation, request)
 
-    proxy = f.AwsClientProxy(
-        "ec2",
-        SimpleNamespace(
-            meta=SimpleNamespace(region_name=REGION), reboot_instances=admitted_call
-        ),
-        owner,
-    )
-    proxy.reboot_instances(InstanceIds=[INSTANCE_ID])
+    aws.respond = admitted_call
+    result = owner.reboot_instances([INSTANCE_ID])
+    assert result.status == "completed", result.errors
     assert states == [False, False]
     assert controller.emergency_stop.is_set()
     assert owner.mutation_operations == ["ec2.reboot_instances"]
-    with pytest.raises(f.EmergencyStop):
-        proxy.reboot_instances(InstanceIds=[INSTANCE_ID])
+    assert owner.mutation_attempts == ["ec2.reboot_instances"]
+    with pytest.raises(f.SafetyViolation, match="active approved handler"):
+        owner.ec2.reboot_instances(InstanceIds=[INSTANCE_ID])
+    refused = later.reboot_instances([INSTANCE_ID])
+    assert refused.status == "failed"
+    assert any("Emergency stop" in error for error in refused.errors)
+    assert not later.mutation_attempts and not later.mutation_operations
 
 
-def test_stop_dispatch_stress_has_no_sdk_start_after_latch(monkeypatch):
-    for _ in range(40):
-        monkeypatch.setattr(f, "_PROCESS_EMERGENCY_STOP", f.EmergencyStopLatch())
-        owner, controller, _ = live_ec2()
-        ready = threading.Barrier(3)
-        states = []
-        errors = []
+@pytest.mark.parametrize("stop_at", ["before_handler", "admission", "sdk_return"])
+def test_stop_dispatch_stress_has_no_sdk_start_after_latch(monkeypatch, stop_at):
+    """Deterministic lifecycle control retaining the historical test's invariant."""
+    owner, controller, aws = stopped_ec2_fixture()
+    later, _, later_aws = live_ec2()
+    states = []
+    recovery_states = []
+    record = owner._record_mutation_attempt
+    respond = aws.respond
 
-        def raw_call(states=states, controller=controller, **_kwargs):
-            states.append(controller.emergency_stop.is_set())
-            return {}
-
-        proxy = f.AwsClientProxy(
-            "ec2",
-            SimpleNamespace(
-                meta=SimpleNamespace(region_name=REGION), reboot_instances=raw_call
-            ),
-            owner,
-        )
-
-        def dispatch(ready=ready, proxy=proxy):
-            ready.wait(3)
-            proxy.reboot_instances(InstanceIds=[INSTANCE_ID])
-
-        def stop(ready=ready, controller=controller):
-            ready.wait(3)
+    def record_admission(operation):
+        record(operation)
+        if stop_at == "admission":
             controller.emergency_stop_all()
+            assert controller.emergency_stop.stop_requested()
+            assert not controller.emergency_stop.is_set()
 
-        workers = [invoke_thread(dispatch, errors), invoke_thread(stop, errors)]
-        ready.wait(3)
-        for worker in workers:
-            worker.join(3)
-            assert not worker.is_alive()
-        assert all(isinstance(error, f.EmergencyStop) for error in errors)
-        assert not any(states)
-        assert controller.emergency_stop.is_set()
-        with pytest.raises(f.EmergencyStop):
-            proxy.reboot_instances(InstanceIds=[INSTANCE_ID])
+    def raw_call(service, operation, request):
+        if operation == "stop_instances":
+            states.append(controller.emergency_stop.is_set())
+            if stop_at == "sdk_return":
+                controller.emergency_stop_all()
+                assert controller.emergency_stop.stop_requested()
+                assert not controller.emergency_stop.is_set()
+        elif operation == "start_instances":
+            recovery_states.append(controller.emergency_stop.is_set())
+        return respond(service, operation, request)
+
+    monkeypatch.setattr(owner, "_record_mutation_attempt", record_admission)
+    monkeypatch.setattr(aws, "respond", raw_call)
+    aws.read_overrides[("ec2", "describe_instances")] = (
+        [
+            instance_response("running"),
+            instance_response("stopped"),
+            instance_response("running"),
+        ]
+        if stop_at == "sdk_return"
+        else [instance_response("running"), instance_response("running")]
+    )
+    if stop_at == "before_handler":
+        controller.emergency_stop_all()
+    result = owner.stop_instances([INSTANCE_ID])
+    assert result.status == "failed"
+    assert any("Emergency stop" in error for error in result.errors)
+    assert states == ([False] if stop_at == "sdk_return" else [])
+    assert not any(states)
+    assert controller.emergency_stop.is_set()
+    assert owner.mutation_attempts == (
+        [] if stop_at == "before_handler" else ["ec2.stop_instances"]
+    )
+    assert owner.mutation_operations == (
+        ["ec2.stop_instances"] if stop_at == "sdk_return" else []
+    )
+    refused = later.reboot_instances([INSTANCE_ID])
+    assert refused.status == "failed"
+    assert any("Emergency stop" in error for error in refused.errors)
+    assert not later.mutation_attempts and not later.mutation_operations
+    assert not any(name == "reboot_instances" for _, name, _ in later_aws.calls)
+    if owner.mutation_attempts:
+        owner.run_rollback()
+        assert owner.rollback_verified and not owner.rollback_errors
+    assert recovery_states == ([True] if stop_at == "sdk_return" else [])
+    assert owner.rollback_attempts == (
+        ["ec2.start_instances"] if stop_at == "sdk_return" else []
+    )
+    assert owner.rollback_operations == owner.rollback_attempts
 
 
 @pytest.mark.parametrize("operation", sorted(f.S3_OWNER_BOUND_OPERATIONS))
@@ -653,14 +754,30 @@ def test_all_s3_bucket_reads_writes_and_verifications_bind_captured_owner(operat
         **{operation: lambda **kwargs: calls.append(kwargs) or {}},
     )
     controller, _ = native_controller()
-    owner = f.ChaosExperiment({"account_id": ACCOUNT_ID, "dry_run": False}, controller)
+    owner = f.ChaosExperiment({"account_id": ACCOUNT_ID, "dry_run": True}, controller)
     # An unrelated later mapping edit cannot replace the authenticated account.
     owner.config["account_id"] = "999999999999"
     proxy = f.AwsClientProxy("s3", client, owner)
-    if "s3." + operation in f.CONCURRENCY_UNSAFE_MUTATIONS:
-        with pytest.raises(f.SafetyViolation, match="conditional ownership proof"):
+    if operation not in f.READ_ONLY_OPERATIONS["s3"]:
+        with pytest.raises(f.SafetyViolation, match="Plan mode refuses"):
             getattr(proxy, operation)(Bucket=BUCKET)
         assert not calls
+        assert not owner.mutation_attempts and not owner.mutation_operations
+        if "s3." + operation in f.CONCURRENCY_UNSAFE_MUTATIONS:
+            with pytest.raises(
+                f.ConfigurationError, match="Live approval is unavailable"
+            ):
+                make_experiment(
+                    f.ChaosType.S3_BUCKET_POLICY_DENY,
+                    {
+                        "bucket_name": BUCKET,
+                        "break_glass_principal_arn": BREAK_GLASS_ARN,
+                    },
+                    FakeAWS(reject_writes=False),
+                    dry_run=False,
+                )
+        else:
+            assert_confirmed_ec2_sdk_dispatch_is_tracked()
     else:
         getattr(proxy, operation)(Bucket=BUCKET)
         assert calls == [{"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT_ID}]
@@ -753,7 +870,15 @@ def test_real_botocore_owner_mismatch_refuses_delete_and_valid_owner_succeeds(fa
         expected_account=ACCOUNT_ID,
     )
     controller.check_safety_conditions = lambda: (True, [])
-    owner = f.S3ChaosExperiment({"dry_run": False}, controller)
+    with pytest.raises(f.SafetyViolation, match="plan-only"):
+        f.S3ChaosExperiment({"dry_run": False}, controller)
+    owner = make_experiment(
+        f.ChaosType.S3_OBJECT_DELETE,
+        {"bucket_name": BUCKET, "prefix": PREFIX, "max_objects": 1},
+        FakeAWS(reject_writes=False),
+        dry_run=False,
+    )
+    owner.s3 = f.AwsClientProxy("s3", client, owner)
     read = {
         "Bucket": BUCKET,
         "Prefix": PREFIX,

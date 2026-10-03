@@ -1,6 +1,7 @@
 """Account-free adversarial tests for cloud mutation boundaries."""
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 from test_aws_chaos_framework import (
@@ -18,7 +19,36 @@ import aws_chaos_framework as framework
 
 def experiment(kind, aws, **config):
     values = {**action_configs()[kind], **config}
+    if not framework.experiment_metadata(kind).live_supported:
+        before = list(aws.calls)
+        with pytest.raises(
+            framework.ConfigurationError,
+            match="Live (approval is unavailable|FIS approval is disabled)",
+        ):
+            make_experiment(kind, values, aws, dry_run=False)
+        assert aws.calls == before
+        return make_experiment(kind, values, aws, dry_run=True), values
     return make_experiment(kind, values, aws, dry_run=False), values
+
+
+def raw_owner(config, controller):
+    if config.get("dry_run", True):
+        return framework.ChaosExperiment(config, controller)
+    clients = (
+        controller.aws
+        if isinstance(controller, FakeSafetyController)
+        else SimpleNamespace(
+            client=lambda service: controller.session.client(
+                service, region_name=config.get("region", REGION)
+            )
+        )
+    )
+    return make_experiment(
+        framework.ChaosType.EC2_REBOOT,
+        {"instance_ids": [INSTANCE_ID], "region": config.get("region", REGION)},
+        clients,
+        dry_run=False,
+    )
 
 
 def test_absent_ingress_rule_never_creates_access_on_rollback():
@@ -37,9 +67,9 @@ def test_absent_ingress_rule_never_creates_access_on_rollback():
 def test_unsupported_ingress_never_infers_forward_or_restore_ownership():
     aws = FakeAWS(reject_writes=False)
     item, values = experiment(framework.ChaosType.VPC_SECURITY_GROUP_MODIFY, aws)
-    assert item.modify_security_group(**values).status == "failed"
+    assert item.modify_security_group(**values).status == "completed"
     item.run_rollback()
-    assert not item.ingress_write_confirmed
+    assert not getattr(item, "ingress_write_confirmed", False)
     assert not hasattr(item, "removed_rule")
     assert not any(
         operation.startswith(("authorize_", "revoke_")) for _, operation, _ in aws.calls
@@ -48,22 +78,40 @@ def test_unsupported_ingress_never_infers_forward_or_restore_ownership():
 
 def test_emergency_stop_blocks_forward_write_but_allows_recovery():
     aws = FakeAWS(reject_writes=False)
-    item, _ = experiment(framework.ChaosType.EC2_STOP, aws)
+    running = aws.respond("ec2", "describe_instances", {})
+    stopped = copy.deepcopy(running)
+    stopped["Reservations"][0]["Instances"][0]["State"]["Name"] = "stopped"
+    aws.read_overrides[("ec2", "describe_instances")] = [
+        running,
+        stopped,
+        stopped,
+        running,
+    ]
+    item, values = experiment(framework.ChaosType.EC2_STOP, aws)
+    assert item.stop_instances(**values).status == "completed"
     item.safety_controller.emergency_stop.set()
-    with pytest.raises(framework.EmergencyStop):
+    before = list(aws.calls)
+    with pytest.raises(framework.SafetyViolation, match="active approved handler"):
         item.ec2.stop_instances(InstanceIds=[INSTANCE_ID])
-    assert not item.mutation_attempts
-    item._in_rollback = True
-    item.ec2.start_instances(InstanceIds=[INSTANCE_ID])
+    assert aws.calls == before
+    assert item.stop_instances(**values).status == "failed"
+    assert item.mutation_attempts == ["ec2.stop_instances"]
+    item.run_rollback()
     assert item.rollback_attempts == ["ec2.start_instances"]
+    assert item.rollback_verified
 
 
 def test_efs_throttle_cannot_increase_capacity():
     aws = FakeAWS(reject_writes=False)
     item, values = experiment(framework.ChaosType.EFS_THROTTLE_THROUGHPUT, aws)
     values["provisioned_throughput"] = 100000
-    assert item.throttle_throughput(**values).status == "failed"
-    item.run_rollback()
+    refused = item.throttle_throughput(**values)
+    assert refused.status == "failed"
+    assert "arguments differ" in refused.errors[0]
+    with pytest.raises(
+        framework.SafetyViolation, match="completed approved handler lifecycle"
+    ):
+        item.run_rollback()
     assert not any(operation == "update_file_system" for _, operation, _ in aws.calls)
 
 
@@ -102,9 +150,7 @@ def test_fis_rejects_unreviewed_actions_invalid_alarms_and_aggregate_blast_radiu
     attack,
 ):
     aws = FakeAWS(reject_writes=False)
-    item, values = experiment(
-        framework.ChaosType.FIS_TEMPLATE, aws, account_id=ACCOUNT_ID, region=REGION
-    )
+    values = action_configs()[framework.ChaosType.FIS_TEMPLATE]
     template = aws.respond("fis", "get_experiment_template", {})["experimentTemplate"]
     if attack == "destructive":
         template["actions"]["stop"]["actionId"] = "aws:ec2:terminate-instances"
@@ -112,10 +158,12 @@ def test_fis_rejects_unreviewed_actions_invalid_alarms_and_aggregate_blast_radiu
         template["stopConditions"][0]["value"] = "not-an-alarm"
     else:
         template["targets"]["Second"] = copy.deepcopy(template["targets"]["Instances"])
-    aws.read_overrides[("fis", "get_experiment_template")] = [
-        {"experimentTemplate": template}
-    ]
-    assert item.run_template(values["experiment_template_id"]).status == "failed"
+    before = list(aws.calls)
+    with pytest.raises(
+        framework.ConfigurationError, match="Live FIS approval is disabled"
+    ):
+        make_experiment(framework.ChaosType.FIS_TEMPLATE, values, aws, dry_run=False)
+    assert aws.calls == before
     assert not any(operation == "start_experiment" for _, operation, _ in aws.calls)
 
 
@@ -182,7 +230,7 @@ def test_elb_recovery_preserves_port_and_availability_zone():
 def test_ecs_recovery_does_not_accept_desired_count_without_running_tasks(monkeypatch):
     aws = FakeAWS(reject_writes=False)
     item, _ = experiment(
-        framework.ChaosType.ECS_SERVICE_UPDATE, aws, state_timeout_seconds=1
+        framework.ChaosType.ECS_SERVICE_UPDATE, aws, state_timeout_seconds=10
     )
     monkeypatch.setattr(framework.time, "sleep", lambda _: None)
     aws.read_overrides[("ecs", "describe_services")] = [
@@ -197,8 +245,8 @@ def test_ecs_recovery_does_not_accept_desired_count_without_running_tasks(monkey
             ]
         }
     ]
-    ticks = iter([0, 0, 0.5, 2])
-    monkeypatch.setattr(framework.time, "monotonic", lambda: next(ticks, 2))
+    ticks = iter([0, 0, 0.5, 11])
+    monkeypatch.setattr(framework.time, "monotonic", lambda: next(ticks, 11))
     with pytest.raises(TimeoutError):
         item._wait_for_service_count("cluster", "service", 1, False)
     assert not item.rollback_verified
@@ -244,11 +292,9 @@ def test_child_selector_requires_exact_allowlist_digest(kind, field):
 
 def test_empty_s3_prefix_never_lists_or_deletes_bucket_objects():
     aws = FakeAWS(reject_writes=False)
-    item, values = experiment(framework.ChaosType.S3_OBJECT_DELETE, aws, prefix="")
-    assert item.delete_objects(**values).status == "failed"
-    assert not any(
-        op in {"list_objects_v2", "delete_objects"} for _, op, _ in aws.calls
-    )
+    with pytest.raises(framework.ConfigurationError, match="prefix"):
+        experiment(framework.ChaosType.S3_OBJECT_DELETE, aws, prefix="")
+    assert not aws.calls
 
 
 def test_worker_failure_sets_emergency_stop_before_scheduler_reaps():
@@ -390,16 +436,17 @@ def test_rds_retention_cannot_claim_data_recovery_even_without_concurrent_change
 
 def test_rds_original_retention_with_pending_change_is_not_verified():
     aws = FakeAWS(reject_writes=False)
-    item, _ = experiment(framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY, aws)
-    item.original_retention = 7
-    item.owned_retention = 0
-    item.db_identifier = "synthetic"
-    item.mutation_attempts.append("rds.modify_db_instance")
-    current = aws.respond("rds", "describe_db_instances", {})
+    original = aws.respond("rds", "describe_db_instances", {})
+    owned = copy.deepcopy(original)
+    owned["DBInstances"][0]["BackupRetentionPeriod"] = 0
+    current = copy.deepcopy(original)
     current["DBInstances"][0]["PendingModifiedValues"] = {"BackupRetentionPeriod": 0}
-    aws.read_overrides[("rds", "describe_db_instances")] = [current]
+    aws.read_overrides[("rds", "describe_db_instances")] = [original, owned, current]
+    item, values = experiment(framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY, aws)
+    assert item.modify_backup_retention(**values).status == "completed"
     with pytest.raises(framework.SafetyViolation, match="irreversible"):
         item.run_rollback()
+    assert item.mutation_attempts == ["rds.modify_db_instance"]
     assert not item.rollback_verified
 
 
@@ -457,8 +504,10 @@ def test_extension_recovery_requires_original_post_state(action):
     item, values = experiment(kind, aws)
     orchestrator = object.__new__(framework.ChaosOrchestrator)
     if kind in framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS:
-        with pytest.raises(framework.ConfigurationError, match="not safely executable"):
-            orchestrator._execute_experiment(item, kind, values)
+        assert item.dry_run
+        assert (
+            orchestrator._execute_experiment(item, kind, values).status == "completed"
+        )
         assert not item.mutation_attempts
         assert all(
             operation in framework.READ_ONLY_OPERATIONS.get(service, ())
@@ -597,62 +646,22 @@ def test_live_discovery_cannot_bypass_reviewed_target_approval(placeholder):
 
 
 def test_managed_fis_recovery_is_required_when_auto_rollback_disabled():
-    import threading
-
-    from test_aws_chaos_framework import (
-        BREAK_GLASS_ARN,
-        OTHER_ACCESS_KEY,
-        FakeSafetyController,
-    )
-
     aws = FakeAWS(reject_writes=False)
-    item, values = experiment(framework.ChaosType.FIS_TEMPLATE, aws)
-    item.fis_experiment_id = "synthetic"
-    item.recovery_instance_ids = ["i-0123456789abcdef0"]
-    item.mutation_attempts = ["fis.start_experiment"]
-    aws.read_overrides[("fis", "get_experiment")] = [
-        {"experiment": {"state": {"status": "completed"}}}
-    ]
-    aws.read_overrides[("ec2", "describe_instances")] = [
-        {
-            "Reservations": [
-                {
-                    "Instances": [
-                        {
-                            "InstanceId": item.recovery_instance_ids[0],
-                            "State": {"Name": "stopped"},
-                        }
-                    ]
-                }
-            ]
-        }
-    ]
-    orchestrator = object.__new__(framework.ChaosOrchestrator)
-    orchestrator.config = {"global": {}, "safety": {}}
-    orchestrator.region = REGION
-    orchestrator.dry_run = False
-    orchestrator.live = True
-    orchestrator.operator_principal_arn = BREAK_GLASS_ARN
-    orchestrator.active_access_key_id = OTHER_ACCESS_KEY
-    orchestrator._report_sensitive_values = set()
-    orchestrator._sensitive_values_lock = threading.Lock()
-    orchestrator._active_experiments_lock = threading.Lock()
-    orchestrator.active_experiments = []
-    orchestrator.safety_controller = FakeSafetyController(aws, live=True)
-    orchestrator._validate_target_scope = lambda *args: None
-    orchestrator._create_experiment = lambda *args: item
-    orchestrator._execute_experiment = lambda *args: framework.ExperimentResult(
-        experiment_id="synthetic",
-        experiment_type=framework.ChaosType.FIS_TEMPLATE,
-        start_time=framework.utc_now(),
-        status="completed",
+    values = {
+        **action_configs()[framework.ChaosType.FIS_TEMPLATE],
+        "auto_rollback": False,
+    }
+    with pytest.raises(
+        framework.ConfigurationError, match="Live FIS approval is disabled"
+    ):
+        make_experiment(framework.ChaosType.FIS_TEMPLATE, values, aws, dry_run=False)
+    assert not aws.calls
+    metadata = framework.experiment_metadata(framework.ChaosType.FIS_TEMPLATE)
+    assert metadata.rollback == "managed"
+    evidence = SimpleNamespace(
+        rollback_errors=[], rollback_verified=False, rollback_attempts=[]
     )
-    result = orchestrator._run_single_experiment(
-        {**values, "type": "fis_template", "auto_rollback": False}
-    )
-    assert result.status == "failed"
-    assert result.rollback_successful is False
-    assert any("not yet verified" in error for error in result.rollback_errors)
+    assert not framework.ChaosOrchestrator._rollback_outcome(metadata, evidence)
 
 
 def test_waf_ip_set_recovery_preserves_concurrent_addresses_and_description():
@@ -667,8 +676,11 @@ def test_waf_ip_set_recovery_preserves_concurrent_addresses_and_description():
     restored = copy.deepcopy(concurrent)
     restored["IPSet"]["Addresses"].remove("198.51.100.0/24")
     aws.read_overrides[("wafv2", "get_ip_set")] = [original, concurrent, restored]
-    item, values = experiment(framework.ChaosType.WAF_IP_SET_MODIFY, aws)
-    values["addresses_to_add"] = ["192.0.2.0/24", "198.51.100.0/24"]
+    item, values = experiment(
+        framework.ChaosType.WAF_IP_SET_MODIFY,
+        aws,
+        addresses_to_add=["192.0.2.0/24", "198.51.100.0/24"],
+    )
     item.safety_controller.config.update(
         target_allowlist=sorted(
             framework.ChaosOrchestrator._target_values(
@@ -735,14 +747,7 @@ def test_directory_service_rejects_unrestorable_replication_scope_before_delete(
 def test_waf_rejected_or_ambiguous_forward_write_never_claims_address_ownership(
     ambiguous,
 ):
-    import threading
-
     from botocore.exceptions import ClientError
-    from test_aws_chaos_framework import (
-        BREAK_GLASS_ARN,
-        OTHER_ACCESS_KEY,
-        FakeSafetyController,
-    )
 
     aws = FakeAWS(reject_writes=False)
     original = aws.respond("wafv2", "get_ip_set", {})
@@ -769,40 +774,23 @@ def test_waf_rejected_or_ambiguous_forward_write_never_claims_address_ownership(
         return respond(service, operation, request)
 
     aws.respond = race
-    item, values = experiment(framework.ChaosType.WAF_IP_SET_MODIFY, aws)
-    values["addresses_to_add"] = ["198.51.100.0/24"]
-    item.safety_controller.config.update(
-        target_allowlist=sorted(
-            framework.ChaosOrchestrator._target_values(
-                {"type": "waf_ip_set_modify", **values}
-            )
-        ),
-        max_blast_radius=2,
+    values = {
+        **action_configs()[framework.ChaosType.WAF_IP_SET_MODIFY],
+        "addresses_to_add": ["198.51.100.0/24"],
+    }
+    from test_aws_chaos_framework import make_orchestrator
+
+    orchestrator = make_orchestrator(
+        framework.ChaosType.WAF_IP_SET_MODIFY, values, aws, dry_run=False
     )
-    orchestrator = object.__new__(framework.ChaosOrchestrator)
-    orchestrator.config = {"global": {}, "safety": {}}
-    orchestrator.region = REGION
-    orchestrator.dry_run = False
-    orchestrator.live = True
-    orchestrator.operator_principal_arn = BREAK_GLASS_ARN
-    orchestrator.active_access_key_id = OTHER_ACCESS_KEY
-    orchestrator._report_sensitive_values = set()
-    orchestrator._sensitive_values_lock = threading.Lock()
-    orchestrator._active_experiments_lock = threading.Lock()
-    orchestrator.active_experiments = []
-    orchestrator.safety_controller = FakeSafetyController(aws, live=True)
-    orchestrator._validate_target_scope = lambda *args: None
-    orchestrator._create_experiment = lambda *args: item
     result = orchestrator._run_single_experiment(
-        {**values, "type": "waf_ip_set_modify", "auto_rollback": True}
+        {"type": "waf_ip_set_modify", **values}
     )
     assert result.status == "failed"
     assert result.rollback_successful is False
-    assert item.mutation_operations == []
-    assert item.rollback_attempts == []
-    assert not item.rollback_verified
-    assert item.mutation_attempts == ["wafv2.update_ip_set"]
-    assert any("no cleanup is authorized" in error for error in result.rollback_errors)
+    assert not result.rollback_attempts
+    assert not result.rollback_operations
+    assert not any(op == "update_ip_set" for _, op, _ in aws.calls)
 
 
 # Offline controls for the validated d104 target-identity findings.
@@ -866,7 +854,8 @@ def test_offline_config_and_token_bind_typed_arn(kind, key, service, resource, c
         framework.validate_config_data(config)
         if framework.ChaosType(kind) in framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS:
             with pytest.raises(
-                framework.ConfigurationError, match="Live approval is unavailable"
+                framework.ConfigurationError,
+                match="Live (approval is unavailable|FIS approval is disabled)",
             ):
                 framework.confirmation_token(config, "reviewed")
         else:
@@ -892,7 +881,7 @@ def test_direct_sdk_foreign_arn_never_reaches_mutation(
     service, operation, key, recovery
 ):
     aws = FakeAWS(reject_writes=False)
-    owner = framework.ChaosExperiment(
+    owner = raw_owner(
         {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False},
         FakeSafetyController(aws, live=True),
     )
@@ -948,19 +937,14 @@ def test_global_arn_exceptions_are_narrow_and_explicit():
 def test_live_tag_or_unproven_digest_refused_before_reads_and_token(selector):
     aws = FakeAWS(reject_writes=False)
     values = {"repository_name": "chaos-test-repository", "image_ids": selector}
-    item = make_experiment(
-        framework.ChaosType.ECR_IMAGE_DELETE, values, aws, dry_run=False
-    )
-    assert item.delete_images(**values).status == "failed"
-    assert not aws.calls and not item.mutation_attempts
-    with pytest.raises(framework.SafetyViolation):
-        item.ecr.batch_delete_image(
-            repositoryName=values["repository_name"], imageIds=selector
+    with pytest.raises((framework.ConfigurationError, framework.SafetyViolation)):
+        make_experiment(
+            framework.ChaosType.ECR_IMAGE_DELETE, values, aws, dry_run=False
         )
-    with pytest.raises((framework.SafetyViolation, framework.ConfigurationError)):
-        framework.confirmation_token(
-            config_for({"type": "ecr_image_delete", **values}), "reviewed"
-        )
+    assert not aws.calls
+    config = config_for({"type": "ecr_image_delete", **values})
+    with pytest.raises((framework.ConfigurationError, framework.SafetyViolation)):
+        framework.confirmation_token(config, "reviewed")
 
 
 def test_reviewed_digest_reaches_ecr_with_account_binding_not_a_tag():
@@ -1084,10 +1068,12 @@ def test_ec2_termination_has_no_live_authority_in_token_handler_or_sdk():
     with pytest.raises(framework.ConfigurationError):
         framework.confirmation_token(config, "reviewed")
     aws = FakeAWS(reject_writes=False)
-    item = make_experiment(
-        framework.ChaosType.EC2_TERMINATE, values, aws, dry_run=False
-    )
-    assert item.terminate_instances(**values).status == "failed"
+    with pytest.raises(
+        framework.ConfigurationError,
+        match="Live (approval is unavailable|FIS approval is disabled)",
+    ):
+        make_experiment(framework.ChaosType.EC2_TERMINATE, values, aws, dry_run=False)
+    item = make_experiment(framework.ChaosType.EC2_TERMINATE, values, aws, dry_run=True)
     assert not aws.calls
     with pytest.raises(framework.SafetyViolation):
         item.ec2.terminate_instances(InstanceIds=[INSTANCE_ID])
@@ -1101,26 +1087,14 @@ def native_target_experiment(kind, values):
         aws_secret_access_key="synthetic",
         region_name=REGION,
     )
-    safety = framework.SafetyController(
-        {
-            "target_allowlist": list(
-                framework.ChaosOrchestrator._target_values(
-                    {"type": kind.value, **values}
-                )
-            ),
-            "max_blast_radius": 100,
-        },
-        session,
-        REGION,
-        True,
-        ACCOUNT_ID,
+    return make_experiment(
+        kind,
+        values,
+        SimpleNamespace(
+            client=lambda service: session.client(service, region_name=REGION)
+        ),
+        dry_run=False,
     )
-    config = {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False, **values}
-    cls = {
-        framework.ChaosType.ECR_IMAGE_DELETE: framework.ECRChaosExperiment,
-        framework.ChaosType.KMS_GRANT_REVOKE: framework.KMSChaosExperiment,
-    }[kind]
-    return cls(config, safety)
 
 
 @pytest.mark.parametrize(
@@ -1227,6 +1201,12 @@ def test_native_kms_grant_key_identity_before_dispatch(attack):
         "foreign_region": key.replace(REGION, "us-gov-east-1"),
     }.get(attack, key)
     values = {"key_id": supplied, "grant_id": "1" * 64}
+    if attack in {"alias", "bare_id", "alias_arn", "foreign_account", "foreign_region"}:
+        # These identities cannot obtain public live approval. The same cases
+        # now stop before a client can perform the formerly tested lookup.
+        with pytest.raises((framework.SafetyViolation, framework.ConfigurationError)):
+            native_target_experiment(framework.ChaosType.KMS_GRANT_REVOKE, values)
+        return
     item = native_target_experiment(framework.ChaosType.KMS_GRANT_REVOKE, values)
     if attack == "unapproved":
         item.safety_controller.config["target_allowlist"] = []
@@ -1263,7 +1243,7 @@ def test_native_kms_grant_key_identity_before_dispatch(attack):
 @pytest.mark.parametrize("attack", ["cycle", "deep", "wide", "malformed_arn", "valid"])
 def test_bounded_sdk_arguments_refuse_before_tracking(attack):
     aws = FakeAWS(reject_writes=False)
-    owner = framework.ChaosExperiment(
+    owner = raw_owner(
         {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False},
         FakeSafetyController(aws, live=True),
     )
@@ -1278,8 +1258,17 @@ def test_bounded_sdk_arguments_refuse_before_tracking(attack):
     elif attack == "malformed_arn":
         payload = {"Arn": "arn:"}
     if attack == "valid":
-        owner.client("sns").unsubscribe(SubscriptionArn=payload["Arn"])
-        assert owner.mutation_operations == ["sns.unsubscribe"]
+        assert list(framework.bounded_argument_leaves(payload))
+        framework.validate_sdk_request_arns(
+            "sns",
+            "unsubscribe",
+            {"SubscriptionArn": payload["Arn"]},
+            ACCOUNT_ID,
+            REGION,
+        )
+        with pytest.raises(framework.SafetyViolation, match="active approved handler"):
+            owner.client("sns").unsubscribe(SubscriptionArn=payload["Arn"])
+        assert not aws.calls and not owner.mutation_attempts
     else:
         with pytest.raises(framework.SafetyViolation):
             if attack == "malformed_arn":
@@ -1312,10 +1301,15 @@ def test_native_cloudfront_canonical_child_admission(attack):
         True,
         ACCOUNT_ID,
     )
-    item = framework.CloudFrontChaosExperiment(
-        {"account_id": ACCOUNT_ID, "region": "us-east-1", "dry_run": False, **values},
-        safety,
+    item = make_experiment(
+        kind,
+        {"region": "us-east-1", **values},
+        SimpleNamespace(
+            client=lambda service: session.client(service, region_name="us-east-1")
+        ),
+        dry_run=False,
     )
+    item.safety_controller.config.update(safety.config)
     supplied = {**values, "paths": ["/secret"]} if attack == "paths" else values
     with Stubber(item.cloudfront._client) as stub:
         if attack == "valid":
@@ -1358,7 +1352,7 @@ def test_native_waf_canonical_children_and_scope_before_mutation(attack):
         "ip_set_id": "01234567-89ab-cdef-0123-456789abcdef",
         "ip_set_name": "Reviewed",
         "scope": "REGIONAL",
-        "addresses_to_add": ["198.51.100.9/24", "198.51.100.0/24"],
+        "addresses_to_add": ["198.51.100.0/24", "198.51.100.0/24"],
     }
     kind = framework.ChaosType.WAF_IP_SET_MODIFY
     session = framework.boto3.Session(
@@ -1378,9 +1372,15 @@ def test_native_waf_canonical_children_and_scope_before_mutation(attack):
         True,
         ACCOUNT_ID,
     )
-    item = framework.WAFChaosExperiment(
-        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False, **values}, safety
+    item = make_experiment(
+        kind,
+        values,
+        SimpleNamespace(
+            client=lambda service: session.client(service, region_name=REGION)
+        ),
+        dry_run=False,
     )
+    item.safety_controller.config.update(safety.config)
     supplied = dict(values)
     if attack == "cidr":
         supplied["addresses_to_add"] = ["203.0.113.0/24"]
@@ -1512,15 +1512,17 @@ def test_native_raw_protected_requests_have_no_handler_authority(
         ACCOUNT_ID,
     )
     safety.check_safety_conditions = lambda: (True, [])
-    owner = framework.ChaosExperiment(
-        {"account_id": ACCOUNT_ID, "region": region, "dry_run": False, **values}, safety
+    owner = make_experiment(
+        kind,
+        {**values, "region": region},
+        SimpleNamespace(client=lambda service: raw),
+        dry_run=False,
     )
+    owner.safety_controller.config.update(safety.config)
     owner._in_rollback = rollback
     with Stubber(raw) as stub:
         # No response is queued. A dispatch would fail the native SDK guard.
-        with pytest.raises(
-            framework.SafetyViolation, match="matching reviewed handler"
-        ):
+        with pytest.raises(framework.SafetyViolation, match="active approved handler"):
             getattr(owner.client(service), operation)(**request)
         stub.assert_no_pending_responses()
     assert not owner.mutation_attempts and not owner.rollback_attempts
@@ -1556,10 +1558,13 @@ def test_native_elb_cognito_snapshot_is_restorable_before_fault(attack):
     session = framework.boto3.Session(
         aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
     )
-    safety = framework.SafetyController({}, session, REGION, True, ACCOUNT_ID)
-    safety.check_safety_conditions = lambda: (True, [])
-    item = framework.ELBChaosExperiment(
-        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, safety
+    item = make_experiment(
+        framework.ChaosType.ELB_LISTENER_RULE_MODIFY,
+        {"rule_arn": rule},
+        SimpleNamespace(
+            client=lambda service: session.client(service, region_name=REGION)
+        ),
+        dry_run=False,
     )
     fault = [
         {
@@ -1615,8 +1620,11 @@ def test_lambda_recovery_preserves_opaque_arn_values():
         restored,
         restored,
     ]
-    item, values = experiment(framework.ChaosType.LAMBDA_ENVIRONMENT_CORRUPT, aws)
-    values["corrupt_vars"] = {"MODE": owned["Environment"]["Variables"]["MODE"]}
+    item, values = experiment(
+        framework.ChaosType.LAMBDA_ENVIRONMENT_CORRUPT,
+        aws,
+        corrupt_vars={"MODE": owned["Environment"]["Variables"]["MODE"]},
+    )
     assert item.corrupt_environment(**values).status == "completed"
     item.run_rollback()
     assert item.rollback_verified
@@ -1664,14 +1672,19 @@ def test_native_lambda_application_text_does_not_erase_identity_checks(attack):
         ACCOUNT_ID,
     )
     safety.check_safety_conditions = lambda: (True, [])
-    owner = framework.ChaosExperiment(
+    owner = raw_owner(
         {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, safety
     )
     with Stubber(raw) as stub:
         if attack == "opaque":
-            stub.add_response("update_function_configuration", {}, request)
-            owner.client("lambda").update_function_configuration(**request)
-            assert owner.mutation_attempts == ["lambda.update_function_configuration"]
+            framework.validate_sdk_request_arns(
+                "lambda", "update_function_configuration", request, ACCOUNT_ID, REGION
+            )
+            with pytest.raises(
+                framework.SafetyViolation, match="active approved handler"
+            ):
+                owner.client("lambda").update_function_configuration(**request)
+            assert not owner.mutation_attempts
         else:
             with pytest.raises(framework.SafetyViolation):
                 owner.client("lambda").update_function_configuration(**request)
@@ -1692,12 +1705,12 @@ def test_native_protected_dispatch_ticket_is_single_use_exact_and_thread_local(a
     request = {"KeyId": key, "GrantId": values["grant_id"]}
     expected = copy.deepcopy(request)
     with Stubber(owner.kms._client) as stub:
-        if attack != "changed":
-            stub.add_response("revoke_grant", {}, expected)
         with owner._approved_sdk_request("kms", "revoke_grant", request) as admitted:
             if attack == "changed":
                 admitted["GrantId"] = "2" * 64
-                with pytest.raises(framework.SafetyViolation):
+                with pytest.raises(
+                    framework.SafetyViolation, match="active approved handler"
+                ):
                     owner.kms.revoke_grant(**admitted)
                 with pytest.raises(framework.SafetyViolation):
                     owner.kms.revoke_grant(**expected)
@@ -1710,13 +1723,17 @@ def test_native_protected_dispatch_ticket_is_single_use_exact_and_thread_local(a
                 elif attack == "detached":
                     request["GrantId"] = "2" * 64
                     assert admitted == expected
-                owner.kms.revoke_grant(**admitted)
+                with pytest.raises(
+                    framework.SafetyViolation, match="active approved handler"
+                ):
+                    owner.kms.revoke_grant(**admitted)
                 with pytest.raises(framework.SafetyViolation):
                     owner.kms.revoke_grant(**admitted)
         with pytest.raises(framework.SafetyViolation):
             owner.kms.revoke_grant(**expected)
         stub.assert_no_pending_responses()
-    assert len(owner.mutation_attempts) == (0 if attack == "changed" else 1)
+    assert not owner.mutation_attempts
+    assert owner._sdk_request_authority.ticket is None
 
 
 @pytest.mark.parametrize("path", ["target_group", "forward_group", "misplaced_cognito"])
@@ -1829,17 +1846,19 @@ def test_native_sns_firehose_role_reference_is_narrow_and_owner_bound(attack):
         ACCOUNT_ID,
     )
     safety.check_safety_conditions = lambda: (True, [])
-    owner = framework.ChaosExperiment(
+    owner = raw_owner(
         {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, safety
     )
     with Stubber(raw) as stub:
         if attack == "valid":
-            stub.add_response(
-                "subscribe",
-                {"SubscriptionArn": topic + ":01234567-89ab-cdef-0123-456789abcdef"},
-                request,
+            framework.validate_sdk_request_arns(
+                "sns", "subscribe", request, ACCOUNT_ID, REGION
             )
-            owner.client("sns").subscribe(**request)
+            with pytest.raises(
+                framework.SafetyViolation, match="active approved handler"
+            ):
+                owner.client("sns").subscribe(**request)
+            assert not owner.mutation_attempts
         else:
             with pytest.raises(framework.SafetyViolation):
                 owner.client("sns").subscribe(**request)
@@ -1899,10 +1918,13 @@ def test_native_sns_snapshot_admission_precedes_irreversible_fault(protocol, att
     session = framework.boto3.Session(
         aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
     )
-    safety = framework.SafetyController({}, session, REGION, True, ACCOUNT_ID)
-    safety.check_safety_conditions = lambda: (True, [])
-    owner = framework.SNSChaosExperiment(
-        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, safety
+    owner = make_experiment(
+        framework.ChaosType.SNS_SUBSCRIPTION_DELETE,
+        {"subscription_arn": subscription},
+        SimpleNamespace(
+            client=lambda service: session.client(service, region_name=REGION)
+        ),
+        dry_run=False,
     )
     with Stubber(owner.sns._client) as stub:
         stub.add_response(
@@ -1971,10 +1993,13 @@ def test_native_sns_role_grammar_precedes_dispatch_and_irreversible_fault(
     session = framework.boto3.Session(
         aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
     )
-    safety = framework.SafetyController({}, session, REGION, True, ACCOUNT_ID)
-    safety.check_safety_conditions = lambda: (True, [])
-    owner = framework.SNSChaosExperiment(
-        {"account_id": ACCOUNT_ID, "region": REGION, "dry_run": False}, safety
+    owner = make_experiment(
+        framework.ChaosType.SNS_SUBSCRIPTION_DELETE,
+        {"subscription_arn": subscription},
+        SimpleNamespace(
+            client=lambda service: session.client(service, region_name=REGION)
+        ),
+        dry_run=False,
     )
     with Stubber(owner.sns._client) as stub:
         if entrypoint == "delete":
@@ -2004,12 +2029,20 @@ def test_native_sns_role_grammar_precedes_dispatch_and_irreversible_fault(
                 assert not owner.rollback_verified
             else:
                 assert not owner.mutation_attempts and not owner.rollback_attempts
-        elif valid:
-            stub.add_response("subscribe", {"SubscriptionArn": subscription}, request)
-            owner.sns.subscribe(**request)
-            assert owner.mutation_operations == ["sns.subscribe"]
         else:
-            with pytest.raises(framework.SafetyViolation):
+            if valid:
+                framework.validate_sdk_request_arns(
+                    "sns", "subscribe", request, ACCOUNT_ID, REGION
+                )
+            else:
+                with pytest.raises(framework.SafetyViolation):
+                    framework.validate_sdk_request_arns(
+                        "sns", "subscribe", request, ACCOUNT_ID, REGION
+                    )
+            # Subscribe has authority only inside the owned delete recovery.
+            with pytest.raises(
+                framework.SafetyViolation, match="active approved handler"
+            ):
                 owner.sns.subscribe(**request)
             assert not owner.mutation_attempts
         stub.assert_no_pending_responses()

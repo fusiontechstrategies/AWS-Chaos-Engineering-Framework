@@ -12,6 +12,7 @@ from test_aws_chaos_framework import (
     FakeAWS,
     action_configs,
     make_experiment,
+    make_orchestrator,
 )
 
 import aws_chaos_framework as f
@@ -47,23 +48,32 @@ def test_later_orchestrator_signal_stops_earlier_controller_and_keeps_rollback(
     cfg = config_for(f.ChaosType.EC2_REBOOT, instance_ids=[INSTANCE_ID])
     path = tmp_path / "config.yaml"
     path.write_text(f.yaml.safe_dump(cfg), encoding="utf-8")
-    first = f.ChaosOrchestrator(str(path), output_dir=str(tmp_path / "first"))
+    values = {"instance_ids": [INSTANCE_ID]}
+    first = make_orchestrator(f.ChaosType.EC2_STOP, values, aws, dry_run=False)
+    earlier = first._create_experiment(f.ChaosType.EC2_STOP, values)
+    running = aws.respond("ec2", "describe_instances", {})
+    stopped = copy.deepcopy(running)
+    stopped["Reservations"][0]["Instances"][0]["State"]["Name"] = "stopped"
+    aws.read_overrides[("ec2", "describe_instances")] = [
+        running,
+        stopped,
+        stopped,
+        running,
+    ]
+    assert earlier.stop_instances(**values).status == "completed"
     second = f.ChaosOrchestrator(str(path), output_dir=str(tmp_path / "second"))
-    first.safety_controller.check_safety_conditions = lambda: (True, [])
-    earlier = f.EC2ChaosExperiment({"dry_run": False}, first.safety_controller)
     handlers[f.signal.SIGTERM](f.signal.SIGTERM, None)
     assert (
         first.safety_controller.emergency_stop
         is second.safety_controller.emergency_stop
     )
     assert first.safety_controller.emergency_stop.is_set()
-    with pytest.raises(f.EmergencyStop):
+    with pytest.raises(f.SafetyViolation, match="active approved handler"):
         earlier.ec2.reboot_instances(InstanceIds=[INSTANCE_ID])
     assert not any(call[1] == "reboot_instances" for call in aws.calls)
     with pytest.raises(f.EmergencyStop):
         earlier._wait_forward(100)
-    earlier._in_rollback = True
-    earlier.ec2.start_instances(InstanceIds=[INSTANCE_ID])
+    earlier.run_rollback()
     assert earlier.rollback_operations == ["ec2.start_instances"]
     third = f.SafetyController({}, session, REGION, True)
     assert third.emergency_stop.is_set()
@@ -163,18 +173,23 @@ def test_vpc_post_delete_requires_bounded_exact_target_readback(
         item.delete_vpc_peering(target) if peering else item.delete_vpc_endpoint(target)
     )
     assert result.status == ("completed" if absent else "failed")
-    assert result.affected_resources == ([target] if absent else [])
+    expected = (
+        f.ChaosOrchestrator._target_values(
+            {"type": kind.value, **action_configs()[kind]}
+        )
+        if peering
+        else {target}
+    )
+    assert set(result.affected_resources) == (expected if absent else set())
     assert sum(call[1] == name for call in aws.calls) >= 3
 
 
 @pytest.mark.parametrize("override", [False, True])
 def test_fis_mutable_template_is_read_only_even_with_asserted_trust(override):
     aws = FakeAWS(reject_writes=False)
-    item = live_experiment(f.ChaosType.FIS_TEMPLATE, aws, template_immutable=override)
-    result = item.run_template("EXT1234567890abcdef0")
-    assert result.status == "failed"
-    assert any("immutable reviewed template" in error for error in result.errors)
-    assert not any(call[1] == "start_experiment" for call in aws.calls)
+    with pytest.raises(f.ConfigurationError, match="Live FIS approval is disabled"):
+        live_experiment(f.ChaosType.FIS_TEMPLATE, aws, template_immutable=override)
+    assert not aws.calls
     cfg = config_for(
         f.ChaosType.FIS_TEMPLATE, experiment_template_id="EXT1234567890abcdef0"
     )
@@ -205,11 +220,9 @@ def test_sqs_foreign_owner_cannot_receive_token_or_purge(foreign):
     with pytest.raises(f.ConfigurationError, match="SQS"):
         f.confirmation_token(cfg, "test")
     aws = FakeAWS(reject_writes=False)
-    item = live_experiment(
-        f.ChaosType.SQS_QUEUE_PURGE, aws, queue_url=url, queue_arn=arn
-    )
-    assert item.purge_queue(url).status == "failed"
-    assert not any(call[1] == "purge_queue" for call in aws.calls)
+    with pytest.raises(f.ConfigurationError, match="SQS"):
+        live_experiment(f.ChaosType.SQS_QUEUE_PURGE, aws, queue_url=url, queue_arn=arn)
+    assert not aws.calls
 
 
 @pytest.mark.parametrize("changed_at", [0, 1, 2])
@@ -511,14 +524,8 @@ def test_live_preflight_and_duration_failure_latch_every_controller(path, raises
     from test_final_scan_regressions import worker
 
     aws = FakeAWS(reject_writes=False)
-    item = worker(aws)
-    item.config = config_for(f.ChaosType.EC2_REBOOT, instance_ids=[INSTANCE_ID])
-    item.config["safety"]["safety_alarms"] = ["chaos-stop"]
-    item.confirmation = "synthetic-token"
-    item.expected_confirmation = lambda *args: "synthetic-token"
-    item.allow_irreversible = False
-    item.vpc_id = None
-    item._validate_target_scope = lambda *args: None
+    values = {"instance_ids": [INSTANCE_ID]}
+    item = worker(aws, f.ChaosType.EC2_REBOOT, values)
 
     def unsafe():
         if raises:
@@ -527,13 +534,20 @@ def test_live_preflight_and_duration_failure_latch_every_controller(path, raises
 
     item.safety_controller.check_safety_conditions = unsafe
     item.safety_controller.emergency_stop.wait = lambda *args: False
-    session = SimpleNamespace(client=lambda service, **kwargs: aws.client(service))
-    prior = f.SafetyController({}, session, REGION, True)
-    prior.check_safety_conditions = lambda: (True, [])
-    earlier = f.EC2ChaosExperiment({"dry_run": False}, prior)
+    earlier = make_experiment(f.ChaosType.EC2_STOP, values, aws, dry_run=False)
+    running = aws.respond("ec2", "describe_instances", {})
+    stopped = copy.deepcopy(running)
+    stopped["Reservations"][0]["Instances"][0]["State"]["Name"] = "stopped"
+    aws.read_overrides[("ec2", "describe_instances")] = [
+        running,
+        stopped,
+        stopped,
+        running,
+    ]
+    assert earlier.stop_instances(**values).status == "completed"
     with pytest.raises((f.SafetyViolation, f.EmergencyStop)):
         if path == "suite":
-            item._run_experiment_suite("test")
+            item._run_experiment_suite("ordinary")
         elif path == "worker":
             item._run_single_experiment_locked(
                 {"type": "ec2_reboot", "instance_ids": [INSTANCE_ID]}
@@ -541,10 +555,9 @@ def test_live_preflight_and_duration_failure_latch_every_controller(path, raises
         else:
             item._wait_with_runtime_checks(30)
     assert f._PROCESS_EMERGENCY_STOP.is_set()
-    with pytest.raises(f.EmergencyStop):
+    with pytest.raises(f.SafetyViolation, match="active approved handler"):
         earlier.ec2.reboot_instances(InstanceIds=[INSTANCE_ID])
-    earlier._in_rollback = True
-    earlier.ec2.start_instances(InstanceIds=[INSTANCE_ID])
+    earlier.run_rollback()
     assert earlier.rollback_operations == ["ec2.start_instances"]
 
 
@@ -576,14 +589,24 @@ def test_stop_during_terminal_read_cannot_complete_forward_wait(method):
     safety = f.SafetyController({}, session, REGION, True)
     safety.check_safety_conditions = lambda: (True, [])
     if method == "vpc":
-        item = f.VPCChaosExperiment({"dry_run": False}, safety)
+        item = live_experiment(
+            f.ChaosType.VPC_ENDPOINT_DELETE
+            if method == "vpc"
+            else f.ChaosType.VPC_PEERING_DELETE,
+            aws,
+        )
         operation = "describe_vpc_endpoints"
         result = {"VpcEndpoints": []}
 
         def call():
             return item._wait_for_vpc_deletion("vpce-0123456789abcdef0", peering=False)
     elif method in {"peering_deleted", "peering_not_found"}:
-        item = f.VPCChaosExperiment({"dry_run": False}, safety)
+        item = live_experiment(
+            f.ChaosType.VPC_ENDPOINT_DELETE
+            if method == "vpc"
+            else f.ChaosType.VPC_PEERING_DELETE,
+            aws,
+        )
         operation = "describe_vpc_peering_connections"
         result = {
             "VpcPeeringConnections": [
@@ -597,7 +620,10 @@ def test_stop_during_terminal_read_cannot_complete_forward_wait(method):
         def call():
             return item._wait_for_vpc_deletion("pcx-0123456789abcdef0", peering=True)
     elif method == "cluster":
-        item = f.RDSChaosExperiment({"dry_run": False}, safety)
+        item = live_experiment(
+            f.ChaosType.RDS_FAILOVER if method == "cluster" else f.ChaosType.RDS_REBOOT,
+            aws,
+        )
         operation = "describe_db_clusters"
         result = aws.respond("rds", operation, {})
         for member in result["DBClusters"][0]["DBClusterMembers"]:
@@ -608,7 +634,10 @@ def test_stop_during_terminal_read_cannot_complete_forward_wait(method):
                 "chaos-test-cluster", original_writer="chaos-test-db"
             )
     else:
-        item = f.RDSChaosExperiment({"dry_run": False}, safety)
+        item = live_experiment(
+            f.ChaosType.RDS_FAILOVER if method == "cluster" else f.ChaosType.RDS_REBOOT,
+            aws,
+        )
         operation = "describe_db_instances"
         result = aws.respond("rds", operation, {})
 

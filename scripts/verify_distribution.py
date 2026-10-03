@@ -95,6 +95,7 @@ APPROVED_SOURCE_PATHS = frozenset(
         "tests/test_normalize_wheel.py",
         "tests/test_release_assets.py",
         "tests/test_security_regressions.py",
+        "tests/test_residual_authorization.py",
         "tests/test_trusted_release_promotion.py",
     ]
 )

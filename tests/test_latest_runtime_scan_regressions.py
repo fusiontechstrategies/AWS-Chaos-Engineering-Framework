@@ -67,7 +67,14 @@ def termination_response(aws):
 def test_termination_refuses_unapproved_or_incomplete_derived_scope(attack):
     aws = FakeAWS(reject_writes=False)
     response = termination_response(aws)
-    item = termination(aws, dry_run=attack not in {"child_allowlist", "radius"})
+    if attack in {"child_allowlist", "radius"}:
+        with pytest.raises(
+            framework.SafetyViolation, match="Direct experiment construction"
+        ):
+            termination(aws, dry_run=False)
+        assert not writes(aws)
+        return
+    item = termination(aws, dry_run=True)
     instance = response["Reservations"][0]["Instances"][0]
     if attack == "child_allowlist":
         item.safety_controller.config["target_allowlist"] = [INSTANCE_ID]
@@ -119,7 +126,10 @@ def test_termination_rechecks_relationship_after_other_baseline_reads():
         "VolumeId"
     ] = OTHER_VOLUME
     aws.read_overrides[("ec2", "describe_instances")] = [baseline, changed]
-    assert termination(aws).terminate_instances([INSTANCE_ID]).status == "failed"
+    assert (
+        termination(aws, dry_run=True).terminate_instances([INSTANCE_ID]).status
+        == "failed"
+    )
     assert not writes(aws)
 
 
@@ -405,6 +415,27 @@ def transition_states(aws, case):
     return pending, ready
 
 
+def transition_owner(cls, aws, timeout, *, dry_run=False):
+    kinds = {
+        framework.EC2ChaosExperiment: framework.ChaosType.EC2_STOP,
+        framework.EBSChaosExperiment: framework.ChaosType.EBS_DETACH_VOLUME,
+        framework.EFSChaosExperiment: framework.ChaosType.EFS_THROTTLE_THROUGHPUT,
+        framework.RDSChaosExperiment: framework.ChaosType.RDS_PARAMETER_GROUP_MODIFY,
+        framework.LambdaChaosExperiment: framework.ChaosType.LAMBDA_MEMORY_LIMIT,
+        framework.ECSChaosExperiment: framework.ChaosType.ECS_SERVICE_UPDATE,
+        framework.KinesisChaosExperiment: framework.ChaosType.KINESIS_RETENTION_MODIFY,
+        framework.OpenSearchChaosExperiment: framework.ChaosType.OPENSEARCH_CLUSTER_CONFIG_MODIFY,
+        framework.AppStreamChaosExperiment: framework.ChaosType.APPSTREAM_FLEET_STOP,
+    }
+    kind = kinds[cls]
+    return make_experiment(
+        kind,
+        {**action_configs()[kind], "state_timeout_seconds": timeout},
+        aws,
+        dry_run=dry_run,
+    )
+
+
 @pytest.mark.parametrize("case", WAIT_CASES, ids=lambda case: case[1])
 def test_every_forward_transition_polls_alarm_changes_and_stops_promptly(
     case, monkeypatch
@@ -413,7 +444,15 @@ def test_every_forward_transition_polls_alarm_changes_and_stops_promptly(
     aws = FakeAWS()
     pending, _ready = transition_states(aws, case)
     aws.read_overrides[(service, operation)] = [pending]
-    safety = FakeSafetyController(aws, live=True)
+    if cls is framework.OpenSearchChaosExperiment:
+        with pytest.raises(
+            framework.ConfigurationError, match="Live approval is unavailable"
+        ):
+            transition_owner(cls, aws, 60)
+        assert not writes(aws)
+        return
+    item = transition_owner(cls, aws, 60)
+    safety = item.safety_controller
     safety.config["monitor_interval_seconds"] = 5
     clock = [0.0]
     alarm = [False]
@@ -432,7 +471,6 @@ def test_every_forward_transition_polls_alarm_changes_and_stops_promptly(
         polls.append(alarm[0])
         or (not alarm[0], ["Synthetic alarm entered ALARM"] if alarm[0] else [])
     )
-    item = cls({"dry_run": False, "state_timeout_seconds": 60}, safety)
     with pytest.raises(framework.EmergencyStop, match="Runtime safety"):
         getattr(item, method)(*args, True)
     assert polls[-1] is True and False in polls
@@ -447,12 +485,14 @@ def test_every_recovery_transition_ignores_stop_event_and_safety_alarm(case):
     aws = FakeAWS()
     _pending, ready = transition_states(aws, case)
     aws.read_overrides[(service, operation)] = [ready]
-    safety = FakeSafetyController(aws, live=True)
+    item = transition_owner(
+        cls, aws, 10, dry_run=cls is framework.OpenSearchChaosExperiment
+    )
+    safety = item.safety_controller
     safety.emergency_stop.set()
     safety.check_safety_conditions = lambda: (_ for _ in ()).throw(
         AssertionError("Recovery must not poll forward guards")
     )
-    item = cls({"dry_run": False, "state_timeout_seconds": 10}, safety)
     item._in_rollback = True
     getattr(item, method)(*args, False)
     assert not writes(aws)
@@ -514,7 +554,7 @@ def test_absent_duplicate_wrong_or_incomplete_targets_never_complete(
 
 def test_orchestrator_refuses_live_no_write_completion():
     aws = FakeAWS()
-    item = worker(aws)
+    item = worker(aws, framework.ChaosType.EC2_STOP, {"instance_ids": [INSTANCE_ID]})
     item._execute_experiment = lambda *_: framework.ExperimentResult(
         "synthetic",
         framework.ChaosType.EC2_STOP,
@@ -610,9 +650,10 @@ def test_concurrency_unsafe_types_plan_but_cannot_obtain_live_approval_or_mutate
     assert dispatch._execute_experiment(planned, kind, config).status == "completed"
     assert not writes(planned_aws)
     live_aws = FakeAWS(reject_writes=False)
-    live = make_experiment(kind, config, live_aws, dry_run=False)
-    with pytest.raises(framework.ConfigurationError, match="not safely executable"):
-        dispatch._execute_experiment(live, kind, config)
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(kind, config, live_aws, dry_run=False)
     assert not writes(live_aws)
     suite_config = framework.yaml.safe_load(framework.SAMPLE_CONFIG)
     suite_config["global"]["account_id"] = ACCOUNT_ID
@@ -631,9 +672,11 @@ def test_direct_forward_or_legacy_cleanup_cannot_clobber_concurrent_state(
     operation, rollback
 ):
     aws = FakeAWS(reject_writes=False)
-    safety = FakeSafetyController(aws, live=True)
-    owner = framework.ChaosExperiment(
-        {"account_id": ACCOUNT_ID, "dry_run": False}, safety
+    owner = make_experiment(
+        framework.ChaosType.EC2_REBOOT,
+        action_configs()[framework.ChaosType.EC2_REBOOT],
+        aws,
+        dry_run=False,
     )
     owner.expected_account = ACCOUNT_ID
     owner._in_rollback = rollback
@@ -641,7 +684,7 @@ def test_direct_forward_or_legacy_cleanup_cannot_clobber_concurrent_state(
     current = {"concurrent_principal": "must remain unchanged"}
     original = copy.deepcopy(current)
     proxy = owner.client(service)
-    with pytest.raises(framework.SafetyViolation, match="conditional ownership proof"):
+    with pytest.raises(framework.SafetyViolation, match="active approved handler"):
         request = (
             {"Bucket": "owned-test-bucket"}
             if service == "s3"
@@ -663,31 +706,40 @@ def test_direct_forward_or_legacy_cleanup_cannot_clobber_concurrent_state(
 )
 def test_incomplete_ec2_recovery_blocks_later_live_work(response):
     aws = FakeAWS(reject_writes=False)
-    aws.read_overrides[("ec2", "describe_instances")] = [
-        {"Reservations": [{"Instances": response}]}
-    ]
-    orchestrator = worker(aws)
-    experiment = framework.EC2ChaosExperiment(
-        {"dry_run": False}, orchestrator.safety_controller
-    )
-    experiment.stopped_instances = [INSTANCE_ID, OTHER_INSTANCE]
-    experiment.mutation_attempts = ["ec2.stop_instances"]
-    orchestrator._create_experiment = lambda *_: experiment
-    orchestrator._execute_experiment = lambda *_: framework.ExperimentResult(
-        "synthetic",
-        framework.ChaosType.EC2_STOP,
-        framework.utc_now(),
-        status="completed",
-        affected_resources=[INSTANCE_ID, OTHER_INSTANCE],
-    )
-    result = orchestrator._run_single_experiment(
-        {"type": "ec2_stop", "instance_ids": [INSTANCE_ID, OTHER_INSTANCE]}
-    )
+    original = aws.respond
+    state = {"stopped": False, "recovered": False}
+
+    def respond(service, operation, request):
+        if service == "ec2" and operation == "describe_instances":
+            aws.calls.append((service, operation, request))
+            instances = (
+                response
+                if state["recovered"]
+                else [
+                    {
+                        "InstanceId": value,
+                        "State": {"Name": "stopped" if state["stopped"] else "running"},
+                    }
+                    for value in [INSTANCE_ID, OTHER_INSTANCE]
+                ]
+            )
+            return {"Reservations": [{"Instances": copy.deepcopy(instances)}]}
+        if service == "ec2" and operation == "stop_instances":
+            state["stopped"] = True
+        if service == "ec2" and operation == "start_instances":
+            state["recovered"] = True
+        return original(service, operation, request)
+
+    aws.respond = respond
+    values = {"instance_ids": [INSTANCE_ID, OTHER_INSTANCE]}
+    orchestrator = worker(aws, framework.ChaosType.EC2_STOP, values)
+    result = orchestrator._run_single_experiment({"type": "ec2_stop", **values})
     assert result.status == "failed" and result.rollback_successful is False
-    assert not experiment.rollback_verified
+    assert result.mutation_attempts == ["ec2.stop_instances"]
+    assert result.rollback_attempts == ["ec2.start_instances"]
     assert framework._LIVE_RECOVERY_BLOCKED.is_set()
     before = list(aws.calls)
-    with pytest.raises(framework.SafetyViolation, match="blocked after unverified"):
+    with pytest.raises(framework.EmergencyStop, match="Process-wide emergency stop"):
         worker(aws)._run_single_experiment(
             {"type": "ec2_stop", "instance_ids": [INSTANCE_ID]}
         )
