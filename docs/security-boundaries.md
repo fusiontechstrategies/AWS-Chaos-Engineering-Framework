@@ -73,9 +73,15 @@ All supported experiment bucket reads, writes, verification and recovery calls
 carry `ExpectedBucketOwner` equal to the captured global approved AWS account.
 AWS refuses an owner mismatch. Per-experiment account overrides are rejected;
 editing the global account invalidates the confirmation token. Cross-account
-S3 experiments are unsupported. Direct library callers must supply the reviewed
-twelve-digit account through their controller or experiment configuration; a
-missing or invalid account refuses bucket calls before dispatch.
+S3 experiments are unsupported. Direct library callers must supply an experiment
+owner and the reviewed twelve-digit account through their controller or
+experiment configuration. Controller-only clients permit safety and identity
+reads, but refuse every mutation and all supported S3 bucket calls, including
+bucket reads. A missing or invalid account refuses owned bucket calls before
+dispatch. The controller's captured account alone does not grant an ownerless
+client experiment approval or recovery authority.
+Owned plan-mode clients permit reads but refuse direct mutation dispatch,
+including calls marked as recovery. Planning never grants write authority.
 
 ## Concurrent changes and recovery evidence
 

@@ -989,15 +989,18 @@ class AwsClientProxy:
     def __getattr__(self, name: str) -> Any:
         attribute = getattr(self._client, name)
         read_only = name.startswith(READ_ONLY_OPERATION_PREFIXES)
-        bind_s3_owner = (
-            self._service == "s3"
-            and self._owner is not None
-            and name in S3_OWNER_BOUND_OPERATIONS
-        )
+        bind_s3_owner = self._service == "s3" and name in S3_OWNER_BOUND_OPERATIONS
         if not callable(attribute) or (read_only and not bind_s3_owner):
             return attribute
 
         def invoke(*args: Any, **kwargs: Any) -> Any:
+            if self._owner is None:
+                # Controller-only clients support safety/identity reads. They do
+                # not carry experiment approval, tracking or recovery ownership.
+                # Refuse every write and every account-bound S3 bucket read.
+                raise SafetyViolation(
+                    "AWS mutations and S3 bucket calls require an experiment owner"
+                )
             if bind_s3_owner:
                 expected = self._owner.expected_account
                 if not isinstance(expected, str) or not ACCOUNT_ID_PATTERN.fullmatch(
@@ -1024,6 +1027,8 @@ class AwsClientProxy:
                 kwargs["ExpectedBucketOwner"] = expected
             if read_only:
                 return attribute(*args, **kwargs)
+            if self._owner.dry_run:
+                raise SafetyViolation("Plan mode refuses direct AWS mutation dispatch")
             if self._owner is not None:
                 if (
                     not self._owner.dry_run

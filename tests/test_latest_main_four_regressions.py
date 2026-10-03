@@ -43,6 +43,57 @@ def live_ec2():
     return owner, controller, aws
 
 
+@pytest.mark.parametrize("account", [None, "", ACCOUNT_ID])
+@pytest.mark.parametrize("operation", sorted(f.S3_OWNER_BOUND_OPERATIONS))
+def test_ownerless_controller_s3_bucket_reads_and_writes_refuse(account, operation):
+    controller, aws = native_controller()
+    controller.expected_account = account
+    with pytest.raises(f.SafetyViolation, match="require an experiment owner"):
+        getattr(controller.client("s3"), operation)(Bucket=BUCKET)
+    assert not aws.calls
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+def test_ownerless_controller_mutation_refuses_before_and_after_latch(stopped):
+    controller, aws = native_controller()
+    if stopped:
+        controller.emergency_stop_all()
+        assert controller.emergency_stop.is_set()
+    with pytest.raises(f.SafetyViolation, match="require an experiment owner"):
+        controller.client("ec2").reboot_instances(InstanceIds=[INSTANCE_ID])
+    assert not aws.calls
+
+
+def test_ownerless_controller_safety_identity_reads_remain_usable_after_stop():
+    controller, aws = native_controller()
+    aws.read_overrides[("sts", "get_caller_identity")] = [{"Account": ACCOUNT_ID}]
+    aws.read_overrides[("guardduty", "list_detectors")] = [{"DetectorIds": ["offline"]}]
+    aws.read_overrides[("securityhub", "get_findings")] = [{"Findings": []}]
+    controller.emergency_stop_all()
+    assert controller.client("sts").get_caller_identity()["Account"] == ACCOUNT_ID
+    assert controller.client("cloudwatch").describe_alarms()["MetricAlarms"]
+    assert controller.client("guardduty").list_detectors()["DetectorIds"]
+    assert controller.client("securityhub").get_findings()["Findings"] == []
+    assert all(call[1].startswith(f.READ_ONLY_OPERATION_PREFIXES) for call in aws.calls)
+
+
+@pytest.mark.parametrize(
+    "service,operation", [("ec2", "reboot_instances"), ("s3", "delete_objects")]
+)
+@pytest.mark.parametrize("rollback", [False, True])
+def test_plan_owner_cannot_dispatch_direct_mutation_even_as_recovery(
+    service, operation, rollback
+):
+    controller, aws = native_controller()
+    owner = f.ChaosExperiment({"dry_run": True}, controller)
+    owner._in_rollback = rollback
+    request = {"Bucket": BUCKET} if service == "s3" else {"InstanceIds": [INSTANCE_ID]}
+    with pytest.raises(f.SafetyViolation, match="Plan mode refuses"):
+        getattr(controller.client(service, owner), operation)(**request)
+    assert not aws.calls
+    assert not owner.mutation_attempts
+
+
 def invoke_thread(action, errors):
     def invoke():
         try:
@@ -203,7 +254,7 @@ def test_all_s3_bucket_reads_writes_and_verifications_bind_captured_owner(operat
     calls = []
     client = SimpleNamespace(**{operation: lambda **kwargs: calls.append(kwargs) or {}})
     controller, _ = native_controller()
-    owner = f.ChaosExperiment({"account_id": ACCOUNT_ID, "dry_run": True}, controller)
+    owner = f.ChaosExperiment({"account_id": ACCOUNT_ID, "dry_run": False}, controller)
     # An unrelated later mapping edit cannot replace the authenticated account.
     owner.config["account_id"] = "999999999999"
     proxy = f.AwsClientProxy("s3", client, owner)
