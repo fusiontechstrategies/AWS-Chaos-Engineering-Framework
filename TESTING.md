@@ -21,6 +21,8 @@ ElastiCache TestFailover, CodeCommit TestRepositoryTriggers and STS
 GetSessionToken before/after stop, without an owner, in plan/recovery mode, and
 with tracked live admission. Reviewed safety/identity reads remain available
 after stop; only reviewed EC2 inventory paginator operations can return delegates.
+SDK protocol controls cover real client `hasattr`, `getattr` defaults, unknown
+attributes, call-time unsupported-method refusal and unchanged stop/tracking.
 
 ## 2.0.3 release-readiness gate
 

@@ -1071,12 +1071,19 @@ class AwsClientProxy:
         ):
             # Raw SDK paginator/waiter/presign helpers retain an unwrapped client.
             # Only the reviewed direct bucket operations are supported here.
-            raise SafetyViolation(
-                "S3 proxy permits only reviewed owner-bound bucket operations"
-            )
+            def refuse_s3_operation(*args: Any, **kwargs: Any) -> Any:
+                raise SafetyViolation(
+                    "S3 proxy permits only reviewed owner-bound bucket operations"
+                )
+
+            return refuse_s3_operation
         if callable(attribute) and name in SDK_DELEGATE_OPERATIONS:
             if self._service != "ec2" or name != "get_paginator":
-                raise SafetyViolation("Unreviewed raw SDK delegates are disabled")
+
+                def refuse_sdk_delegate(*args: Any, **kwargs: Any) -> Any:
+                    raise SafetyViolation("Unreviewed raw SDK delegates are disabled")
+
+                return refuse_sdk_delegate
 
             def reviewed_paginator(*args: Any, **kwargs: Any) -> Any:
                 if len(args) == 1 and not kwargs:
