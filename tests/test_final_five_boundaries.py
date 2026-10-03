@@ -484,3 +484,65 @@ def test_admitted_text_matches_universal_newlines_without_altering_source_bytes(
         == "include README.md\ninclude MANIFEST.in\n"
     )
     assert source_files.read_bytes(tmp_path, "MANIFEST.in") == data
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_posix_directory_owner_has_one_entry_and_idempotent_release(
+    monkeypatch, failure
+):
+    calls = []
+    closed = []
+
+    def open_descriptor(path, flags, *, dir_fd=None):
+        calls.append((path, flags, dir_fd))
+        if failure:
+            raise OSError("ordinary directory acquisition failure")
+        return 42
+
+    fake_os = SimpleNamespace(
+        O_RDONLY=0,
+        O_DIRECTORY=1,
+        O_NOFOLLOW=2,
+        open=open_descriptor,
+        close=closed.append,
+    )
+    monkeypatch.setattr(source_files, "os", fake_os)
+    owner = source_files._PosixDirectory("owned", dir_fd=41)
+    assert not calls and not closed
+    if failure:
+        with pytest.raises(OSError, match="ordinary directory"):
+            owner.__enter__()
+    else:
+        assert owner.__enter__() == 42
+    with pytest.raises(ValueError, match="only once"):
+        owner.__enter__()
+    owner.close()
+    owner.close()
+    owner.__exit__(None, None, None)
+    assert calls == [("owned", 3, 41)]
+    assert closed == ([] if failure else [42])
+    with pytest.raises(ValueError, match="only once"):
+        owner.__enter__()
+
+
+def test_posix_directory_owner_does_not_retry_failed_close(monkeypatch):
+    closed = []
+
+    def close_descriptor(descriptor):
+        closed.append(descriptor)
+        raise OSError("ordinary close failure")
+
+    fake_os = SimpleNamespace(
+        O_RDONLY=0,
+        O_DIRECTORY=1,
+        O_NOFOLLOW=2,
+        open=lambda *a, **k: 43,
+        close=close_descriptor,
+    )
+    monkeypatch.setattr(source_files, "os", fake_os)
+    owner = source_files._PosixDirectory("owned")
+    assert owner.__enter__() == 43
+    with pytest.raises(OSError, match="ordinary close failure"):
+        owner.close()
+    owner.close()
+    assert closed == [43]

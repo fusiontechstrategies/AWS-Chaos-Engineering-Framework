@@ -102,14 +102,37 @@ def _windows_handle(path: Path, directory: bool):
         kernel.CloseHandle(handle)
 
 
-@contextlib.contextmanager
-def _posix_directory(path, *, dir_fd=None):
-    """Retain one no-follow directory descriptor with explicit native ownership."""
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
-    try:
-        yield fd
-    finally:
-        os.close(fd)
+class _PosixDirectory:
+    """Own one retained no-follow directory descriptor for a single context."""
+
+    __slots__ = ("_path", "_parent", "_fd", "_used")
+
+    def __init__(self, path, *, dir_fd=None):
+        self._path = path
+        self._parent = dir_fd  # Borrowed; the surrounding stack retains its owner.
+        self._fd = None
+        self._used = False
+
+    def __enter__(self):
+        if self._used:
+            raise ValueError("source directory lease may be entered only once")
+        self._used = True
+        self._fd = os.open(
+            self._path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=self._parent,
+        )
+        return self._fd
+
+    def close(self):
+        self._used = True
+        descriptor = self._fd
+        self._fd = None  # Never retry a failed close on a potentially reused number.
+        if descriptor is not None:
+            os.close(descriptor)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
 
 @contextlib.contextmanager
@@ -167,11 +190,9 @@ def _file_descriptor(root: Path, parts: tuple[str, ...]):
                 os.close(fd)
     else:
         with contextlib.ExitStack() as stack:
-            parent_fd = stack.enter_context(_posix_directory(root.anchor))
+            parent_fd = stack.enter_context(_PosixDirectory(root.anchor))
             for part in (*root.parts[1:], *parts[:-1]):
-                parent_fd = stack.enter_context(
-                    _posix_directory(part, dir_fd=parent_fd)
-                )
+                parent_fd = stack.enter_context(_PosixDirectory(part, dir_fd=parent_fd))
             fd = os.open(
                 parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
             )
@@ -246,9 +267,9 @@ def source_names(root: Path, relative: str) -> list[str]:
                 stack.enter_context(_windows_handle(ancestor, True))
             listing = directory
         else:
-            listing = stack.enter_context(_posix_directory(directory.anchor))
+            listing = stack.enter_context(_PosixDirectory(directory.anchor))
             for part in directory.parts[1:]:
-                listing = stack.enter_context(_posix_directory(part, dir_fd=listing))
+                listing = stack.enter_context(_PosixDirectory(part, dir_fd=listing))
         with os.scandir(listing) as entries:
             for entry in entries:
                 if len(names) >= MAX_SOURCE_ENTRIES:
