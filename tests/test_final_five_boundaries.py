@@ -112,11 +112,8 @@ def test_legacy_recovery_state_does_not_restore_unconditionally(
     item = make_experiment(kind, action_configs()[kind], aws)
     for key, value in attributes.items():
         setattr(item, key, value)
-    if dry_run:
-        item.rollback()
-    else:
-        with pytest.raises(framework.SafetyViolation, match="unsupported"):
-            item.run_rollback()
+    # The live case already refused construction and returned above.
+    item.rollback()
     assert not aws.calls
     assert not item.rollback_verified
 
