@@ -13,6 +13,7 @@ import argparse
 import atexit
 import copy
 import hashlib
+import inspect
 import ipaddress
 import json
 import logging
@@ -33,6 +34,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -1520,6 +1522,7 @@ class AwsClientProxy:
                 return attribute(*args, **kwargs)
             if self._owner.dry_run:
                 raise SafetyViolation("Plan mode refuses direct AWS mutation dispatch")
+            self._owner._require_execution_grant(dispatch=True)
             if args:
                 raise SafetyViolation(
                     "AWS mutations require explicit keyword resource arguments"
@@ -1584,7 +1587,7 @@ class AwsClientProxy:
                     )
                 self._owner._check_forward_safety()
                 if (
-                    not self._owner._in_rollback
+                    not self._owner._is_recovery_dispatch()
                     and self._owner.safety_controller.emergency_stop.is_set()
                 ):
                     raise EmergencyStop("Emergency stop prevents further AWS mutations")
@@ -1599,14 +1602,16 @@ class AwsClientProxy:
                         raise SafetyViolation(
                             "SQS QueueArn changed before purge dispatch"
                         )
-                if not self._owner._in_rollback and (
+                if not self._owner._is_recovery_dispatch() and (
                     _PROCESS_EMERGENCY_STOP.stop_requested()
                     or self._owner.safety_controller.emergency_stop.is_set()
                 ):
                     raise EmergencyStop(
                         "Emergency stop prevents dispatch after safety or ownership read"
                     )
-            forward = self._owner is not None and not self._owner._in_rollback
+            forward = (
+                self._owner is not None and not self._owner._is_recovery_dispatch()
+            )
             barrier = (
                 _PROCESS_EMERGENCY_STOP.forward_dispatch() if forward else nullcontext()
             )
@@ -1882,11 +1887,632 @@ class SafetyController:
         )
 
 
+@dataclass(frozen=True)
+class _ExecutionGrant:
+    """Immutable authority issued only for a confirmed orchestrator action."""
+
+    kind: ChaosType
+    config_json: str
+    account: str
+    region: str
+    controller: Any
+    targets: frozenset[str]
+
+
+def _canonical_execution_data(value: Any) -> str:
+    list(bounded_argument_leaves({"payload": value}))
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if len(encoded.encode("utf-8")) > MAX_CONFIG_BYTES:
+        raise SafetyViolation("Execution data exceeds the reviewed byte budget")
+    return encoded
+
+
+# This table binds each public handler to its reviewed dispatcher arguments.
+AUTHORIZED_HANDLER_CALLS = {
+    ChaosType.FIS_TEMPLATE: (
+        "run_template",
+        (("experiment_template_id", False, None),),
+    ),
+    ChaosType.EC2_TERMINATE: (
+        "terminate_instances",
+        (("instance_ids", False, None), ("delete_on_termination_volumes", True, None)),
+    ),
+    ChaosType.EC2_STOP: ("stop_instances", (("instance_ids", False, None),)),
+    ChaosType.EC2_REBOOT: ("reboot_instances", (("instance_ids", False, None),)),
+    ChaosType.EC2_NETWORK_LATENCY: (
+        "inject_network_latency",
+        (("instance_ids", False, None), ("latency_ms", True, 100)),
+    ),
+    ChaosType.EC2_NETWORK_PACKET_LOSS: (
+        "inject_packet_loss",
+        (("instance_ids", False, None), ("loss_percent", True, 10)),
+    ),
+    ChaosType.EC2_CPU_STRESS: (
+        "inject_cpu_stress",
+        (
+            ("instance_ids", False, None),
+            ("cpu_percent", True, 80),
+            ("duration_seconds", True, 300),
+        ),
+    ),
+    ChaosType.EC2_MEMORY_STRESS: (
+        "inject_memory_stress",
+        (
+            ("instance_ids", False, None),
+            ("memory_percent", True, 80),
+            ("duration_seconds", True, 300),
+        ),
+    ),
+    ChaosType.EC2_DISK_STRESS: (
+        "inject_disk_stress",
+        (
+            ("instance_ids", False, None),
+            ("io_percent", True, 80),
+            ("duration_seconds", True, 300),
+        ),
+    ),
+    ChaosType.EC2_DISK_FILL: (
+        "fill_disk",
+        (("instance_ids", False, None), ("fill_percent", True, 90)),
+    ),
+    ChaosType.EBS_DETACH_VOLUME: (
+        "detach_volume",
+        (("volume_id", False, None), ("attachment", True, None)),
+    ),
+    ChaosType.EBS_THROTTLE_IOPS: (
+        "throttle_iops",
+        (("volume_id", False, None), ("iops", True, 3000)),
+    ),
+    ChaosType.EFS_MOUNT_TARGET_DELETE: (
+        "delete_mount_target",
+        (("mount_target_id", False, None),),
+    ),
+    ChaosType.EFS_THROTTLE_THROUGHPUT: (
+        "throttle_throughput",
+        (
+            ("file_system_id", False, None),
+            ("throughput_mode", True, "provisioned"),
+            ("provisioned_throughput", True, 1.0),
+        ),
+    ),
+    ChaosType.VPC_SUBNET_ACL_MODIFY: (
+        "modify_subnet_acl",
+        (("subnet_id", False, None), ("nacl_id", False, None)),
+    ),
+    ChaosType.VPC_ROUTE_TABLE_MODIFY: (
+        "modify_route_table",
+        (
+            ("route_table_id", False, None),
+            ("destination_cidr", False, None),
+            ("blackhole", True, True),
+        ),
+    ),
+    ChaosType.VPC_SECURITY_GROUP_MODIFY: (
+        "modify_security_group",
+        (("group_id", False, None), ("remove_rule", False, None)),
+    ),
+    ChaosType.VPC_NACL_BLOCK_TRAFFIC: (
+        "block_traffic_nacl",
+        (
+            ("nacl_id", False, None),
+            ("rule_number", True, 100),
+            ("protocol", True, "-1"),
+            ("cidr_block", True, "0.0.0.0/0"),
+        ),
+    ),
+    ChaosType.VPC_PEERING_DELETE: (
+        "delete_vpc_peering",
+        (("peering_connection_id", False, None),),
+    ),
+    ChaosType.VPC_ENDPOINT_DELETE: (
+        "delete_vpc_endpoint",
+        (("endpoint_id", False, None),),
+    ),
+    ChaosType.RDS_FAILOVER: (
+        "failover_db_cluster",
+        (("cluster_identifier", False, None),),
+    ),
+    ChaosType.RDS_REBOOT: (
+        "reboot_db_instance",
+        (("db_instance_identifier", False, None), ("force_failover", True, False)),
+    ),
+    ChaosType.RDS_BACKUP_RETENTION_MODIFY: (
+        "modify_backup_retention",
+        (("db_identifier", False, None), ("retention_period", True, 0)),
+    ),
+    ChaosType.RDS_PARAMETER_GROUP_MODIFY: (
+        "modify_parameter_group",
+        (("parameter_group_name", False, None), ("parameters", False, None)),
+    ),
+    ChaosType.LAMBDA_THROTTLE: (
+        "throttle_function",
+        (("function_name", False, None), ("reserved_concurrent_executions", True, 0)),
+    ),
+    ChaosType.LAMBDA_ERROR_INJECTION: (
+        "inject_error",
+        (("function_name", False, None), ("error_rate", True, 0.5)),
+    ),
+    ChaosType.LAMBDA_TIMEOUT_MODIFY: (
+        "modify_timeout",
+        (("function_name", False, None), ("timeout_seconds", True, 1)),
+    ),
+    ChaosType.LAMBDA_MEMORY_LIMIT: (
+        "modify_memory_limit",
+        (("function_name", False, None), ("memory_mb", True, 128)),
+    ),
+    ChaosType.LAMBDA_ENVIRONMENT_CORRUPT: (
+        "corrupt_environment",
+        (("function_name", False, None), ("corrupt_vars", False, None)),
+    ),
+    ChaosType.S3_BUCKET_POLICY_DENY: (
+        "deny_bucket_policy",
+        (("bucket_name", False, None), ("break_glass_principal_arn", False, None)),
+    ),
+    ChaosType.S3_BUCKET_VERSIONING_SUSPEND: (
+        "suspend_versioning",
+        (("bucket_name", False, None),),
+    ),
+    ChaosType.S3_BUCKET_ENCRYPTION_DISABLE: (
+        "disable_encryption",
+        (("bucket_name", False, None),),
+    ),
+    ChaosType.S3_OBJECT_DELETE: (
+        "delete_objects",
+        (("bucket_name", False, None), ("prefix", True, ""), ("max_objects", True, 10)),
+    ),
+    ChaosType.S3_LIFECYCLE_MODIFY: (
+        "modify_lifecycle",
+        (("bucket_name", False, None), ("expire_days", True, 1)),
+    ),
+    ChaosType.SQS_QUEUE_PURGE: ("purge_queue", (("queue_url", False, None),)),
+    ChaosType.SQS_QUEUE_POLICY_RESTRICT: (
+        "restrict_queue_policy",
+        (("queue_url", False, None), ("break_glass_principal_arn", False, None)),
+    ),
+    ChaosType.SQS_MESSAGE_DELAY: (
+        "modify_message_delay",
+        (("queue_url", False, None), ("delay_seconds", True, 900)),
+    ),
+    ChaosType.SQS_VISIBILITY_TIMEOUT: (
+        "modify_visibility_timeout",
+        (("queue_url", False, None), ("timeout_seconds", True, 43200)),
+    ),
+    ChaosType.SNS_SUBSCRIPTION_DELETE: (
+        "delete_subscription",
+        (("subscription_arn", False, None),),
+    ),
+    ChaosType.SNS_TOPIC_POLICY_RESTRICT: (
+        "restrict_topic_policy",
+        (("topic_arn", False, None), ("break_glass_principal_arn", False, None)),
+    ),
+    ChaosType.ELB_REMOVE_TARGETS: (
+        "remove_targets",
+        (
+            ("target_group_arn", False, None),
+            ("target_ids", False, None),
+            ("target_descriptors", True, None),
+        ),
+    ),
+    ChaosType.ELB_MODIFY_ATTRIBUTES: (
+        "modify_attributes",
+        (("target_group_arn", False, None), ("deregistration_delay", True, 3600)),
+    ),
+    ChaosType.ELB_HEALTH_CHECK_MODIFY: (
+        "modify_health_check",
+        (
+            ("target_group_arn", False, None),
+            ("interval", True, 300),
+            ("timeout", True, 120),
+        ),
+    ),
+    ChaosType.ELB_LISTENER_RULE_MODIFY: (
+        "modify_listener_rule",
+        (
+            ("rule_arn", False, None),
+            ("action_type", True, "fixed-response"),
+            ("status_code", True, "503"),
+        ),
+    ),
+    ChaosType.ECS_TASK_STOP: (
+        "stop_tasks",
+        (
+            ("cluster", False, None),
+            ("task_arns", False, None),
+            ("reason", True, "Chaos experiment"),
+        ),
+    ),
+    ChaosType.ECS_SERVICE_UPDATE: (
+        "update_service",
+        (
+            ("cluster", False, None),
+            ("service", False, None),
+            ("desired_count", True, 0),
+        ),
+    ),
+    ChaosType.ECS_CONTAINER_INSTANCE_DRAIN: (
+        "drain_container_instance",
+        (("cluster", False, None), ("container_instance_arn", False, None)),
+    ),
+    ChaosType.ECS_TASK_DEFINITION_MODIFY: (
+        "modify_task_definition",
+        (
+            ("task_definition", False, None),
+            ("cpu", True, "256"),
+            ("memory", True, "512"),
+        ),
+    ),
+    ChaosType.KINESIS_SHARD_SPLIT: (
+        "split_shard",
+        (
+            ("stream_name", False, None),
+            ("shard_to_split", False, None),
+            ("new_starting_hash_key", False, None),
+        ),
+    ),
+    ChaosType.KINESIS_SHARD_MERGE: (
+        "merge_shards",
+        (
+            ("stream_name", False, None),
+            ("shard_to_merge", False, None),
+            ("adjacent_shard", False, None),
+        ),
+    ),
+    ChaosType.KINESIS_RETENTION_MODIFY: (
+        "modify_retention",
+        (("stream_name", False, None), ("retention_hours", True, 168)),
+    ),
+    ChaosType.KINESIS_THROUGHPUT_LIMIT: (
+        "limit_throughput",
+        (("stream_name", False, None), ("shard_count", True, 1)),
+    ),
+    ChaosType.OPENSEARCH_NODE_RESTART: (
+        "restart_node",
+        (("domain_name", False, None), ("instance_id", False, None)),
+    ),
+    ChaosType.OPENSEARCH_CLUSTER_CONFIG_MODIFY: (
+        "modify_cluster_config",
+        (("domain_name", False, None), ("instance_count", True, 1)),
+    ),
+    ChaosType.OPENSEARCH_INDEX_DELETE: (
+        "delete_index",
+        (("domain_endpoint", False, None), ("index_name", False, None)),
+    ),
+    ChaosType.CLOUDFRONT_BEHAVIOR_MODIFY: (
+        "modify_behavior",
+        (
+            ("distribution_id", False, None),
+            ("path_pattern", True, "/*"),
+            ("error_code", True, 503),
+        ),
+    ),
+    ChaosType.CLOUDFRONT_ORIGIN_FAILOVER: (
+        "trigger_origin_failover",
+        (("distribution_id", False, None),),
+    ),
+    ChaosType.CLOUDFRONT_CACHE_INVALIDATE: (
+        "invalidate_cache",
+        (("distribution_id", False, None), ("paths", True, ["/*"])),
+    ),
+    ChaosType.WAF_RULE_MODIFY: (
+        "modify_rule",
+        (
+            ("web_acl_id", False, None),
+            ("web_acl_name", False, None),
+            ("rule_name", False, None),
+            ("action", True, "BLOCK"),
+            ("scope", True, "REGIONAL"),
+        ),
+    ),
+    ChaosType.WAF_RATE_LIMIT_MODIFY: (
+        "modify_rate_limit",
+        (
+            ("web_acl_id", False, None),
+            ("web_acl_name", False, None),
+            ("rule_name", False, None),
+            ("limit", True, 100),
+            ("scope", True, "REGIONAL"),
+        ),
+    ),
+    ChaosType.WAF_IP_SET_MODIFY: (
+        "modify_ip_set",
+        (
+            ("ip_set_id", False, None),
+            ("ip_set_name", False, None),
+            ("addresses_to_add", False, None),
+            ("scope", True, "REGIONAL"),
+        ),
+    ),
+    ChaosType.KMS_KEY_DISABLE: ("disable_key", (("key_id", False, None),)),
+    ChaosType.KMS_KEY_POLICY_RESTRICT: (
+        "restrict_key_policy",
+        (("key_id", False, None), ("break_glass_principal_arn", False, None)),
+    ),
+    ChaosType.KMS_GRANT_REVOKE: (
+        "revoke_grant",
+        (("key_id", False, None), ("grant_id", False, None)),
+    ),
+    ChaosType.IAM_POLICY_DETACH: (
+        "detach_policy",
+        (("role_name", False, None), ("policy_arn", False, None)),
+    ),
+    ChaosType.IAM_ROLE_MODIFY: (
+        "modify_role",
+        (("role_name", False, None), ("max_session_duration", True, 3600)),
+    ),
+    ChaosType.IAM_USER_ACCESS_KEY_DEACTIVATE: (
+        "deactivate_access_key",
+        (("user_name", False, None), ("access_key_id", False, None)),
+    ),
+    ChaosType.DS_TRUST_DELETE: ("delete_trust", (("trust_id", False, None),)),
+    ChaosType.DS_CONDITIONAL_FORWARDER_DELETE: (
+        "delete_conditional_forwarder",
+        (("directory_id", False, None), ("remote_domain_name", False, None)),
+    ),
+    ChaosType.APPSTREAM_FLEET_STOP: ("stop_fleet", (("fleet_name", False, None),)),
+    ChaosType.APPSTREAM_STACK_DISASSOCIATE: (
+        "disassociate_stack",
+        (("fleet_name", False, None), ("stack_name", False, None)),
+    ),
+    ChaosType.ECR_IMAGE_DELETE: (
+        "delete_images",
+        (("repository_name", False, None), ("image_ids", False, None)),
+    ),
+    ChaosType.ECR_REPOSITORY_POLICY_RESTRICT: (
+        "restrict_repository_policy",
+        (("repository_name", False, None), ("break_glass_principal_arn", False, None)),
+    ),
+    ChaosType.CODECOMMIT_TRIGGER_DELETE: (
+        "delete_trigger",
+        (("repository_name", False, None), ("trigger_name", False, None)),
+    ),
+    ChaosType.CODECOMMIT_BRANCH_PROTECT: (
+        "protect_branch",
+        (("repository_name", False, None), ("branch_name", False, None)),
+    ),
+    ChaosType.SES_CONFIGURATION_SET_DELETE: (
+        "delete_configuration_set",
+        (("config_set_name", False, None),),
+    ),
+    ChaosType.SES_SENDING_QUOTA_LIMIT: (
+        "modify_sending_quota",
+        (("max_send_rate", True, 1.0),),
+    ),
+}
+
+
+def peering_endpoint_scope(config: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
+    """Admit an exact complete same-account and same-region endpoint tuple."""
+    endpoints = config.get("peering_endpoints")
+    if not isinstance(endpoints, dict) or set(endpoints) != {"requester", "accepter"}:
+        raise SafetyViolation("Peering deletion requires both reviewed endpoints")
+    for endpoint in endpoints.values():
+        if not isinstance(endpoint, dict) or set(endpoint) != {
+            "owner_id",
+            "region",
+            "vpc_id",
+        }:
+            raise SafetyViolation(
+                "Peering endpoint identity must be complete and exact"
+            )
+        if (
+            not isinstance(endpoint["owner_id"], str)
+            or not ACCOUNT_ID_PATTERN.fullmatch(endpoint["owner_id"])
+            or not isinstance(endpoint["region"], str)
+            or not isinstance(endpoint["vpc_id"], str)
+            or not re.fullmatch(r"vpc-[0-9a-f]{8}(?:[0-9a-f]{9})?", endpoint["vpc_id"])
+        ):
+            raise SafetyViolation("Peering endpoint identity is invalid")
+    if endpoints["requester"]["vpc_id"] == endpoints["accepter"]["vpc_id"]:
+        raise SafetyViolation("Peering endpoints must be distinct VPCs")
+    canonical = json.loads(_canonical_execution_data(endpoints))
+    digest = hashlib.sha256(
+        _canonical_execution_data(canonical).encode("utf-8")
+    ).hexdigest()
+    return canonical, {endpoint["vpc_id"] for endpoint in canonical.values()} | {
+        "selector:vpc_peering_delete:" + digest
+    }
+
+
+MAX_DENIED_PATTERNS = 32
+MAX_DENIED_PATTERN_LENGTH = 128
+MAX_DENIED_TARGET_LENGTH = 2048
+MAX_DENIED_MATCH_WORK = 1_048_576
+DEFAULT_DENIED_PATTERNS = ["prod", "production"]
+
+
+def validate_denied_patterns(patterns: Any) -> list[str]:
+    """Allow only small literal globs with * and ?, without regex evaluation."""
+    if not isinstance(patterns, list) or not 1 <= len(patterns) <= MAX_DENIED_PATTERNS:
+        raise ConfigurationError(
+            "safety.denied_target_globs requires 1..32 literal globs"
+        )
+    for pattern in patterns:
+        if (
+            not isinstance(pattern, str)
+            or not 1 <= len(pattern) <= MAX_DENIED_PATTERN_LENGTH
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_/.:@*?"
+                for character in pattern
+            )
+        ):
+            raise ConfigurationError(
+                "Denied target patterns permit bounded literal text, * and ? only"
+            )
+    return patterns
+
+
+def denied_policy_globs(safety: dict[str, Any]) -> list[str]:
+    """Require explicit migration before applying the new glob grammar."""
+    if "denied_target_patterns" in safety:
+        raise ConfigurationError(
+            "Legacy safety.denied_target_patterns regex configuration is unsupported; "
+            "manually migrate every pattern to safety.denied_target_globs"
+        )
+    return validate_denied_patterns(
+        safety.get("denied_target_globs", DEFAULT_DENIED_PATTERNS)
+    )
+
+
+def denied_target_matches(patterns: Any, targets: set[str]) -> bool:
+    patterns = validate_denied_patterns(patterns)
+    if len(targets) > 1024:
+        raise SafetyViolation(
+            "Denied target admission exceeds the reviewed target budget"
+        )
+    if any(
+        not isinstance(target, str) or len(target) > MAX_DENIED_TARGET_LENGTH
+        for target in targets
+    ):
+        raise SafetyViolation(
+            "Denied target admission exceeds the reviewed target budget"
+        )
+    normalized = [target.casefold() for target in targets]
+    if any(len(target) > MAX_DENIED_TARGET_LENGTH for target in normalized):
+        raise SafetyViolation(
+            "Denied target admission exceeds the reviewed target budget"
+        )
+    if sum(map(len, patterns)) * sum(map(len, normalized)) > MAX_DENIED_MATCH_WORK:
+        raise SafetyViolation(
+            "Denied target matching exceeds the reviewed aggregate work budget"
+        )
+    for target in normalized:
+        if not isinstance(target, str) or len(target) > MAX_DENIED_TARGET_LENGTH:
+            raise SafetyViolation(
+                "Denied target admission exceeds the reviewed target budget"
+            )
+        folded = target.casefold()
+        if any(
+            part in {"prod", "production"}
+            for part in folded.replace("/", "-").replace("_", "-").split("-")
+        ):
+            return True
+        for pattern in patterns:
+            # A bounded dynamic program has O(pattern length * target length)
+            # work. No pattern is sent to a backtracking expression engine.
+            matched = [True] + [False] * len(folded)
+            for character in pattern.casefold():
+                next_matched = [False] * (len(folded) + 1)
+                if character == "*":
+                    next_matched[0] = matched[0]
+                    for index in range(1, len(folded) + 1):
+                        next_matched[index] = matched[index] or next_matched[index - 1]
+                else:
+                    for index in range(1, len(folded) + 1):
+                        next_matched[index] = matched[index - 1] and (
+                            character == "?" or character == folded[index - 1]
+                        )
+                matched = next_matched
+            if matched[-1]:
+                return True
+    return False
+
+
+def _guard_live_handler(method):
+    signature = inspect.signature(method)
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        if self.dry_run:
+            return method(self, *args, **kwargs)
+        acquired = False
+        try:
+            grant = self._require_execution_grant()
+            selected = AUTHORIZED_HANDLER_CALLS.get(grant.kind)
+            if selected is None or selected[0] != method.__name__:
+                raise SafetyViolation(
+                    "Handler differs from the approved experiment type"
+                )
+            bound = signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            actual = [value for key, value in bound.arguments.items() if key != "self"]
+            approved = json.loads(grant.config_json)
+            expected = [
+                approved.get(key, default) if optional else approved[key]
+                for key, optional, default in selected[1]
+            ]
+            if (
+                grant.kind == ChaosType.CLOUDFRONT_CACHE_INVALIDATE
+                and actual[1] is None
+            ):
+                actual[1] = ["/*"]
+            if _canonical_execution_data(actual) != _canonical_execution_data(expected):
+                raise SafetyViolation(
+                    "Handler arguments differ from the immutable approved request"
+                )
+            acquired = self._execution_lock.acquire(blocking=False)
+            if not acquired:
+                raise SafetyViolation("Another experiment lifecycle is active")
+            if self._execution_used:
+                raise SafetyViolation("Execution grant has already been consumed")
+            self._execution_used = True
+        except (SafetyViolation, TypeError, ValueError) as error:
+            if acquired:
+                self._execution_lock.release()
+            # Public handlers have always returned failed ExperimentResult data
+            # for rejected live work. Preserve that contract for grant checks.
+            grant = self._execution_grant
+            kind = (
+                grant.kind
+                if isinstance(grant, _ExecutionGrant)
+                else next(
+                    kind
+                    for kind, call in AUTHORIZED_HANDLER_CALLS.items()
+                    if call[0] == method.__name__
+                )
+            )
+            return ExperimentResult(
+                experiment_id=_experiment_id("refused"),
+                experiment_type=kind,
+                start_time=utc_now(),
+                end_time=utc_now(),
+                status="failed",
+                errors=[str(error)],
+            )
+        self._sdk_request_authority.execution = grant
+        self._sdk_request_authority.phase = "forward"
+        try:
+            # Run with detached approved values, so caller-owned containers
+            # cannot alter the request after admission.
+            return method(self, *json.loads(_canonical_execution_data(expected)))
+        finally:
+            self._forward_finished = True
+            del self._sdk_request_authority.execution
+            del self._sdk_request_authority.phase
+            self._execution_lock.release()
+
+    return guarded
+
+
 class ChaosExperiment:
     """Base class for chaos experiments"""
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        handlers = {value[0] for value in AUTHORIZED_HANDLER_CALLS.values()}
+        for name in handlers & cls.__dict__.keys():
+            setattr(cls, name, _guard_live_handler(cls.__dict__[name]))
+
     def __init__(self, config: dict[str, Any], safety_controller: SafetyController):
-        self.config = config
+        creation = getattr(safety_controller, "_execution_creation", None)
+        grant = getattr(creation, "grant", None)
+        if config.get("dry_run", True) is not True:
+            if (
+                not isinstance(grant, _ExecutionGrant)
+                or grant.controller is not safety_controller
+                or grant.config_json != _canonical_execution_data(config)
+            ):
+                raise SafetyViolation(
+                    "Direct experiment construction is plan-only; live execution requires confirmed orchestrator authority"
+                )
+            del creation.grant
+        else:
+            grant = None
+        self._execution_grant = grant
+        self._execution_lock = threading.Lock()
+        self._execution_used = False
+        self._forward_finished = False
+        self.config = copy.deepcopy(config)
         self.safety_controller = safety_controller
         # Capture the account authenticated by the orchestrator, rather than
         # consulting a mutable per-experiment mapping at every request.
@@ -1906,6 +2532,30 @@ class ChaosExperiment:
         self._in_rollback = False
         self.rollback_mode = "none"
         self._sdk_request_authority = threading.local()
+
+    def _require_execution_grant(self, *, dispatch: bool = False) -> _ExecutionGrant:
+        grant = self._execution_grant
+        if (
+            not isinstance(grant, _ExecutionGrant)
+            or grant.controller is not self.safety_controller
+            or grant.account != self.expected_account
+            or grant.region != self.expected_region
+            or grant.config_json != _canonical_execution_data(self.config)
+        ):
+            raise SafetyViolation(
+                "AWS mutation requires unchanged immutable execution authority"
+            )
+        if dispatch and not (
+            (
+                getattr(self._sdk_request_authority, "phase", None) == "forward"
+                and getattr(self._sdk_request_authority, "execution", None) is grant
+            )
+            or self._is_recovery_dispatch()
+        ):
+            raise SafetyViolation(
+                "AWS mutation requires an active approved handler or its owned recovery"
+            )
+        return grant
 
     @contextmanager
     def _approved_sdk_request(
@@ -1967,7 +2617,7 @@ class ChaosExperiment:
                 raise SafetyViolation(
                     "Authorized WAF request differs from its reviewed parent or scope"
                 )
-            if self._in_rollback:
+            if self._is_recovery_dispatch():
                 if not getattr(self, "ip_set_write_confirmed", False):
                     raise SafetyViolation(
                         "WAF recovery requires confirmed owned additions"
@@ -2016,29 +2666,64 @@ class ChaosExperiment:
 
     def _record_mutation(self, operation: str) -> None:
         """Record a successful forward or rollback operation."""
-        if self._in_rollback:
+        if self._is_recovery_dispatch():
             self.rollback_operations.append(operation)
         else:
             self.mutation_operations.append(operation)
 
     def _record_mutation_attempt(self, operation: str) -> None:
         """Record a write attempt, including ambiguous network failures."""
-        if self._in_rollback:
+        if self._is_recovery_dispatch():
             self.rollback_attempts.append(operation)
         else:
             self.mutation_attempts.append(operation)
 
+    def _is_recovery_dispatch(self) -> bool:
+        """Recovery exemptions belong only to this thread's admitted phase."""
+        return getattr(self._sdk_request_authority, "phase", None) == "recovery" and (
+            self.dry_run
+            or (
+                isinstance(self._execution_grant, _ExecutionGrant)
+                and getattr(self._sdk_request_authority, "recovery", None)
+                is self._execution_grant
+                and getattr(self._sdk_request_authority, "execution", None) is None
+            )
+        )
+
     def run_rollback(self) -> None:
-        """Run rollback while separating forward and rollback SDK operations."""
-        self._in_rollback = True
+        """Recover only after the owned forward lifecycle has settled."""
+        if not self._execution_lock.acquire(blocking=False):
+            raise SafetyViolation("Another experiment lifecycle is active")
+        recovery_grant = None
         try:
-            self.rollback()
-            self._verify_additional_recovery()
-        except Exception as exc:
-            self.rollback_errors.append(str(exc))
-            raise
+            if not self.dry_run:
+                grant = self._require_execution_grant()
+                if not self._execution_used or not self._forward_finished:
+                    raise SafetyViolation(
+                        "Recovery requires a completed approved handler lifecycle"
+                    )
+                if self.mutation_attempts:
+                    recovery_grant = grant
+            if getattr(self._sdk_request_authority, "phase", None) is not None:
+                raise SafetyViolation("Nested recovery dispatch is refused")
+            self._sdk_request_authority.phase = "recovery"
+            if recovery_grant is not None:
+                self._sdk_request_authority.recovery = recovery_grant
+            # Diagnostic compatibility only. SDK admission never reads this flag.
+            self._in_rollback = True
+            try:
+                self.rollback()
+                self._verify_additional_recovery()
+            except Exception as exc:
+                self.rollback_errors.append(str(exc))
+                raise
+            finally:
+                self._in_rollback = False
+                del self._sdk_request_authority.phase
+                if recovery_grant is not None:
+                    del self._sdk_request_authority.recovery
         finally:
-            self._in_rollback = False
+            self._execution_lock.release()
 
     def _verify_additional_recovery(self) -> None:
         """Read back extension recovery state independently of successful writes."""
@@ -2276,7 +2961,7 @@ class ChaosExperiment:
 
     def _check_forward_safety(self) -> None:
         """Poll all configured guards during forward work; recovery is exempt."""
-        if self.dry_run or self._in_rollback:
+        if self.dry_run or self._is_recovery_dispatch():
             return
         require_runtime_safety(self.safety_controller, "Runtime safety")
 
@@ -2300,6 +2985,11 @@ class ChaosExperiment:
         """Require child IDs and tuple approval even for direct class callers."""
         targets = ChaosOrchestrator._target_values({"type": kind.value, **config})
         if not self.dry_run:
+            grant = self._require_execution_grant()
+            if targets - grant.targets:
+                raise SafetyViolation(
+                    "Derived resources exceed immutable approved scope"
+                )
             safety = self.safety_controller.config
             if targets - set(safety.get("target_allowlist", [])):
                 raise SafetyViolation(
@@ -2309,9 +2999,8 @@ class ChaosExperiment:
                 safety.get("max_blast_radius", 1)
             ):
                 raise SafetyViolation("Derived resources exceed max_blast_radius")
-            for pattern in safety.get("denied_target_patterns", []):
-                if any(re.search(str(pattern), target) for target in targets):
-                    raise SafetyViolation("A derived target matches a denied pattern")
+            if denied_target_matches(denied_policy_globs(safety), targets):
+                raise SafetyViolation("A derived target matches a denied pattern")
         return targets
 
 
@@ -2540,98 +3229,18 @@ class EC2ChaosExperiment(ChaosExperiment):
     def inject_network_latency(
         self, instance_ids: list[str], latency_ms: int = 100
     ) -> ExperimentResult:
-        """Inject network latency using SSM"""
-        experiment_id = _experiment_id("ec2-latency")
-        result = ExperimentResult(
-            experiment_id=experiment_id,
-            experiment_type=ChaosType.EC2_NETWORK_LATENCY,
-            start_time=utc_now(),
+        """Legacy SSM execution is disabled; use a reviewed FIS template."""
+        raise ConfigurationError(
+            "Legacy SSM shell faults are disabled; use a reviewed FIS template"
         )
-
-        try:
-            command = f"""
-            sudo tc qdisc add dev eth0 root netem delay {latency_ms}ms
-            echo "Network latency of {latency_ms}ms added"
-            """
-
-            if not self.dry_run:
-                self.ssm.send_command(
-                    InstanceIds=instance_ids,
-                    DocumentName="AWS-RunShellScript",
-                    Parameters={"commands": [command]},
-                )
-                result.affected_resources = instance_ids
-                logger.info(
-                    f"Injected {latency_ms}ms latency on instances: {instance_ids}"
-                )
-
-                # Store for rollback
-                self.latency_instances = instance_ids
-            else:
-                logger.info(
-                    f"DRY RUN: Would inject {latency_ms}ms latency on instances: {instance_ids}"
-                )
-                result.affected_resources = instance_ids
-
-            result.status = "completed"
-
-        except Exception as e:
-            logger.error(f"Error injecting latency: {e}")
-            result.errors.append(str(e))
-            result.status = "failed"
-
-        finally:
-            result.end_time = utc_now()
-
-        return result
 
     def inject_packet_loss(
         self, instance_ids: list[str], loss_percent: int = 10
     ) -> ExperimentResult:
-        """Inject network packet loss using SSM"""
-        experiment_id = _experiment_id("ec2-packet-loss")
-        result = ExperimentResult(
-            experiment_id=experiment_id,
-            experiment_type=ChaosType.EC2_NETWORK_PACKET_LOSS,
-            start_time=utc_now(),
+        """Legacy SSM execution is disabled; use a reviewed FIS template."""
+        raise ConfigurationError(
+            "Legacy SSM shell faults are disabled; use a reviewed FIS template"
         )
-
-        try:
-            command = f"""
-            sudo tc qdisc add dev eth0 root netem loss {loss_percent}%
-            echo "Packet loss of {loss_percent}% added"
-            """
-
-            if not self.dry_run:
-                self.ssm.send_command(
-                    InstanceIds=instance_ids,
-                    DocumentName="AWS-RunShellScript",
-                    Parameters={"commands": [command]},
-                )
-                result.affected_resources = instance_ids
-                logger.info(
-                    f"Injected {loss_percent}% packet loss on instances: {instance_ids}"
-                )
-
-                # Store for rollback
-                self.packet_loss_instances = instance_ids
-            else:
-                logger.info(
-                    f"DRY RUN: Would inject {loss_percent}% packet loss on instances: {instance_ids}"
-                )
-                result.affected_resources = instance_ids
-
-            result.status = "completed"
-
-        except Exception as e:
-            logger.error(f"Error injecting packet loss: {e}")
-            result.errors.append(str(e))
-            result.status = "failed"
-
-        finally:
-            result.end_time = utc_now()
-
-        return result
 
     def inject_cpu_stress(
         self,
@@ -2639,51 +3248,10 @@ class EC2ChaosExperiment(ChaosExperiment):
         cpu_percent: int = 80,
         duration_seconds: int = 300,
     ) -> ExperimentResult:
-        """Inject CPU stress using SSM"""
-        experiment_id = _experiment_id("ec2-cpu-stress")
-        result = ExperimentResult(
-            experiment_id=experiment_id,
-            experiment_type=ChaosType.EC2_CPU_STRESS,
-            start_time=utc_now(),
+        """Legacy SSM execution is disabled; use a reviewed FIS template."""
+        raise ConfigurationError(
+            "Legacy SSM shell faults are disabled; use a reviewed FIS template"
         )
-
-        try:
-            command = f"""
-            # Install stress-ng if not present
-            which stress-ng || sudo yum install -y stress-ng || sudo apt-get install -y stress-ng
-
-            # Run CPU stress test
-            stress-ng --cpu 0 --cpu-load {cpu_percent} --timeout {duration_seconds}s
-            """
-
-            if not self.dry_run:
-                self.ssm.send_command(
-                    InstanceIds=instance_ids,
-                    DocumentName="AWS-RunShellScript",
-                    Parameters={"commands": [command]},
-                    TimeoutSeconds=duration_seconds + 60,
-                )
-                result.affected_resources = instance_ids
-                logger.info(
-                    f"Injected CPU stress ({cpu_percent}%) on instances: {instance_ids}"
-                )
-            else:
-                logger.info(
-                    f"DRY RUN: Would inject CPU stress ({cpu_percent}%) on instances: {instance_ids}"
-                )
-                result.affected_resources = instance_ids
-
-            result.status = "completed"
-
-        except Exception as e:
-            logger.error(f"Error injecting CPU stress: {e}")
-            result.errors.append(str(e))
-            result.status = "failed"
-
-        finally:
-            result.end_time = utc_now()
-
-        return result
 
     def inject_memory_stress(
         self,
@@ -2691,167 +3259,26 @@ class EC2ChaosExperiment(ChaosExperiment):
         memory_percent: int = 80,
         duration_seconds: int = 300,
     ) -> ExperimentResult:
-        """Inject memory stress using SSM"""
-        experiment_id = _experiment_id("ec2-memory-stress")
-        result = ExperimentResult(
-            experiment_id=experiment_id,
-            experiment_type=ChaosType.EC2_MEMORY_STRESS,
-            start_time=utc_now(),
+        """Legacy SSM execution is disabled; use a reviewed FIS template."""
+        raise ConfigurationError(
+            "Legacy SSM shell faults are disabled; use a reviewed FIS template"
         )
-
-        try:
-            command = f"""
-            # Install stress-ng if not present
-            which stress-ng || sudo yum install -y stress-ng || sudo apt-get install -y stress-ng
-
-            # Get total memory and calculate stress amount
-            TOTAL_MEM=$(free -m | awk 'NR==2{{print $2}}')
-            STRESS_MEM=$((TOTAL_MEM * {memory_percent} / 100))
-
-            # Run memory stress test
-            stress-ng --vm 1 --vm-bytes ${{STRESS_MEM}}M --timeout {duration_seconds}s
-            """
-
-            if not self.dry_run:
-                self.ssm.send_command(
-                    InstanceIds=instance_ids,
-                    DocumentName="AWS-RunShellScript",
-                    Parameters={"commands": [command]},
-                    TimeoutSeconds=duration_seconds + 60,
-                )
-                result.affected_resources = instance_ids
-                logger.info(
-                    f"Injected memory stress ({memory_percent}%) on instances: {instance_ids}"
-                )
-            else:
-                logger.info(
-                    f"DRY RUN: Would inject memory stress ({memory_percent}%) on instances: {instance_ids}"
-                )
-                result.affected_resources = instance_ids
-
-            result.status = "completed"
-
-        except Exception as e:
-            logger.error(f"Error injecting memory stress: {e}")
-            result.errors.append(str(e))
-            result.status = "failed"
-
-        finally:
-            result.end_time = utc_now()
-
-        return result
 
     def inject_disk_stress(
         self, instance_ids: list[str], io_percent: int = 80, duration_seconds: int = 300
     ) -> ExperimentResult:
-        """Inject disk I/O stress using SSM"""
-        experiment_id = _experiment_id("ec2-disk-stress")
-        result = ExperimentResult(
-            experiment_id=experiment_id,
-            experiment_type=ChaosType.EC2_DISK_STRESS,
-            start_time=utc_now(),
+        """Legacy SSM execution is disabled; use a reviewed FIS template."""
+        raise ConfigurationError(
+            "Legacy SSM shell faults are disabled; use a reviewed FIS template"
         )
-
-        try:
-            command = f"""
-            # Install stress-ng if not present
-            which stress-ng || sudo yum install -y stress-ng || sudo apt-get install -y stress-ng
-
-            # Run disk I/O stress test
-            stress-ng --iomix 4 --iomix-bytes {io_percent}% --timeout {duration_seconds}s
-            """
-
-            if not self.dry_run:
-                self.ssm.send_command(
-                    InstanceIds=instance_ids,
-                    DocumentName="AWS-RunShellScript",
-                    Parameters={"commands": [command]},
-                    TimeoutSeconds=duration_seconds + 60,
-                )
-                result.affected_resources = instance_ids
-                logger.info(
-                    f"Injected disk I/O stress ({io_percent}%) on instances: {instance_ids}"
-                )
-            else:
-                logger.info(
-                    f"DRY RUN: Would inject disk I/O stress ({io_percent}%) on instances: {instance_ids}"
-                )
-                result.affected_resources = instance_ids
-
-            result.status = "completed"
-
-        except Exception as e:
-            logger.error(f"Error injecting disk stress: {e}")
-            result.errors.append(str(e))
-            result.status = "failed"
-
-        finally:
-            result.end_time = utc_now()
-
-        return result
 
     def fill_disk(
         self, instance_ids: list[str], fill_percent: int = 90
     ) -> ExperimentResult:
-        """Fill disk to specified percentage using SSM"""
-        experiment_id = _experiment_id("ec2-disk-fill")
-        result = ExperimentResult(
-            experiment_id=experiment_id,
-            experiment_type=ChaosType.EC2_DISK_FILL,
-            start_time=utc_now(),
+        """Legacy SSM execution is disabled; use a reviewed FIS template."""
+        raise ConfigurationError(
+            "Legacy SSM shell faults are disabled; use a reviewed FIS template"
         )
-
-        try:
-            command = f"""
-            # Create chaos directory
-            CHAOS_DIR="/tmp/chaos_disk_fill"
-            mkdir -p $CHAOS_DIR
-
-            # Get disk usage and calculate fill size
-            DISK_SIZE=$(df -BG / | awk 'NR==2{{print $2}}' | sed 's/G//')
-            CURRENT_USED=$(df -BG / | awk 'NR==2{{print $3}}' | sed 's/G//')
-            TARGET_USED=$((DISK_SIZE * {fill_percent} / 100))
-            FILL_SIZE=$((TARGET_USED - CURRENT_USED))
-
-            if [ $FILL_SIZE -gt 0 ]; then
-                # Create file to fill disk
-                dd if=/dev/zero of=$CHAOS_DIR/fill_file bs=1G count=$FILL_SIZE
-                echo "Filled disk to approximately {fill_percent}%"
-            else
-                echo "Disk already at or above {fill_percent}% capacity"
-            fi
-            """
-
-            if not self.dry_run:
-                self.ssm.send_command(
-                    InstanceIds=instance_ids,
-                    DocumentName="AWS-RunShellScript",
-                    Parameters={"commands": [command]},
-                )
-                result.affected_resources = instance_ids
-                logger.info(
-                    f"Filled disk to {fill_percent}% on instances: {instance_ids}"
-                )
-
-                # Store for rollback
-                self.disk_fill_instances = instance_ids
-            else:
-                logger.info(
-                    f"DRY RUN: Would fill disk to {fill_percent}% on instances: {instance_ids}"
-                )
-                result.affected_resources = instance_ids
-
-            result.status = "completed"
-
-        except Exception as e:
-            logger.error(f"Error filling disk: {e}")
-            result.errors.append(str(e))
-            result.status = "failed"
-
-        finally:
-            result.end_time = utc_now()
-
-        return result
 
     def _collect_instance_metrics(self, instance_ids: list[str]) -> dict[str, Any]:
         """Collect metrics for instances"""
@@ -2947,61 +3374,22 @@ class EC2ChaosExperiment(ChaosExperiment):
             raise
 
     def _remove_network_latency(self, instance_ids: list[str]):
-        """Remove network latency"""
-        try:
-            command = """
-            sudo tc qdisc del dev eth0 root netem
-            echo "Network latency removed"
-            """
-
-            self.ssm.send_command(
-                InstanceIds=instance_ids,
-                DocumentName="AWS-RunShellScript",
-                Parameters={"commands": [command]},
-            )
-            logger.info(f"Removed network latency from instances: {instance_ids}")
-
-        except Exception as e:
-            logger.error(f"Error removing latency: {e}")
-            raise
+        """Legacy SSM execution is disabled; use a reviewed FIS template."""
+        raise ConfigurationError(
+            "Legacy SSM shell faults are disabled; use a reviewed FIS template"
+        )
 
     def _remove_packet_loss(self, instance_ids: list[str]):
-        """Remove packet loss"""
-        try:
-            command = """
-            sudo tc qdisc del dev eth0 root netem
-            echo "Packet loss removed"
-            """
-
-            self.ssm.send_command(
-                InstanceIds=instance_ids,
-                DocumentName="AWS-RunShellScript",
-                Parameters={"commands": [command]},
-            )
-            logger.info(f"Removed packet loss from instances: {instance_ids}")
-
-        except Exception as e:
-            logger.error(f"Error removing packet loss: {e}")
-            raise
+        """Legacy SSM execution is disabled; use a reviewed FIS template."""
+        raise ConfigurationError(
+            "Legacy SSM shell faults are disabled; use a reviewed FIS template"
+        )
 
     def _cleanup_disk_fill(self, instance_ids: list[str]):
-        """Clean up disk fill"""
-        try:
-            command = """
-            rm -rf /tmp/chaos_disk_fill
-            echo "Disk fill cleaned up"
-            """
-
-            self.ssm.send_command(
-                InstanceIds=instance_ids,
-                DocumentName="AWS-RunShellScript",
-                Parameters={"commands": [command]},
-            )
-            logger.info(f"Cleaned up disk fill on instances: {instance_ids}")
-
-        except Exception as e:
-            logger.error(f"Error cleaning up disk fill: {e}")
-            raise
+        """Legacy SSM execution is disabled; use a reviewed FIS template."""
+        raise ConfigurationError(
+            "Legacy SSM shell faults are disabled; use a reviewed FIS template"
+        )
 
 
 class EBSChaosExperiment(ChaosExperiment):
@@ -3885,8 +4273,42 @@ class VPCChaosExperiment(ChaosExperiment):
             peering_info = self.ec2.describe_vpc_peering_connections(
                 VpcPeeringConnectionIds=[peering_connection_id]
             )
-            if peering_info["VpcPeeringConnections"]:
-                self.peering_details = peering_info["VpcPeeringConnections"][0]
+            connections = peering_info.get("VpcPeeringConnections")
+            if isinstance(connections, list) and len(connections) == 1:
+                selected = connections[0]
+                if selected.get("VpcPeeringConnectionId") != peering_connection_id:
+                    raise SafetyViolation(
+                        "Peering response differs from the exact reviewed connection"
+                    )
+                endpoints, endpoint_targets = peering_endpoint_scope(self.config)
+                actual = {}
+                for role, field in (
+                    ("requester", "RequesterVpcInfo"),
+                    ("accepter", "AccepterVpcInfo"),
+                ):
+                    item = selected.get(field, {})
+                    actual[role] = {
+                        "owner_id": item.get("OwnerId"),
+                        "region": item.get("Region"),
+                        "vpc_id": item.get("VpcId"),
+                    }
+                if actual != endpoints:
+                    raise SafetyViolation(
+                        "Peering endpoint metadata differs from the reviewed tuple"
+                    )
+                if not self.dry_run:
+                    if any(
+                        endpoint["owner_id"] != self.expected_account
+                        or endpoint["region"] != self.expected_region
+                        for endpoint in endpoints.values()
+                    ):
+                        raise SafetyViolation(
+                            "Peering endpoint is outside the reviewed account or region"
+                        )
+                    self._require_derived_scope(
+                        ChaosType.VPC_PEERING_DELETE, self.config
+                    )
+                self.peering_details = copy.deepcopy(selected)
 
                 if not self.dry_run:
                     # Delete peering connection
@@ -3896,7 +4318,9 @@ class VPCChaosExperiment(ChaosExperiment):
                     if response.get("Return") is not True:
                         raise SafetyViolation("AWS did not accept VPC peering deletion")
                     self._wait_for_vpc_deletion(peering_connection_id, peering=True)
-                    result.affected_resources = [peering_connection_id]
+                    result.affected_resources = sorted(
+                        {peering_connection_id} | endpoint_targets
+                    )
                     logger.info(
                         f"Deleted VPC peering connection: {peering_connection_id}"
                     )
@@ -3904,7 +4328,9 @@ class VPCChaosExperiment(ChaosExperiment):
                     logger.info(
                         f"DRY RUN: Would delete VPC peering connection: {peering_connection_id}"
                     )
-                    result.affected_resources = [peering_connection_id]
+                    result.affected_resources = sorted(
+                        {peering_connection_id} | endpoint_targets
+                    )
             else:
                 raise ConfigurationError(
                     f"VPC peering connection not found: {peering_connection_id}"
@@ -9202,6 +9628,9 @@ class ChaosOrchestrator:
             if "type" in config
             else set()
         )
+        if config.get("type") == ChaosType.VPC_PEERING_DELETE.value:
+            _endpoints, endpoint_targets = peering_endpoint_scope(config)
+            targets.update(endpoint_targets)
         selector_fields = {
             ChaosType.VPC_SECURITY_GROUP_MODIFY.value: ("remove_rule",),
             ChaosType.RDS_PARAMETER_GROUP_MODIFY.value: ("parameters",),
@@ -9263,6 +9692,9 @@ class ChaosOrchestrator:
     @staticmethod
     def _blast_radius(experiment_type: ChaosType, config: dict[str, Any]) -> int:
         """Count materially affected primary and explicitly approved child resources."""
+        if experiment_type == ChaosType.VPC_PEERING_DELETE:
+            peering_endpoint_scope(config)
+            return 3
         if experiment_type == ChaosType.EC2_TERMINATE:
             return len(
                 set(config["instance_ids"])
@@ -9328,6 +9760,16 @@ class ChaosOrchestrator:
                 ),
                 self.region,
             )
+        if experiment_type == ChaosType.VPC_PEERING_DELETE:
+            endpoints, _targets = peering_endpoint_scope(config)
+            if any(
+                endpoint["owner_id"] != self.expected_account
+                or endpoint["region"] != self.region
+                for endpoint in endpoints.values()
+            ):
+                raise SafetyViolation(
+                    "Peering endpoints must match the reviewed account and region"
+                )
         break_glass = config.get("break_glass_principal_arn")
         if break_glass and str(break_glass) != str(self.operator_principal_arn):
             raise SafetyViolation(
@@ -9356,13 +9798,8 @@ class ChaosOrchestrator:
             raise SafetyViolation(
                 f"Experiment has {len(unapproved)} target(s) not in the exact target allowlist"
             )
-        for pattern in safety.get(
-            "denied_target_patterns",
-            [r"(?i)(?:^|[-_/])prod(?:uction)?(?:$|[-_/])"],
-        ):
-            compiled = re.compile(str(pattern))
-            if any(compiled.search(target) for target in targets):
-                raise SafetyViolation("A target matches a denied target pattern")
+        if denied_target_matches(denied_policy_globs(safety), targets):
+            raise SafetyViolation("A target matches a denied target pattern")
 
     def _wait_with_runtime_checks(self, duration_seconds: int) -> None:
         """Wait cooperatively while rechecking configured steady-state guards."""
@@ -9643,7 +10080,9 @@ class ChaosOrchestrator:
 
         # EC2 experiments
         elif experiment_type == ChaosType.EC2_TERMINATE:
-            return experiment.terminate_instances(config["instance_ids"])
+            return experiment.terminate_instances(
+                config["instance_ids"], config.get("delete_on_termination_volumes")
+            )
         elif experiment_type == ChaosType.EC2_STOP:
             return experiment.stop_instances(config["instance_ids"])
         elif experiment_type == ChaosType.EC2_REBOOT:
@@ -9681,7 +10120,9 @@ class ChaosOrchestrator:
 
         # EBS experiments
         elif experiment_type == ChaosType.EBS_DETACH_VOLUME:
-            return experiment.detach_volume(config["volume_id"])
+            return experiment.detach_volume(
+                config["volume_id"], config.get("attachment")
+            )
         elif experiment_type == ChaosType.EBS_THROTTLE_IOPS:
             return experiment.throttle_iops(
                 config["volume_id"], config.get("iops", 3_000)
@@ -9996,6 +10437,113 @@ class ChaosOrchestrator:
             raise ValueError(f"Unsupported experiment type: {experiment_type}")
 
     def _create_experiment(
+        self, experiment_type: ChaosType, config: dict[str, Any]
+    ) -> ChaosExperiment:
+        if "account_id" in config and config["account_id"] != self.config.get(
+            "global", {}
+        ).get("account_id"):
+            raise SafetyViolation(
+                "Experiment account cannot override the reviewed global account"
+            )
+        if "region" in config and config["region"] != self.config.get("global", {}).get(
+            "region", DEFAULT_REGION
+        ):
+            raise SafetyViolation(
+                "Experiment region cannot override the reviewed global region"
+            )
+        runtime = {**self.config.get("global", {}), **config}
+        runtime["type"] = experiment_type.value
+        if self.live:
+            runtime.update(
+                region=self.region,
+                account_id=self.expected_account,
+                dry_run=False,
+                operator_principal_arn=self.operator_principal_arn,
+                active_access_key_id=self.active_access_key_id,
+            )
+            self._authorize_live_creation(experiment_type, runtime)
+            grant = _ExecutionGrant(
+                experiment_type,
+                _canonical_execution_data(runtime),
+                self.expected_account,
+                self.region,
+                self.safety_controller,
+                frozenset(self._target_values(runtime)),
+            )
+            if not hasattr(self.safety_controller, "_execution_creation"):
+                self.safety_controller._execution_creation = threading.local()
+            creation = self.safety_controller._execution_creation
+            if getattr(creation, "grant", None) is not None:
+                raise SafetyViolation("Nested execution grant creation is refused")
+            creation.grant = grant
+            try:
+                return self._instantiate_experiment(experiment_type, runtime)
+            finally:
+                if hasattr(creation, "grant"):
+                    del creation.grant
+        runtime["dry_run"] = True
+        return self._instantiate_experiment(experiment_type, runtime)
+
+    def _authorize_live_creation(
+        self, kind: ChaosType, runtime: dict[str, Any]
+    ) -> None:
+        suite_name = getattr(self, "suite_name", None)
+        suite = self.config.get("experiment_suites", {}).get(suite_name, {})
+        entries = suite.get("experiments", [])
+        if (
+            not self.live
+            or self.dry_run
+            or not self.safety_controller.live
+            or self.actual_account != self.expected_account
+            or self.safety_controller.expected_account != self.expected_account
+            or self.safety_controller.region != self.region
+            or not self.caller_arn
+        ):
+            raise SafetyViolation(
+                "Live creation requires authenticated orchestrator identity"
+            )
+        irreversible = any(
+            experiment_metadata(ChaosType(item["type"])).risk == RiskLevel.IRREVERSIBLE
+            for item in entries
+        )
+        if not entries or self.confirmation != self.expected_confirmation(
+            suite_name, irreversible
+        ):
+            raise SafetyViolation("Live creation requires the confirmed reviewed suite")
+        safety = self.config.get("safety", {})
+        if irreversible and not (
+            self.allow_irreversible and safety.get("allow_irreversible") is True
+        ):
+            raise SafetyViolation("Irreversible execution requires both approvals")
+        if kind != ChaosType.FIS_TEMPLATE and not (
+            safety.get("safety_alarms")
+            or safety.get("_runtime_allow_live_without_safety_alarms") is True
+        ):
+            raise SafetyViolation("Live execution requires approved safety alarms")
+        candidates = []
+        for entry in entries:
+            reviewed = {**self.config.get("global", {}), **entry}
+            reviewed.update(
+                region=self.region,
+                account_id=self.expected_account,
+                dry_run=False,
+                operator_principal_arn=self.operator_principal_arn,
+                active_access_key_id=self.active_access_key_id,
+            )
+            candidates.append(_canonical_execution_data(reviewed))
+        supplied = {
+            key: value
+            for key, value in runtime.items()
+            if key != "_runtime_stop_on_failure"
+        }
+        if _canonical_execution_data(supplied) not in candidates:
+            raise SafetyViolation("Execution request differs from the confirmed suite")
+        self._validate_target_scope(kind, runtime)
+        require_runtime_safety(
+            self.safety_controller, "Execution authorization", SafetyViolation
+        )
+
+    def _instantiate_experiment(
         self, experiment_type: ChaosType, config: dict[str, Any]
     ) -> ChaosExperiment:
         """Create experiment instance based on type"""
@@ -10406,8 +10954,9 @@ safety:
   required_target_tags:
     ChaosReady: "true"
   target_allowlist: []
-  denied_target_patterns:
-    - '(?i)(?:^|[-_/])prod(?:uction)?(?:$|[-_/])'
+  denied_target_globs:
+    - "prod"
+    - "production"
   allow_irreversible: false
   allow_fis_without_stop_conditions: false
   allow_fis_unbounded_targets: false
@@ -10634,21 +11183,7 @@ def validate_config_data(config: dict[str, Any]) -> None:
         raise ConfigurationError(
             "safety.required_target_tags must contain at least one exact tag"
         )
-    denied_patterns = safety.get(
-        "denied_target_patterns",
-        [r"(?i)(?:^|[-_/])prod(?:uction)?(?:$|[-_/])"],
-    )
-    if not isinstance(denied_patterns, list) or not denied_patterns:
-        raise ConfigurationError(
-            "safety.denied_target_patterns must be a non-empty list"
-        )
-    for index, pattern in enumerate(denied_patterns):
-        try:
-            re.compile(str(pattern))
-        except re.error as exc:
-            raise ConfigurationError(
-                f"safety.denied_target_patterns[{index}] is invalid: {exc}"
-            ) from exc
+    validate_denied_patterns(denied_policy_globs(safety))
 
     for key in (
         "block_on_insufficient_data",
@@ -10770,6 +11305,19 @@ def validate_config_data(config: dict[str, Any]) -> None:
                 raise ConfigurationError(
                     f"{location} is missing required parameter(s): {', '.join(missing)}"
                 )
+            if experiment_type == ChaosType.VPC_PEERING_DELETE:
+                try:
+                    endpoints, _endpoint_targets = peering_endpoint_scope(experiment)
+                    if any(
+                        endpoint["owner_id"] != account_id
+                        or endpoint["region"] != region
+                        for endpoint in endpoints.values()
+                    ):
+                        raise SafetyViolation(
+                            "Peering endpoints must match global account and region"
+                        )
+                except SafetyViolation as error:
+                    raise ConfigurationError(f"{location}: {error}") from error
             for key in ("instance_ids", "target_ids", "task_arns", "paths"):
                 if key not in experiment:
                     continue

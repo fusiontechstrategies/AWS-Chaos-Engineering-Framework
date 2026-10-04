@@ -27,8 +27,9 @@ safety:
   required_target_tags:
     ChaosReady: "true"
   target_allowlist: []
-  denied_target_patterns:
-    - '(?i)(?:^|[-_/])prod(?:uction)?(?:$|[-_/])'
+  denied_target_globs:
+    - "prod"
+    - "production"
   allow_irreversible: false
   allow_fis_without_stop_conditions: false
   allow_fis_unbounded_targets: false

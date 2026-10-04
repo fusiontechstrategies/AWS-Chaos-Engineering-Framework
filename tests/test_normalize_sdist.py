@@ -5,8 +5,35 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from scripts import normalize_sdist as normalizer
+
+
+class DecodedMembers:
+    """In-memory parser records; no link or unsafe-path archive is serialized."""
+
+    def __init__(self, member):
+        self.member = member
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def __iter__(self):
+        return iter([self.member])
+
+    def extractfile(self, _member):
+        raise AssertionError("Refused metadata must not reach member data reading")
+
+
+def decoded_member_parser(member):
+    view = SimpleNamespace(**vars(tarfile))
+    view.open = lambda *args, **kwargs: DecodedMembers(member)
+    return view
 
 
 class NormalizeSdistTests(unittest.TestCase):
@@ -47,17 +74,22 @@ class NormalizeSdistTests(unittest.TestCase):
     def test_link_member_is_rejected_without_changing_archive(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "linked.tar.gz"
-            with tarfile.open(path, mode="w:gz") as archive:
-                member = tarfile.TarInfo("package-1.0/link")
-                member.type = tarfile.SYMTYPE
-                member.linkname = "outside"
-                archive.addfile(member)
+            self.make_archive(path, 100)
+            member = tarfile.TarInfo("package-1.0/link")
+            member.type = tarfile.SYMTYPE
+            # Only a modeled parser record: no TAR/OS link is constructed.
             original = path.read_bytes()
-            with self.assertRaisesRegex(
-                normalizer.SdistNormalizationError, "link or device"
+            with (
+                patch.object(
+                    normalizer.archive_budget, "tarfile", decoded_member_parser(member)
+                ),
+                self.assertRaisesRegex(
+                    normalizer.SdistNormalizationError, "link or device"
+                ),
             ):
                 normalizer.normalize_sdist(path, 50)
             self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.iterdir()), [path])
 
     def test_duplicate_and_case_colliding_members_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -100,14 +132,17 @@ class NormalizeSdistTests(unittest.TestCase):
                     self.assertEqual(original, path.read_bytes())
 
             drive = root / "drive.tar.gz"
-            with tarfile.open(drive, mode="w:gz") as archive:
-                value = b"synthetic"
-                member = tarfile.TarInfo("C:/private.txt")
-                member.size = len(value)
-                archive.addfile(member, io.BytesIO(value))
+            self.make_archive(drive, 100)
+            member = tarfile.TarInfo("C:/private.txt")
+            member.size = 9
             original_drive = drive.read_bytes()
-            with self.assertRaisesRegex(
-                normalizer.SdistNormalizationError, "drive path"
+            with (
+                patch.object(
+                    normalizer.archive_budget, "tarfile", decoded_member_parser(member)
+                ),
+                self.assertRaisesRegex(
+                    normalizer.SdistNormalizationError, "drive path"
+                ),
             ):
                 normalizer.normalize_sdist(drive, 50)
             self.assertEqual(original_drive, drive.read_bytes())

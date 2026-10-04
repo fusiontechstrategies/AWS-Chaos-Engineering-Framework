@@ -132,7 +132,7 @@ Irreversible suites require `safety.allow_irreversible: true`, `--allow-irrevers
 
 Use `fis_template` for read-only template inspection and guardrail validation. Live FIS starts and confirmation tokens are disabled. AWS StartExperiment takes a mutable template ID and provides no conditional version or content digest. Re-reading the template narrows the race but cannot prove that the approved content is what AWS starts. A configuration assertion about an exclusive change window does not prove immutability.
 
-Re-enabling live FIS requires an enforceable and independently verified immutable-template boundary or an AWS API that conditionally starts the reviewed version. Recovery methods remain available for already-started experiments from older versions. FIS planning still checks execution-role ownership, alarm scope, explicit resource allowlists, action support and bounded aggregate targets.
+Re-enabling live FIS requires an enforceable and independently verified immutable-template boundary or an AWS API that conditionally starts the reviewed version. The current public API cannot acquire live FIS or historical FIS recovery authority. Already-started experiments from older versions require operator reconciliation through separately approved AWS procedures. FIS planning still checks execution-role ownership, alarm scope, explicit resource allowlists, action support and bounded aggregate targets.
 
 Useful AWS references:
 
@@ -220,3 +220,23 @@ Licensed under the [Apache License 2.0](LICENSE).
 ## Disclaimer
 
 This project is community software and is not affiliated with, sponsored by, or endorsed by Amazon Web Services. AWS, AWS GovCloud, and related service names are trademarks of Amazon.com, Inc. or its affiliates. You are responsible for authorization, configuration, cost, availability impact, regulatory obligations, and recovery planning.
+
+
+### Configuration and library migration
+
+Live library execution requires a confirmed `ChaosOrchestrator` and its reviewed
+suite. Direct experiment constructors are planning only; `dry_run=False` without
+orchestrator authority raises `SafetyViolation`. The public handler accepts the
+exact approved arguments once, and `run_rollback()` admits only that handler's
+owned recovery after the handler completely returns. Each live object serializes
+its handler and recovery lifecycle; premature or reentrant recovery is refused.
+Raw client mutations are refused. Legacy EC2 SSM shell faults
+are disabled; FIS remains planning only.
+
+The former regex key `safety.denied_target_patterns` is rejected. Manually review
+and migrate every old expression to `safety.denied_target_globs`; do not merely
+rename the key. Globs match the whole target, case insensitively: `*` matches any
+sequence and `?` one character, while dots are literal. For example, the regex
+`^test-.*$` deliberately migrates to the glob `test-*`. Fixed `prod` and
+`production` name-token denial remains active independently of configured globs.
+See [security boundaries](docs/security-boundaries.md) for bounds and peering scope.

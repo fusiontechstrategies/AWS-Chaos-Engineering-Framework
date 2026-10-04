@@ -38,9 +38,25 @@ an irreversible operation: recreation does not prove restoration of the original
 subscription ARN, delivery history or every subscription attribute. See the
 [SNS subscription API](https://docs.aws.amazon.com/sns/latest/api/API_Subscribe.html).
 
+Every AWS mutation requires immutable execution authority issued by the confirmed
+public orchestrator after caller identity, suite token, target scope, safety and
+irreversible approvals. Direct experiment construction is planning only. A live
+handler must match the approved type and complete argument list, and consumes its
+authority once. Mutation dispatch is admitted only inside that handler's current
+thread or its `run_rollback()` recovery envelope after the owned forward handler
+has completely returned. Each live object holds one lifecycle lock through the full
+handler and recovery envelope. Premature, overlapping or reentrant recovery is
+refused. Recovery safety exemptions, stop-barrier decisions and write accounting
+are derived from the current thread's admitted authority phase. The legacy
+`_in_rollback` flag is diagnostic and grants no exemption or authority.
+Raw client mutations and direct calls to `rollback()` cannot acquire this authority.
+Rejected live handlers return failed result data; constructors and raw proxy
+mutations raise `SafetyViolation`. An approved object whose configuration or
+reviewed identity changes loses mutation authority.
+
 KMS grant revocation, ECR digest deletion, CloudFront invalidation and WAF IP-set
-updates require a one-use dispatch context created by their public experiment
-handlers. It binds a detached canonical request to the exact reviewed targets
+updates additionally require a one-use dispatch context created by their public
+experiment handlers. It binds a detached canonical request to the exact reviewed targets
 and selectors before the proxy records or sends it. Raw calls to those four SDK
 operations are refused, even with an allowlisted parent or during recovery.
 WAF recovery can remove only confirmed owned additions and preserves unrelated
@@ -78,7 +94,11 @@ conditional version or digest. A second read does not close the final-read/start
 race, and configuration assertions do not prove an immutable IAM/SCP boundary.
 Re-enabling this capability requires an enforceable, independently verified
 immutable-template trust boundary or conditional AWS start support. Recovery
-methods remain usable for already-running experiments from older versions.
+authority is unavailable through the current public API for already-running
+experiments from older versions. Those experiments require operator reconciliation
+through separately approved AWS procedures. The six legacy EC2 SSM shell fault
+handlers are disabled in both modes; they no longer generate or dispatch shell
+programs.
 
 Emergency stop is shared by every controller, including controllers created
 after a stop. A request immediately blocks new forward-call admission and wakes
@@ -134,7 +154,7 @@ CloudFront literal paths are sorted and deduplicated without decoding or changin
 their characters. WAF CIDRs use canonical network notation, sorted without
 duplicates. Parent identity and WAF scope are included in their digests. Both
 actions count one parent plus every unique child path or CIDR toward blast radius,
-require these approvals for direct class calls, and include the approved digest
+require these approvals for confirmed orchestrator handlers, and include the approved digest
 in affected-resource evidence. An omitted CloudFront path list approves `/*`;
 an explicitly empty list is refused.
 For live ELB removal, provide `target_descriptors` with exact Id, Port and returned
@@ -147,7 +167,8 @@ AWS refuses an owner mismatch. Per-experiment account overrides are rejected;
 editing the global account invalidates the confirmation token. Cross-account
 S3 experiments are unsupported. Direct library callers must supply an experiment
 owner and the reviewed twelve-digit account through their controller or
-experiment configuration. Controller-only clients permit safety and identity
+experiment configuration for planning reads. Live writes additionally require the
+confirmed orchestrator authority described above. Controller-only clients permit safety and identity
 reads, but refuse every mutation and all supported S3 bucket calls, including
 bucket reads. A missing or invalid account refuses owned bucket calls before
 dispatch. The controller's captured account alone does not grant an ownerless
@@ -160,7 +181,8 @@ and other bucket methods are refused because they can retain an unwrapped SDK
 client or omit the approved owner. SDK reads are classified by an exact reviewed
 per-service operation list, not `get_`, `test_` or other name prefixes. Effectful
 TestState, TestFailover and TestRepositoryTriggers calls and credential-issuing
-GetSessionToken calls receive normal owner, plan, stop and tracking checks. Raw
+GetSessionToken calls receive normal owner, plan, stop and tracking checks, plus
+active handler authority. They have no supported standalone live handler. Raw
 non-S3 waiter/presign helpers and non-EC2 paginators are disabled. EC2 paginator
 requests accept only the seven reviewed VPC inventory operations. Known unsupported SDK methods remain callable on attribute lookup, but their
 replacement refuses invocation without exposing the raw SDK method. Unknown
@@ -322,3 +344,55 @@ RECORD row per member, with SHA-256 and byte size matching the actual contents;
 RECORD leaves its own hash/size empty. Unknown, duplicate, unsafe or missing rows
 and missing metadata fail closed. Expanded wheel members also have per-member
 and aggregate byte budgets before their contents are retained.
+
+
+## Denied-target policy migration
+
+The legacy regex key `safety.denied_target_patterns` is rejected even when an
+individual spelling could also be a glob. Every existing regex configuration
+requires manual migration to the new `safety.denied_target_globs` key. A key rename
+alone can weaken denial: `.*critical.*` has literal dots under glob syntax.
+Review each intended target set, for example deliberately replacing `^test-.*$`
+with `test-*`. Matching is case insensitive over the whole target; `*` matches a
+sequence, `?` one character, and all other accepted characters are literal.
+Regex brackets, escapes, alternation, anchors, grouping and quantifier `+` are
+unsupported. The list requires 1 through 32 nonempty ASCII globs of at most 128
+characters. Target admission permits at most 1,024 targets of 2,048 characters
+and an aggregate pattern-length times target-length budget of 1,048,576.
+Exceeding a bound refuses admission. The matcher uses bounded dynamic programming.
+
+The fixed `prod` and `production` name-token rule remains active independently of
+these globs, with `-`, `_` and `/` as separators. It cannot be removed by changing
+the configured list. Defaults are `prod` and `production`.
+
+## VPC peering endpoint approval
+
+`vpc_peering_delete` requires `peering_endpoints` with exact `requester` and
+`accepter` mappings. Each contains `owner_id`, `region` and `vpc_id`. Both owners
+and regions must equal the reviewed global account and region, and the VPC IDs
+must differ. Cross-account and cross-region peering deletion is unsupported.
+
+```yaml
+peering_endpoints:
+  requester:
+    owner_id: '123456789012'
+    region: us-gov-west-1
+    vpc_id: vpc-0123456789abcdef0
+  accepter:
+    owner_id: '123456789012'
+    region: us-gov-west-1
+    vpc_id: vpc-0123456789abcdef1
+```
+
+The allowlist must contain the peering ID, both VPC IDs and the canonical
+`selector:vpc_peering_delete:<sha256>` endpoint-tuple digest printed by
+`--show-target-selectors`. All appear in affected-resource evidence. Blast radius
+counts three resources: the connection and both endpoints. Immediately before
+deleting, the describe response must select exactly the approved connection and
+return the complete matching owner/region/VPC tuple. This preflight is not an AWS
+conditional-write guarantee against later changes by another operator.
+
+Draft release notes are passed to GitHub as raw literal field data and compared
+byte-for-byte as text against both creation and final release readback. Body
+mismatch refuses handoff and triggers cleanup only for the immutable draft ID
+returned by that creation request.

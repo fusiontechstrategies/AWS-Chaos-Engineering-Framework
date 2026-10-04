@@ -71,7 +71,7 @@ def create_draft(assets, notes, repository, tag, commit, manifest):
                     "draft=true",
                     "-F",
                     "prerelease=false",
-                    "-F",
+                    "-f",
                     "body=" + notes_text,
                 ]
             )
@@ -80,7 +80,12 @@ def create_draft(assets, notes, repository, tag, commit, manifest):
         if type(candidate_id) is not int or candidate_id <= 0:
             raise ValueError("New draft did not return an immutable release ID")
         release_id = candidate_id
-        if created.get("tag_name") != tag or created.get("draft") is not True:
+        if (
+            created.get("tag_name") != tag
+            or created.get("draft") is not True
+            or created.get("prerelease") is not False
+            or created.get("body") != notes_text
+        ):
             raise ValueError("New release identity or draft state differs")
         gh(
             [
@@ -98,6 +103,7 @@ def create_draft(assets, notes, repository, tag, commit, manifest):
             or state.get("tag_name") != tag
             or state.get("draft") is not True
             or state.get("prerelease") is not False
+            or state.get("body") != notes_text
             or {item["name"] for item in state["assets"]} != set(manifest)
             or len(state["assets"]) != len(manifest)
         ):
