@@ -12,6 +12,11 @@
   identity filtering independent of resource disclosure.
 - Verify distributions with trusted workflow-source tools and bind the final
   publish payload to a digest manifest rechecked in the protected publish job.
+- Require live targets under `--vpc-id` to belong to the discovered, exactly
+  tagged inventory of that VPC, verify each pre-mutation response, and refuse
+  VPC-addressable types whose membership cannot be verified.
+- Bind live S3 lifecycle writes to the reviewed region with an owner-bound
+  bucket location check and refuse SDK region redirects for S3 writes.
 
 All notable changes to this project are documented here.
 

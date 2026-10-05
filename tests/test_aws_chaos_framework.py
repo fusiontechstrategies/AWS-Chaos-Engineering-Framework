@@ -314,6 +314,7 @@ class FakeAWS:
                     }
                 ]
             },
+            ("s3", "get_bucket_location"): {"LocationConstraint": REGION},
             ("sqs", "get_queue_attributes"): {
                 "Attributes": {
                     "Policy": policy,

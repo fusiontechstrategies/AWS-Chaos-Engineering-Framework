@@ -84,11 +84,19 @@ account on reads, forward writes and recovery. Missing accounts, differing
 explicit owners and per-experiment account overrides are refused. Cross-account
 bucket targets are unsupported; changes to the approved global account require
 a new configuration confirmation token.
+Immediately before a live S3 write, an owner-bound `GetBucketLocation` must
+report the reviewed global region. An empty or absent legacy constraint means
+`us-east-1` and `EU` means `eu-west-1`; any other mismatch, unrecognized value or
+read error refuses the write. Botocore can redirect a request and sign it again
+for the bucket's actual region. A signing-time hook on each framework S3 client
+refuses any S3 write signed for a region other than the client's reviewed
+region, so such a redirect cannot reach another region.
+`ExpectedBucketOwner` remains a separate control.
 Controller-only clients without an experiment owner support safety and identity
 reads; they refuse all mutations and account-bound S3 bucket reads. They cannot
 claim the recovery exception or bypass the process stop through an ownerless
 write.
-S3 proxy calls are limited to the twelve direct owner-bound operations used by
+S3 proxy calls are limited to the thirteen direct owner-bound operations used by
 the supported experiments; raw SDK delegates and unreviewed S3 methods refuse.
 Other SDK reads also use exact reviewed per-service operation names. Effectful
 `test_*` calls and unreviewed `get_*` calls do not bypass mutation checks. Raw SDK

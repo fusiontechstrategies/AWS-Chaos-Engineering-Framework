@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import copy
+import itertools
 from typing import Any
+from urllib.parse import urlsplit
 
+import boto3
 import pytest
+from botocore.awsrequest import AWSResponse
 from test_aws_chaos_framework import (
     ACCOUNT_ID,
     INSTANCE_ID,
     REGION,
     VOLUME_ID,
     FakeAWS,
+    FakeClient,
+    FakeClientError,
     action_configs,
     make_experiment,
+    make_orchestrator,
 )
 
 import aws_chaos_framework as framework
@@ -269,3 +276,617 @@ def test_ebs_attaching_tuple_is_not_verified_at_deadline(clock):
         experiment._wait_for_exact_attachment()
     assert clock.sleeps == [2.0]
     assert not experiment.rollback_verified
+
+
+# Selected --vpc-id inventory and S3 region admission.
+
+VPC = "vpc-0123456789abcdef0"
+OTHER_VPC = "vpc-0123456789abcdef1"
+UNTAGGED_INSTANCE = "i-0123456789abcdef1"
+OUTSIDE_INSTANCE = "i-0123456789abcdef2"
+SUBNET = "subnet-0123456789abcdef0"
+UNTAGGED_SUBNET = "subnet-0123456789abcdef1"
+OUTSIDE_SUBNET = "subnet-0123456789abcdef2"
+ORIGINAL_NACL = "acl-0123456789abcdef0"
+NACL = "acl-0fedcba9876543210"
+UNTAGGED_NACL = "acl-0fedcba9876543211"
+OUTSIDE_NACL = "acl-0fedcba9876543212"
+ENDPOINT = "vpce-0123456789abcdef0"
+UNTAGGED_ENDPOINT = "vpce-0123456789abcdef1"
+OUTSIDE_ENDPOINT = "vpce-0123456789abcdef2"
+PEERING = "pcx-0123456789abcdef0"
+MOUNT_TARGET = "fsmt-0123456789abcdef0"
+TAGS = [{"Key": "ChaosReady", "Value": "true"}]
+MUTATIONS = {
+    "reboot_instances",
+    "replace_network_acl_association",
+    "delete_vpc_endpoints",
+    "delete_vpc_peering_connection",
+    "delete_mount_target",
+    "put_bucket_lifecycle_configuration",
+}
+
+
+def item(id_key: str, value: str, vpc: str, tagged: bool) -> dict[str, Any]:
+    return {id_key: value, "VpcId": vpc, **({"Tags": TAGS} if tagged else {})}
+
+
+# Every in-VPC resource appears both with and without the required safety tag.
+INVENTORY = {
+    "describe_instances": [
+        {**item("InstanceId", INSTANCE_ID, VPC, True), "State": {"Name": "running"}},
+        {
+            **item("InstanceId", UNTAGGED_INSTANCE, VPC, False),
+            "State": {"Name": "running"},
+        },
+        {
+            **item("InstanceId", OUTSIDE_INSTANCE, OTHER_VPC, True),
+            "State": {"Name": "running"},
+        },
+    ],
+    "describe_subnets": [
+        item("SubnetId", SUBNET, VPC, True),
+        item("SubnetId", UNTAGGED_SUBNET, VPC, False),
+        item("SubnetId", OUTSIDE_SUBNET, OTHER_VPC, True),
+    ],
+    "describe_security_groups": [],
+    "describe_network_acls": [
+        item("NetworkAclId", ORIGINAL_NACL, VPC, True),
+        item("NetworkAclId", NACL, VPC, True),
+        item("NetworkAclId", UNTAGGED_NACL, VPC, False),
+        item("NetworkAclId", OUTSIDE_NACL, OTHER_VPC, True),
+    ],
+    "describe_route_tables": [],
+    "describe_vpc_endpoints": [
+        item("VpcEndpointId", ENDPOINT, VPC, True),
+        item("VpcEndpointId", UNTAGGED_ENDPOINT, VPC, False),
+        item("VpcEndpointId", OUTSIDE_ENDPOINT, OTHER_VPC, True),
+    ],
+    "describe_vpc_peering_connections": [
+        {
+            "VpcPeeringConnectionId": PEERING,
+            "RequesterVpcInfo": {"VpcId": VPC},
+            "AccepterVpcInfo": {"VpcId": OTHER_VPC},
+            "Status": {"Code": "active"},
+            "Tags": TAGS,
+        }
+    ],
+}
+RESULT_KEYS = {
+    "describe_instances": "Reservations",
+    "describe_subnets": "Subnets",
+    "describe_security_groups": "SecurityGroups",
+    "describe_network_acls": "NetworkAcls",
+    "describe_route_tables": "RouteTables",
+    "describe_vpc_endpoints": "VpcEndpoints",
+    "describe_vpc_peering_connections": "VpcPeeringConnections",
+}
+
+
+def matches(resource: dict[str, Any], filters: list[dict[str, Any]]) -> bool:
+    """Apply the EC2 filter names used by the discovery pass."""
+    tags = {tag["Key"]: tag["Value"] for tag in resource.get("Tags", [])}
+    for entry in filters:
+        name = entry["Name"]
+        if name.startswith("tag:"):
+            actual = tags.get(name[4:])
+        elif name == "vpc-id":
+            actual = resource.get("VpcId")
+        elif name in {"requester-vpc-info.vpc-id", "accepter-vpc-info.vpc-id"}:
+            field = name.split("-vpc-info")[0].capitalize() + "VpcInfo"
+            actual = resource.get(field, {}).get("VpcId")
+        elif name == "instance-state-name":
+            actual = resource.get("State", {}).get("Name")
+        elif name == "status-code":
+            actual = resource.get("Status", {}).get("Code")
+        else:
+            raise AssertionError(f"Unmodeled filter {name}")
+        if actual not in entry["Values"]:
+            return False
+    return True
+
+
+class ModeledPaginator:
+    def __init__(self, operation: str) -> None:
+        self.operation = operation
+
+    def paginate(self, Filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        found = [
+            copy.deepcopy(resource)
+            for resource in INVENTORY[self.operation]
+            if matches(resource, Filters)
+        ]
+        if self.operation == "describe_instances":
+            found = [{"Instances": found}] if found else []
+        return [{RESULT_KEYS[self.operation]: found}]
+
+
+class ModeledEC2(FakeClient):
+    """Discovery reads honor VPC and tag filters; other reads use FakeAWS."""
+
+    def describe_vpcs(self, VpcIds: list[str]) -> dict[str, Any]:
+        assert VpcIds == [VPC]
+        return {"Vpcs": [{"VpcId": VPC, "Tags": TAGS}]}
+
+    def get_paginator(self, operation: str) -> ModeledPaginator:
+        return ModeledPaginator(operation)
+
+
+def scoped(kind, values=None, aws=None):
+    """A confirmed live orchestrator whose approval and discovery bind one VPC."""
+    aws = aws or FakeAWS(reject_writes=False)
+    aws.clients.setdefault("ec2", ModeledEC2(aws, "ec2"))
+    values = action_configs()[kind] if values is None else values
+    orchestrator = make_orchestrator(kind, values, aws, dry_run=False)
+    orchestrator.vpc_id = VPC
+    orchestrator.approval_scope["vpc_id"] = VPC
+    orchestrator.confirmation = orchestrator.expected_confirmation("ordinary", True)
+    orchestrator._discover_resources()
+    aws.calls.clear()
+    return orchestrator, aws, values
+
+
+def mutation_calls(aws) -> list[str]:
+    return [operation for _, operation, _ in aws.calls if operation in MUTATIONS]
+
+
+def fast_poll(experiment, monkeypatch) -> None:
+    ticks = itertools.count()
+    monkeypatch.setattr(framework.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(experiment, "_wait_forward", lambda seconds: None)
+
+
+def test_discovery_inventory_contains_only_tagged_resources_in_the_vpc():
+    orchestrator, _aws, _values = scoped(framework.ChaosType.EC2_REBOOT)
+    assert orchestrator.discovered_resources["instances"] == [INSTANCE_ID]
+    assert orchestrator.discovered_resources["subnets"] == [SUBNET]
+    assert orchestrator.discovered_resources["nacls"] == [ORIGINAL_NACL, NACL]
+    assert orchestrator.discovered_resources["vpc_endpoints"] == [ENDPOINT]
+    assert orchestrator.discovered_resources["peering_connections"] == [PEERING]
+
+
+PEERING_VALUES = action_configs()[framework.ChaosType.VPC_PEERING_DELETE]
+SWAPPED_PEERING = {
+    **PEERING_VALUES,
+    "peering_endpoints": {
+        "requester": PEERING_VALUES["peering_endpoints"]["accepter"],
+        "accepter": PEERING_VALUES["peering_endpoints"]["requester"],
+    },
+}
+OUT_OF_SCOPE = [
+    (framework.ChaosType.EC2_REBOOT, {"instance_ids": [OUTSIDE_INSTANCE]}),
+    (framework.ChaosType.EC2_REBOOT, {"instance_ids": [UNTAGGED_INSTANCE]}),
+    (
+        framework.ChaosType.EC2_REBOOT,
+        {"instance_ids": [INSTANCE_ID, OUTSIDE_INSTANCE]},
+    ),
+    (
+        framework.ChaosType.VPC_SUBNET_ACL_MODIFY,
+        {"subnet_id": OUTSIDE_SUBNET, "nacl_id": NACL},
+    ),
+    (
+        framework.ChaosType.VPC_SUBNET_ACL_MODIFY,
+        {"subnet_id": UNTAGGED_SUBNET, "nacl_id": NACL},
+    ),
+    (
+        framework.ChaosType.VPC_SUBNET_ACL_MODIFY,
+        {"subnet_id": SUBNET, "nacl_id": OUTSIDE_NACL},
+    ),
+    (
+        framework.ChaosType.VPC_SUBNET_ACL_MODIFY,
+        {"subnet_id": SUBNET, "nacl_id": UNTAGGED_NACL},
+    ),
+    (framework.ChaosType.VPC_ENDPOINT_DELETE, {"endpoint_id": OUTSIDE_ENDPOINT}),
+    (framework.ChaosType.VPC_ENDPOINT_DELETE, {"endpoint_id": UNTAGGED_ENDPOINT}),
+    (framework.ChaosType.VPC_PEERING_DELETE, PEERING_VALUES),
+    (framework.ChaosType.VPC_PEERING_DELETE, SWAPPED_PEERING),
+]
+
+
+@pytest.mark.parametrize(("kind", "values"), OUT_OF_SCOPE)
+def test_allowlisted_target_outside_vpc_or_tags_is_a_configuration_error(kind, values):
+    orchestrator, aws, values = scoped(kind, values)
+    # The literal allowlist admits every target; only VPC scope refuses it.
+    allowlist = set(orchestrator.config["safety"]["target_allowlist"])
+    assert orchestrator._target_values({"type": kind.value, **values}) <= allowlist
+    with pytest.raises(framework.ConfigurationError):
+        orchestrator._create_experiment(kind, copy.deepcopy(values))
+    assert aws.calls == []
+
+    started = []
+    orchestrator._run_single_experiment = started.append
+    with pytest.raises(framework.ConfigurationError):
+        orchestrator.run_experiment_suite("ordinary")
+    assert started == []
+    assert mutation_calls(aws) == []
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        framework.ChaosType.RDS_REBOOT,
+        framework.ChaosType.LAMBDA_TIMEOUT_MODIFY,
+        framework.ChaosType.ECS_TASK_STOP,
+        framework.ChaosType.DS_TRUST_DELETE,
+    ],
+)
+def test_vpc_scope_refuses_types_whose_membership_is_unverified(kind):
+    values = action_configs()[kind]
+    orchestrator, aws, values = scoped(kind, values)
+    with pytest.raises(framework.ConfigurationError, match="cannot prove"):
+        orchestrator._create_experiment(kind, copy.deepcopy(values))
+    assert aws.calls == []
+    # Without --vpc-id, admission is unchanged.
+    unscoped = make_orchestrator(
+        kind, values, FakeAWS(reject_writes=False), dry_run=False
+    )
+    assert unscoped._create_experiment(kind, copy.deepcopy(values)).dry_run is False
+
+
+def test_vpc_scope_leaves_vpc_independent_types_admitted():
+    kind = framework.ChaosType.S3_LIFECYCLE_MODIFY
+    orchestrator, _aws, values = scoped(kind)
+    experiment = orchestrator._create_experiment(kind, copy.deepcopy(values))
+    assert experiment._execution_grant.vpc_id == VPC
+
+
+def instances_in(vpc: str | None) -> dict[str, Any]:
+    return {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": INSTANCE_ID,
+                        "VpcId": vpc,
+                        "State": {"Name": "running"},
+                    }
+                ]
+            }
+        ]
+    }
+
+
+def nacls_in(vpc: str, original: str = ORIGINAL_NACL) -> dict[str, Any]:
+    return {
+        "NetworkAcls": [
+            {
+                "NetworkAclId": original,
+                "VpcId": vpc,
+                "Associations": [
+                    {
+                        "NetworkAclAssociationId": "aclassoc-0123456789abcdef0",
+                        "SubnetId": SUBNET,
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def endpoints_in(vpc: str) -> dict[str, Any]:
+    return {"VpcEndpoints": [{"VpcEndpointId": ENDPOINT, "VpcId": vpc}]}
+
+
+def mount_target(**changes: Any) -> dict[str, Any]:
+    target = {
+        "MountTargetId": MOUNT_TARGET,
+        "FileSystemId": "fs-0123456789abcdef0",
+        "SubnetId": SUBNET,
+        "VpcId": VPC,
+    }
+    target.update(changes)
+    return {"MountTargets": [{k: v for k, v in target.items() if v is not None}]}
+
+
+def scoped_experiment(kind, values=None):
+    orchestrator, aws, values = scoped(kind, values)
+    experiment = orchestrator._create_experiment(kind, copy.deepcopy(values))
+    assert experiment._execution_grant.vpc_id == VPC
+    return experiment, aws
+
+
+def run_handler(kind, experiment):
+    values = copy.deepcopy(action_configs()[kind])
+    handler, parameters = framework.AUTHORIZED_HANDLER_CALLS[kind]
+    arguments = [values[key] for key, _optional, _default in parameters]
+    return getattr(experiment, handler)(*arguments)
+
+
+@pytest.mark.parametrize(
+    ("kind", "operation", "response"),
+    [
+        (framework.ChaosType.EC2_REBOOT, "describe_instances", instances_in(OTHER_VPC)),
+        (framework.ChaosType.EC2_REBOOT, "describe_instances", instances_in(None)),
+        (
+            framework.ChaosType.VPC_SUBNET_ACL_MODIFY,
+            "describe_network_acls",
+            nacls_in(OTHER_VPC),
+        ),
+        (
+            # The original NACL is the recovery target, so it must be tagged too.
+            framework.ChaosType.VPC_SUBNET_ACL_MODIFY,
+            "describe_network_acls",
+            nacls_in(VPC, original=UNTAGGED_NACL),
+        ),
+        (
+            framework.ChaosType.VPC_ENDPOINT_DELETE,
+            "describe_vpc_endpoints",
+            endpoints_in(OTHER_VPC),
+        ),
+        (
+            framework.ChaosType.EFS_MOUNT_TARGET_DELETE,
+            "describe_mount_targets",
+            mount_target(VpcId=OTHER_VPC),
+        ),
+        (
+            framework.ChaosType.EFS_MOUNT_TARGET_DELETE,
+            "describe_mount_targets",
+            mount_target(VpcId=None),
+        ),
+        (
+            framework.ChaosType.EFS_MOUNT_TARGET_DELETE,
+            "describe_mount_targets",
+            mount_target(SubnetId=UNTAGGED_SUBNET),
+        ),
+        (
+            framework.ChaosType.EFS_MOUNT_TARGET_DELETE,
+            "describe_mount_targets",
+            mount_target(SubnetId=OUTSIDE_SUBNET, VpcId=OTHER_VPC),
+        ),
+        (
+            framework.ChaosType.EFS_MOUNT_TARGET_DELETE,
+            "describe_mount_targets",
+            mount_target(MountTargetId="fsmt-0123456789abcdef1"),
+        ),
+    ],
+)
+def test_pre_mutation_response_outside_scope_refuses_before_mutation(
+    kind, operation, response
+):
+    experiment, aws = scoped_experiment(kind)
+    service = "efs" if kind == framework.ChaosType.EFS_MOUNT_TARGET_DELETE else "ec2"
+    aws.read_overrides[(service, operation)] = [response]
+    result = run_handler(kind, experiment)
+    assert result.status == "failed"
+    assert "selected VPC" in " ".join(result.errors)
+    assert not result.affected_resources
+    assert experiment.mutation_attempts == []
+    assert mutation_calls(aws) == []
+
+
+def test_in_scope_ec2_reboot_is_admitted():
+    kind = framework.ChaosType.EC2_REBOOT
+    experiment, aws = scoped_experiment(kind)
+    aws.read_overrides[("ec2", "describe_instances")] = [instances_in(VPC)]
+    result = run_handler(kind, experiment)
+    assert result.status == "completed", result.errors
+    assert mutation_calls(aws) == ["reboot_instances"]
+
+
+def test_in_scope_subnet_nacl_replacement_is_admitted():
+    kind = framework.ChaosType.VPC_SUBNET_ACL_MODIFY
+    experiment, aws = scoped_experiment(kind)
+    aws.read_overrides[("ec2", "describe_network_acls")] = [nacls_in(VPC)]
+    original = aws.respond
+
+    def respond(service, operation, request):
+        response = original(service, operation, request)
+        if operation == "replace_network_acl_association":
+            return {"NewAssociationId": "aclassoc-0fedcba9876543210"}
+        return response
+
+    aws.respond = respond
+    result = run_handler(kind, experiment)
+    assert result.status == "completed", result.errors
+    assert mutation_calls(aws) == ["replace_network_acl_association"]
+
+
+def test_in_scope_vpc_endpoint_deletion_is_admitted(monkeypatch):
+    kind = framework.ChaosType.VPC_ENDPOINT_DELETE
+    experiment, aws = scoped_experiment(kind)
+    aws.read_overrides[("ec2", "describe_vpc_endpoints")] = [
+        endpoints_in(VPC),
+        endpoints_in(VPC),
+        {"VpcEndpoints": []},
+    ]
+    original = aws.respond
+
+    def respond(service, operation, request):
+        response = original(service, operation, request)
+        if operation == "delete_vpc_endpoints":
+            return {"Unsuccessful": []}
+        return response
+
+    aws.respond = respond
+    fast_poll(experiment, monkeypatch)
+    result = run_handler(kind, experiment)
+    assert result.status == "completed", result.errors
+    assert result.affected_resources == [ENDPOINT]
+    assert mutation_calls(aws) == ["delete_vpc_endpoints"]
+
+
+def test_efs_mount_target_admitted_only_when_its_subnet_resolves_to_the_vpc():
+    kind = framework.ChaosType.EFS_MOUNT_TARGET_DELETE
+    experiment, aws = scoped_experiment(kind)
+    aws.read_overrides[("efs", "describe_mount_targets")] = [mount_target()]
+    result = run_handler(kind, experiment)
+    assert result.status == "completed", result.errors
+    assert mutation_calls(aws) == ["delete_mount_target"]
+
+
+def test_peering_rule_requires_both_endpoints_in_the_selected_vpc():
+    endpoints, _targets = framework.peering_endpoint_scope(PEERING_VALUES)
+    assert {endpoint["vpc_id"] for endpoint in endpoints.values()} == {VPC, OTHER_VPC}
+    for values in (PEERING_VALUES, SWAPPED_PEERING):
+        with pytest.raises(framework.ConfigurationError, match="both endpoints"):
+            framework.validate_vpc_target_scope(
+                framework.ChaosType.VPC_PEERING_DELETE,
+                values,
+                VPC,
+                {"peering_connections": [PEERING]},
+            )
+
+
+# S3 lifecycle region binding.
+
+LIFECYCLE = framework.ChaosType.S3_LIFECYCLE_MODIFY
+BUCKET = action_configs()[LIFECYCLE]["bucket_name"]
+
+
+def lifecycle_experiment(region=REGION, aws=None):
+    aws = aws or FakeAWS(reject_writes=False)
+    values = dict(action_configs()[LIFECYCLE])
+    if region != REGION:
+        values["region"] = region
+        aws.client("s3").meta.region_name = region
+    experiment = make_experiment(LIFECYCLE, values, aws, dry_run=False)
+    aws.calls.clear()
+    return experiment, aws
+
+
+def s3_calls(aws) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (operation, request)
+        for service, operation, request in aws.calls
+        if service == "s3"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [(None, "us-east-1"), ("", "us-east-1"), ("EU", "eu-west-1"), (REGION, REGION)],
+)
+def test_bucket_location_normalizes_legacy_constraints(location, expected):
+    assert framework.normalize_s3_bucket_region(location) == expected
+
+
+@pytest.mark.parametrize("location", ["us-gov-east-1", "us-east-1", "EU", None, ""])
+def test_s3_lifecycle_in_another_region_is_refused_before_write(location):
+    experiment, aws = lifecycle_experiment()
+    aws.read_overrides[("s3", "get_bucket_location")] = [
+        {"LocationConstraint": location}
+    ]
+    result = experiment.modify_lifecycle(BUCKET, 1)
+    assert result.status == "failed"
+    assert "region" in " ".join(result.errors)
+    assert experiment.mutation_attempts == []
+    assert mutation_calls(aws) == []
+    assert (
+        "get_bucket_location",
+        {"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT_ID},
+    ) in s3_calls(aws)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [FakeClientError("AccessDenied"), {"LocationConstraint": "not-a-region"}, []],
+)
+def test_s3_lifecycle_location_errors_fail_closed(response):
+    experiment, aws = lifecycle_experiment()
+    original = aws.respond
+
+    def respond(service, operation, request):
+        if operation == "get_bucket_location":
+            aws.calls.append((service, operation, request))
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return original(service, operation, request)
+
+    aws.respond = respond
+    result = experiment.modify_lifecycle(BUCKET, 1)
+    assert result.status == "failed"
+    assert experiment.mutation_attempts == []
+    assert mutation_calls(aws) == []
+
+
+@pytest.mark.parametrize(
+    ("region", "location"),
+    [(REGION, REGION), ("us-east-1", None), ("us-east-1", ""), ("eu-west-1", "EU")],
+)
+def test_matching_region_and_owner_permit_the_lifecycle_write(region, location):
+    experiment, aws = lifecycle_experiment(region)
+    aws.read_overrides[("s3", "get_bucket_location")] = [
+        {"LocationConstraint": location}
+    ]
+    result = experiment.modify_lifecycle(BUCKET, 1)
+    assert result.status == "completed", result.errors
+    calls = s3_calls(aws)
+    owner = {"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT_ID}
+    assert [operation for operation, _request in calls] == [
+        "get_bucket_lifecycle_configuration",
+        "get_bucket_location",
+        "put_bucket_lifecycle_configuration",
+    ]
+    assert calls[1][1] == owner
+    assert calls[2][1]["ExpectedBucketOwner"] == ACCOUNT_ID
+    assert experiment.mutation_operations == ["s3.put_bucket_lifecycle_configuration"]
+
+
+class OfflineBody:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def stream(self, **_kwargs: Any):
+        yield self.body
+
+
+LOCATION_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    f"{REGION}</LocationConstraint>"
+).encode()
+NO_LIFECYCLE_XML = (
+    b"<Error><Code>NoSuchLifecycleConfiguration</Code><Message>none</Message></Error>"
+)
+REDIRECT_XML = (
+    b"<Error><Code>PermanentRedirect</Code><Message>redirect</Message></Error>"
+)
+
+
+@pytest.mark.parametrize("redirect", [True, False])
+def test_botocore_region_redirect_of_lifecycle_write_is_refused(monkeypatch, redirect):
+    """A real botocore client, answered locally before any network send."""
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    experiment, _aws = lifecycle_experiment()
+    session = boto3.Session(
+        aws_access_key_id="offline",
+        aws_secret_access_key="offline",
+        aws_session_token="offline",
+        region_name=REGION,
+    )
+    controller = framework.SafetyController(
+        {}, session, REGION, True, expected_account=ACCOUNT_ID
+    )
+    raw = controller.client("s3")._client
+    sent: list[tuple[str, str]] = []
+
+    def offline(request, **_kwargs):
+        url = urlsplit(request.url)
+        sent.append((request.method, url.netloc))
+        if request.method == "GET" and url.query == "location":
+            return AWSResponse(request.url, 200, {}, OfflineBody(LOCATION_XML))
+        if request.method == "GET" and url.query == "lifecycle":
+            return AWSResponse(request.url, 404, {}, OfflineBody(NO_LIFECYCLE_XML))
+        if request.method == "PUT" and url.query == "lifecycle":
+            if redirect:
+                headers = {"x-amz-bucket-region": "us-gov-east-1"}
+                return AWSResponse(request.url, 301, headers, OfflineBody(REDIRECT_XML))
+            return AWSResponse(request.url, 200, {}, OfflineBody(b""))
+        raise AssertionError(f"Unexpected offline request {request.method} {url}")
+
+    raw.meta.events.register("before-send.s3", offline)
+    experiment.s3 = framework.AwsClientProxy("s3", raw, experiment)
+    result = experiment.modify_lifecycle(BUCKET, 1)
+    puts = [host for method, host in sent if method == "PUT"]
+    assert all("us-gov-east-1" not in host for _method, host in sent)
+    assert len(puts) == 1
+    if redirect:
+        assert result.status == "failed"
+        assert "redirected" in " ".join(result.errors)
+        assert experiment.mutation_operations == []
+    else:
+        assert result.status == "completed", result.errors
+        assert experiment.mutation_operations == [
+            "s3.put_bucket_lifecycle_configuration"
+        ]
