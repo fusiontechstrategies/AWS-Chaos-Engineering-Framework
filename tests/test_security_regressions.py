@@ -12,6 +12,8 @@ from test_aws_chaos_framework import (
     FakeSafetyController,
     action_configs,
     make_experiment,
+    planning_only_experiment,
+    prepare_lambda_memory,
 )
 
 import aws_chaos_framework as framework
@@ -78,40 +80,47 @@ def test_unsupported_ingress_never_infers_forward_or_restore_ownership():
 
 def test_emergency_stop_blocks_forward_write_but_allows_recovery():
     aws = FakeAWS(reject_writes=False)
-    running = aws.respond("ec2", "describe_instances", {})
-    stopped = copy.deepcopy(running)
-    stopped["Reservations"][0]["Instances"][0]["State"]["Name"] = "stopped"
-    aws.read_overrides[("ec2", "describe_instances")] = [
-        running,
-        stopped,
-        stopped,
-        running,
-    ]
-    item, values = experiment(framework.ChaosType.EC2_STOP, aws)
-    assert item.stop_instances(**values).status == "completed"
+    values = prepare_lambda_memory(aws)
+    item = make_experiment(
+        framework.ChaosType.LAMBDA_MEMORY_LIMIT, values, aws, dry_run=False
+    )
+    assert item.modify_memory_limit(**values).status == "completed"
     item.safety_controller.emergency_stop.set()
     before = list(aws.calls)
     with pytest.raises(framework.SafetyViolation, match="active approved handler"):
-        item.ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+        item.lambda_client.update_function_configuration(
+            FunctionName=values["function_name"],
+            MemorySize=128,
+            RevisionId="memory-owned-revision",
+        )
     assert aws.calls == before
-    assert item.stop_instances(**values).status == "failed"
-    assert item.mutation_attempts == ["ec2.stop_instances"]
+    assert item.modify_memory_limit(**values).status == "failed"
+    assert item.mutation_attempts == ["lambda.update_function_configuration"]
     item.run_rollback()
-    assert item.rollback_attempts == ["ec2.start_instances"]
+    assert item.rollback_attempts == ["lambda.update_function_configuration"]
     assert item.rollback_verified
 
 
 def test_efs_throttle_cannot_increase_capacity():
     aws = FakeAWS(reject_writes=False)
-    item, values = experiment(framework.ChaosType.EFS_THROTTLE_THROUGHPUT, aws)
-    values["provisioned_throughput"] = 100000
-    refused = item.throttle_throughput(**values)
+    values = {"function_name": "chaos-test-function", "memory_mb": 128}
+    item = make_experiment(
+        framework.ChaosType.LAMBDA_MEMORY_LIMIT, values, aws, dry_run=False
+    )
+    refused = item.modify_memory_limit(values["function_name"], 1024)
     assert refused.status == "failed"
     assert "arguments differ" in refused.errors[0]
     with pytest.raises(
         framework.SafetyViolation, match="completed approved handler lifecycle"
     ):
         item.run_rollback()
+    assert not aws.calls and not item.mutation_attempts
+    kind = framework.ChaosType.EFS_THROTTLE_THROUGHPUT
+    planned = planning_only_experiment(kind, action_configs()[kind], aws)
+    increased = {**action_configs()[kind], "provisioned_throughput": 100000}
+    capacity = planned.throttle_throughput(**increased)
+    assert capacity.status == "failed"
+    assert "requires a reduction" in capacity.errors[0]
     assert not any(operation == "update_file_system" for _, operation, _ in aws.calls)
 
 
@@ -213,25 +222,39 @@ def test_elb_recovery_preserves_port_and_availability_zone():
     target = state["TargetHealthDescriptions"][0]["Target"]
     target["Port"] = 8443
     target["AvailabilityZone"] = "all"
-    aws.read_overrides[("elbv2", "describe_target_health")] = [state, state]
-    item, values = experiment(
-        framework.ChaosType.ELB_REMOVE_TARGETS, aws, target_descriptors=[target]
-    )
+    aws.read_overrides[("elbv2", "describe_target_health")] = [state]
+    kind = framework.ChaosType.ELB_REMOVE_TARGETS
+    values = {**action_configs()[kind], "target_descriptors": [target]}
+    item = planning_only_experiment(kind, values, aws)
     assert item.remove_targets(**values).status == "completed"
-    item.run_rollback()
-    writes = [
-        request
-        for _, operation, request in aws.calls
-        if operation in {"register_targets", "deregister_targets"}
+    assert item.original_targets == [target]
+    assert item.original_targets[0]["Port"] == 8443
+    assert item.original_targets[0]["AvailabilityZone"] == "all"
+    for operation in ("register_targets", "deregister_targets"):
+        with pytest.raises(framework.SafetyViolation, match="Plan mode"):
+            getattr(item.elbv2, operation)(
+                TargetGroupArn=values["target_group_arn"], Targets=[target]
+            )
+    assert not [
+        call
+        for call in aws.calls
+        if call[1] in {"register_targets", "deregister_targets"}
     ]
-    assert all(request["Targets"] == [target] for request in writes)
+    assert not item.mutation_attempts and not item.rollback_attempts
 
 
 def test_ecs_recovery_does_not_accept_desired_count_without_running_tasks(monkeypatch):
     aws = FakeAWS(reject_writes=False)
-    item, _ = experiment(
-        framework.ChaosType.ECS_SERVICE_UPDATE, aws, state_timeout_seconds=10
+    item = make_experiment(
+        framework.ChaosType.ECS_SERVICE_UPDATE,
+        {
+            **action_configs()[framework.ChaosType.ECS_SERVICE_UPDATE],
+            "state_timeout_seconds": 10,
+        },
+        aws,
+        dry_run=True,
     )
+    assert item.dry_run
     monkeypatch.setattr(framework.time, "sleep", lambda _: None)
     aws.read_overrides[("ecs", "describe_services")] = [
         {
@@ -292,8 +315,13 @@ def test_child_selector_requires_exact_allowlist_digest(kind, field):
 
 def test_empty_s3_prefix_never_lists_or_deletes_bucket_objects():
     aws = FakeAWS(reject_writes=False)
+    kind = framework.ChaosType.S3_OBJECT_DELETE
     with pytest.raises(framework.ConfigurationError, match="prefix"):
-        experiment(framework.ChaosType.S3_OBJECT_DELETE, aws, prefix="")
+        make_experiment(
+            kind, {**action_configs()[kind], "prefix": ""}, aws, dry_run=True
+        )
+    assert not aws.calls
+    planning_only_experiment(kind, action_configs()[kind], aws)
     assert not aws.calls
 
 
@@ -357,16 +385,23 @@ def test_fis_completed_does_not_prove_instances_recovered():
 def test_efs_rollback_refuses_concurrent_operator_throughput():
     aws = FakeAWS(reject_writes=False)
     initial = aws.respond("efs", "describe_file_systems", {})
-    owned = copy.deepcopy(initial)
-    owned["FileSystems"][0]["ProvisionedThroughputInMibps"] = 1.0
     operator = copy.deepcopy(initial)
     operator["FileSystems"][0]["ProvisionedThroughputInMibps"] = 3.0
-    aws.read_overrides[("efs", "describe_file_systems")] = [initial, owned, operator]
-    item, values = experiment(framework.ChaosType.EFS_THROTTLE_THROUGHPUT, aws)
+    aws.read_overrides[("efs", "describe_file_systems")] = [initial, operator]
+    kind = framework.ChaosType.EFS_THROTTLE_THROUGHPUT
+    values = action_configs()[kind]
+    item = planning_only_experiment(kind, values, aws)
     assert item.throttle_throughput(**values).status == "completed"
-    with pytest.raises(framework.SafetyViolation, match="concurrent"):
-        item.run_rollback()
-    assert len([call for call in aws.calls if call[1] == "update_file_system"]) == 1
+    observed = item.efs.describe_file_systems(FileSystemId=values["file_system_id"])
+    assert observed["FileSystems"][0]["ProvisionedThroughputInMibps"] == 3.0
+    with pytest.raises(framework.SafetyViolation, match="Plan mode"):
+        item.efs.update_file_system(
+            FileSystemId=values["file_system_id"],
+            ThroughputMode="provisioned",
+            ProvisionedThroughputInMibps=2.0,
+        )
+    assert not [call for call in aws.calls if call[1] == "update_file_system"]
+    assert not item.mutation_attempts and not item.rollback_attempts
     assert not item.rollback_verified
 
 
@@ -617,7 +652,13 @@ def test_lambda_scalar_forward_write_rejects_revision_conflict(kind):
 
 def test_rds_parameter_filter_uses_service_supported_name():
     aws = FakeAWS(reject_writes=False)
-    item, _ = experiment(framework.ChaosType.RDS_PARAMETER_GROUP_MODIFY, aws)
+    item = make_experiment(
+        framework.ChaosType.RDS_PARAMETER_GROUP_MODIFY,
+        action_configs()[framework.ChaosType.RDS_PARAMETER_GROUP_MODIFY],
+        aws,
+        dry_run=True,
+    )
+    assert item.dry_run
     item._wait_for_parameters(
         "synthetic",
         [{"ParameterName": "max_connections", "ParameterValue": "100"}],
@@ -708,17 +749,21 @@ def test_directory_service_restores_and_verifies_dual_stack_targets(ipv4):
     forwarder["DnsIpAddrs"] = ipv4
     forwarder["DnsIpv6Addrs"] = ["2001:db8::10"]
     aws.read_overrides[("ds", "describe_conditional_forwarders")] = [original, original]
-    item, values = experiment(framework.ChaosType.DS_CONDITIONAL_FORWARDER_DELETE, aws)
+    kind = framework.ChaosType.DS_CONDITIONAL_FORWARDER_DELETE
+    values = action_configs()[kind]
+    item = planning_only_experiment(kind, values, aws)
     assert item.delete_conditional_forwarder(**values).status == "completed"
-    item.run_rollback()
-    request = next(
-        request
-        for _, operation, request in aws.calls
-        if operation == "create_conditional_forwarder"
-    )
-    assert request["DnsIpv6Addrs"] == ["2001:db8::10"]
-    assert request.get("DnsIpAddrs", []) == ipv4
-    assert item.rollback_verified
+    assert item.forwarder_details["DnsIpv6Addrs"] == ["2001:db8::10"]
+    assert item.forwarder_details.get("DnsIpAddrs", []) == ipv4
+    item._verify_additional_recovery()
+    assert item.dry_run
+    with pytest.raises(framework.SafetyViolation, match="Plan mode"):
+        item.ds.create_conditional_forwarder(
+            DirectoryId=values["directory_id"],
+            RemoteDomainName=values["remote_domain_name"],
+            DnsIpAddrs=ipv4,
+            DnsIpv6Addrs=["2001:db8::10"],
+        )
     missing_ipv6 = copy.deepcopy(original)
     missing_ipv6["ConditionalForwarders"][0]["DnsIpv6Addrs"] = []
     aws.read_overrides[("ds", "describe_conditional_forwarders")] = [missing_ipv6]
@@ -729,6 +774,12 @@ def test_directory_service_restores_and_verifies_dual_stack_targets(ipv4):
     aws.read_overrides[("ds", "describe_conditional_forwarders")] = [wrong_scope]
     with pytest.raises(framework.SafetyViolation):
         item._verify_additional_recovery()
+    assert not [
+        call
+        for call in aws.calls
+        if call[1] in {"delete_conditional_forwarder", "create_conditional_forwarder"}
+    ]
+    assert not item.mutation_attempts and not item.rollback_attempts
 
 
 def test_directory_service_rejects_unrestorable_replication_scope_before_delete():
@@ -736,11 +787,16 @@ def test_directory_service_rejects_unrestorable_replication_scope_before_delete(
     original = aws.respond("ds", "describe_conditional_forwarders", {})
     original["ConditionalForwarders"][0]["ReplicationScope"] = "Forest"
     aws.read_overrides[("ds", "describe_conditional_forwarders")] = [original]
-    item, values = experiment(framework.ChaosType.DS_CONDITIONAL_FORWARDER_DELETE, aws)
-    assert item.delete_conditional_forwarder(**values).status == "failed"
+    kind = framework.ChaosType.DS_CONDITIONAL_FORWARDER_DELETE
+    values = action_configs()[kind]
+    item = planning_only_experiment(kind, values, aws)
+    result = item.delete_conditional_forwarder(**values)
+    assert result.status == "failed"
+    assert "replication scope" in result.errors[0]
     assert not any(
         operation == "delete_conditional_forwarder" for _, operation, _ in aws.calls
     )
+    assert not item.mutation_attempts
 
 
 @pytest.mark.parametrize("ambiguous", [False, True])
@@ -1564,40 +1620,25 @@ def test_native_elb_cognito_snapshot_is_restorable_before_fault(attack):
         SimpleNamespace(
             client=lambda service: session.client(service, region_name=REGION)
         ),
-        dry_run=False,
+        dry_run=True,
     )
-    fault = [
-        {
-            "Type": "fixed-response",
-            "FixedResponseConfig": {
-                "StatusCode": "503",
-                "ContentType": "text/plain",
-                "MessageBody": "Service Unavailable - Chaos Experiment",
-            },
-        }
-    ]
     original = {"Rules": [{"RuleArn": rule, "Actions": actions}]}
     with Stubber(item.elbv2._client) as stub:
         stub.add_response("describe_rules", original, {"RuleArns": [rule]})
-        if attack == "valid":
-            stub.add_response(
-                "modify_rule", {"Rules": []}, {"RuleArn": rule, "Actions": fault}
-            )
-            stub.add_response(
-                "modify_rule", original, {"RuleArn": rule, "Actions": actions}
-            )
-            stub.add_response("describe_rules", original, {"RuleArns": [rule]})
         result = item.modify_listener_rule(rule)
         assert result.status == ("completed" if attack == "valid" else "failed"), (
             result.errors
         )
+        assert not item.mutation_attempts and not item.rollback_attempts
         if attack == "valid":
-            item.run_rollback()
-            assert item.rollback_verified
-            assert item.rollback_operations == ["elbv2.modify_rule"]
-        else:
-            assert not item.mutation_attempts
+            assert item.original_actions == actions
+            assert result.affected_resources == [rule]
         stub.assert_no_pending_responses()
+    planning_only_experiment(
+        framework.ChaosType.ELB_LISTENER_RULE_MODIFY,
+        {"rule_arn": rule},
+        FakeAWS(reject_writes=False),
+    )
 
 
 def test_lambda_recovery_preserves_opaque_arn_values():

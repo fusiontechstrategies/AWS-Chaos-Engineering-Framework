@@ -520,6 +520,23 @@ FIS_PREFERRED_EXPERIMENTS = frozenset(
 
 CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
     {
+        ChaosType.VPC_ROUTE_TABLE_MODIFY,
+        ChaosType.EBS_DETACH_VOLUME,
+        ChaosType.EC2_STOP,
+        ChaosType.EFS_THROTTLE_THROUGHPUT,
+        ChaosType.RDS_PARAMETER_GROUP_MODIFY,
+        ChaosType.LAMBDA_THROTTLE,
+        ChaosType.S3_OBJECT_DELETE,
+        ChaosType.S3_BUCKET_VERSIONING_SUSPEND,
+        ChaosType.ELB_REMOVE_TARGETS,
+        ChaosType.ELB_MODIFY_ATTRIBUTES,
+        ChaosType.ELB_LISTENER_RULE_MODIFY,
+        ChaosType.ELB_HEALTH_CHECK_MODIFY,
+        ChaosType.ECS_SERVICE_UPDATE,
+        ChaosType.ECS_CONTAINER_INSTANCE_DRAIN,
+        ChaosType.APPSTREAM_FLEET_STOP,
+        ChaosType.APPSTREAM_STACK_DISASSOCIATE,
+        ChaosType.DS_CONDITIONAL_FORWARDER_DELETE,
         ChaosType.S3_BUCKET_POLICY_DENY,
         ChaosType.SNS_TOPIC_POLICY_RESTRICT,
         ChaosType.EBS_THROTTLE_IOPS,
@@ -542,8 +559,42 @@ CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
 # These APIs have no conditional ownership/revision argument. A local lock or
 # reread cannot distinguish another principal's identical change or close the
 # read/write race. Keep planning, but do not create a fault requiring this recovery.
+# RDS parameter groups also lack an immutable consumer-topology boundary; S3
+# key-only deletion lacks approved immutable versions. Neither can gain live
+# authority from a larger blast-radius limit or an irreversible approval.
+# Route deletion cannot bind a captured target/generation; EBS attach/detach
+# cannot condition on the mutable MultiAttachEnabled capability. Read-only
+# terminal predicates do not supply ownership for their forward/restore writes.
 CONCURRENCY_UNSAFE_MUTATIONS = frozenset(
     {
+        "ec2.delete_route",
+        "ec2.create_route",
+        "ec2.detach_volume",
+        "ec2.attach_volume",
+        "ec2.stop_instances",
+        "ec2.start_instances",
+        "efs.update_file_system",
+        "rds.modify_db_parameter_group",
+        "lambda.put_function_concurrency",
+        "lambda.delete_function_concurrency",
+        "s3.delete_objects",
+        "s3.put_bucket_versioning",
+        "elbv2.deregister_targets",
+        "elbv2.register_targets",
+        "elbv2.modify_target_group_attributes",
+        "elbv2.modify_target_group",
+        "elbv2.modify_rule",
+        "ecs.update_service",
+        "ecs.update_container_instances_state",
+        "appstream.stop_fleet",
+        "appstream.start_fleet",
+        "appstream.disassociate_fleet",
+        "appstream.associate_fleet",
+        "ds.delete_conditional_forwarder",
+        "ds.create_conditional_forwarder",
+        "sns.subscribe",
+        "ses.create_configuration_set",
+        "s3.put_bucket_encryption",
         "s3.put_bucket_policy",
         "s3.delete_bucket_policy",
         "sns.set_topic_attributes",
@@ -889,11 +940,52 @@ def validate_resource_arn(
         raise SafetyViolation("Resource ARN differs from the reviewed account")
 
 
+def validate_lambda_function_identifier(
+    value: Any, account: str | None, region: str
+) -> None:
+    """Accept a local unqualified name or an exact reviewed full function ARN."""
+    if not isinstance(value, str):
+        raise SafetyViolation(
+            "Lambda requires an exact local name or full function ARN"
+        )
+    if value.startswith("arn:"):
+        validate_resource_arn(value, "lambda", account, region)
+        resource = value.split(":", 5)[5]
+        if not re.fullmatch(r"function:[A-Za-z0-9_-]{1,64}", resource):
+            raise SafetyViolation("Lambda requires an unqualified full function ARN")
+    elif not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+        raise SafetyViolation(
+            "Lambda partial ARNs and qualified names are unsupported; use a local name or full ARN"
+        )
+
+
+def validate_lambda_function_response(
+    requested: str, response: dict[str, Any], account: str | None, region: str
+) -> None:
+    """Bind configuration revision data to the same reviewed function identity."""
+    canonical = response.get("FunctionArn")
+    validate_lambda_function_identifier(canonical, account, region)
+    if not canonical.startswith("arn:"):
+        raise SafetyViolation("Lambda configuration requires a canonical full ARN")
+    partition = "aws-us-gov" if region in GOVCLOUD_REGIONS else "aws"
+    expected = (
+        requested
+        if requested.startswith("arn:")
+        else f"arn:{partition}:lambda:{region}:{account}:function:{requested}"
+    )
+    if canonical != expected:
+        raise SafetyViolation("Lambda configuration differs from the reviewed function")
+
+
 def validate_experiment_arns(
     config: dict[str, Any], account: str | None, region: str
 ) -> None:
     """Validate every ARN-valued target before approval or dispatch."""
     service = str(config.get("type", "")).split("_", 1)[0]
+    if "function_name" in config:
+        validate_lambda_function_identifier(
+            config.get("function_name"), account, region
+        )
     if (
         service == "waf"
         and config.get("scope") == "CLOUDFRONT"
@@ -929,6 +1021,8 @@ def validate_sdk_request_arns(
     region: str,
 ) -> None:
     """Classify actual SDK identity fields, preserving opaque structured data."""
+    if service == "lambda" and "FunctionName" in request:
+        validate_lambda_function_identifier(request["FunctionName"], account, region)
     leaves = list(bounded_argument_leaves(request, with_paths=True))
     if (
         service == "sns"
@@ -1483,7 +1577,10 @@ class AwsClientProxy:
             return reviewed_paginator
         read_only = name in READ_ONLY_OPERATIONS.get(self._service, ())
         bind_s3_owner = self._service == "s3" and name in S3_OWNER_BOUND_OPERATIONS
-        if not callable(attribute) or (read_only and not bind_s3_owner):
+        bind_lambda_identity = self._service == "lambda" and read_only
+        if not callable(attribute) or (
+            read_only and not bind_s3_owner and not bind_lambda_identity
+        ):
             return attribute
 
         def invoke(*args: Any, **kwargs: Any) -> Any:
@@ -1518,8 +1615,45 @@ class AwsClientProxy:
                         "S3 bucket owner differs from the reviewed account"
                     )
                 kwargs["ExpectedBucketOwner"] = expected
+            if self._service == "lambda":
+                if "Qualifier" in kwargs:
+                    raise SafetyViolation("Qualified Lambda requests are unsupported")
+                if not isinstance(
+                    self._owner.expected_account, str
+                ) or not ACCOUNT_ID_PATTERN.fullmatch(self._owner.expected_account):
+                    raise SafetyViolation(
+                        "Lambda requires the reviewed twelve-digit account"
+                    )
+                if args or "FunctionName" not in kwargs:
+                    raise SafetyViolation(
+                        "Lambda requires explicit FunctionName identity"
+                    )
+                validate_lambda_function_identifier(
+                    kwargs["FunctionName"],
+                    self._owner.expected_account,
+                    self._owner.expected_region,
+                )
+                if (
+                    getattr(getattr(self._client, "meta", None), "region_name", None)
+                    != self._owner.expected_region
+                ):
+                    raise SafetyViolation(
+                        "Lambda SDK endpoint differs from the reviewed region"
+                    )
             if read_only:
-                return attribute(*args, **kwargs)
+                response = attribute(*args, **kwargs)
+                if (
+                    self._service == "lambda"
+                    and name == "get_function_configuration"
+                    and not self._owner.dry_run
+                ):
+                    validate_lambda_function_response(
+                        kwargs["FunctionName"],
+                        response,
+                        self._owner.expected_account,
+                        self._owner.expected_region,
+                    )
+                return response
             if self._owner.dry_run:
                 raise SafetyViolation("Plan mode refuses direct AWS mutation dispatch")
             self._owner._require_execution_grant(dispatch=True)
@@ -2413,6 +2547,13 @@ def _guard_live_handler(method):
 
     @wraps(method)
     def guarded(self, *args, **kwargs):
+        if "function_name" in signature.parameters:
+            supplied = signature.bind(self, *args, **kwargs)
+            validate_lambda_function_identifier(
+                supplied.arguments.get("function_name"),
+                self.expected_account,
+                self.expected_region,
+            )
         if self.dry_run:
             return method(self, *args, **kwargs)
         acquired = False
@@ -2535,6 +2676,13 @@ class ChaosExperiment:
 
     def _require_execution_grant(self, *, dispatch: bool = False) -> _ExecutionGrant:
         grant = self._execution_grant
+        if (
+            isinstance(grant, _ExecutionGrant)
+            and grant.kind in CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS
+        ):
+            raise SafetyViolation(
+                "Live mutation and recovery are disabled without conditional ownership proof; reconcile manually"
+            )
         if (
             not isinstance(grant, _ExecutionGrant)
             or grant.controller is not self.safety_controller
@@ -2711,6 +2859,7 @@ class ChaosExperiment:
                 self._sdk_request_authority.recovery = recovery_grant
             # Diagnostic compatibility only. SDK admission never reads this flag.
             self._in_rollback = True
+            self.rollback_verified = False
             try:
                 self.rollback()
                 self._verify_additional_recovery()
@@ -2727,22 +2876,13 @@ class ChaosExperiment:
 
     def _verify_additional_recovery(self) -> None:
         """Read back extension recovery state independently of successful writes."""
+        if self.dry_run and isinstance(self, (VPCChaosExperiment, EBSChaosExperiment)):
+            self.rollback_verified = False
+            return
         checks: list[bool] = []
         if isinstance(self, VPCChaosExperiment):
             if hasattr(self, "route_table_id"):
-                routes = self.ec2.describe_route_tables(
-                    RouteTableIds=[self.route_table_id]
-                )["RouteTables"][0].get("Routes", [])
-                checks.append(
-                    any(
-                        route.get("DestinationCidrBlock") == self.destination_cidr
-                        and all(
-                            route.get(key) == value
-                            for key, value in self.original_route_target.items()
-                        )
-                        for route in routes
-                    )
-                )
+                checks.append(self._route_is_restored(self._current_selected_routes()))
             if hasattr(self, "removed_rule"):
                 groups = self.ec2.describe_security_groups(GroupIds=[self.group_id])[
                     "SecurityGroups"
@@ -3319,6 +3459,8 @@ class EC2ChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback EC2 experiments"""
+        if not self.dry_run:
+            self._require_execution_grant(dispatch=True)
         try:
             if hasattr(self, "stopped_instances"):
                 states = self._instance_states(self.stopped_instances)
@@ -3410,7 +3552,7 @@ class EBSChaosExperiment(ChaosExperiment):
             volumes = self.ec2.describe_volumes(VolumeIds=[volume_id]).get(
                 "Volumes", []
             )
-            if len(volumes) != 1:
+            if len(volumes) != 1 or volumes[0].get("VolumeId") != volume_id:
                 raise RuntimeError("EC2 did not return the selected EBS volume")
             if volumes[0].get("State") == desired_state:
                 return volumes[0]
@@ -3420,6 +3562,43 @@ class EBSChaosExperiment(ChaosExperiment):
             else:
                 time.sleep(wait_seconds)
         raise TimeoutError(f"Timed out waiting for EBS state {desired_state}")
+
+    def _wait_for_exact_attachment(self) -> None:
+        """Verify the single approved attachment's terminal state, not aggregate state."""
+        deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
+        while time.monotonic() < deadline:
+            volumes = self.ec2.describe_volumes(VolumeIds=[self.volume_id]).get(
+                "Volumes", []
+            )
+            if len(volumes) != 1 or volumes[0].get("VolumeId") != self.volume_id:
+                raise SafetyViolation(
+                    "EBS recovery did not return the exact selected volume"
+                )
+            volume = volumes[0]
+            attachments = volume.get("Attachments", [])
+            if volume.get("MultiAttachEnabled") is not False:
+                raise SafetyViolation(
+                    "EBS recovery requires verified single-attach capability"
+                )
+            if len(attachments) > 1 or any(
+                item.get("InstanceId") != self.original_instance
+                or item.get("Device") != self.original_device
+                or item.get("State") not in {"attaching", "attached"}
+                for item in attachments
+            ):
+                raise SafetyViolation(
+                    "EBS rollback found an unexpected volume attachment"
+                )
+            if (
+                volume.get("State") == "in-use"
+                and len(attachments) == 1
+                and attachments[0].get("State") == "attached"
+            ):
+                return
+            time.sleep(min(5.0, max(0.1, deadline - time.monotonic())))
+        raise TimeoutError(
+            "Timed out waiting for the exact EBS attachment to be attached"
+        )
 
     def _wait_for_iops(
         self, volume_id: str, expected_iops: int, interruptible: bool
@@ -3467,6 +3646,7 @@ class EBSChaosExperiment(ChaosExperiment):
                 len(volumes) != 1
                 or volumes[0].get("VolumeId") != volume_id
                 or len(volumes[0].get("Attachments", [])) != 1
+                or volumes[0].get("MultiAttachEnabled") is not False
             ):
                 raise SafetyViolation(
                     "EBS detach requires exactly one matching volume and attachment"
@@ -3611,6 +3791,7 @@ class EBSChaosExperiment(ChaosExperiment):
         if self.dry_run:
             # A simulation authorizes no SDK recovery and proves no live restoration.
             return
+        self._require_execution_grant(dispatch=True)
         try:
             if hasattr(self, "volume_id") and hasattr(self, "original_instance"):
                 volumes = self.ec2.describe_volumes(VolumeIds=[self.volume_id]).get(
@@ -3619,20 +3800,24 @@ class EBSChaosExperiment(ChaosExperiment):
                 if len(volumes) != 1:
                     raise RuntimeError("EC2 did not return the selected EBS volume")
                 volume = volumes[0]
+                if (
+                    volume.get("VolumeId") != self.volume_id
+                    or volume.get("MultiAttachEnabled") is not False
+                ):
+                    raise SafetyViolation(
+                        "EBS recovery requires the exact single-attach volume"
+                    )
                 attachments = volume.get("Attachments", [])
-                already_restored = any(
-                    item.get("InstanceId") == self.original_instance
-                    and item.get("Device") == self.original_device
-                    and item.get("State") == "attached"
-                    for item in attachments
-                )
-                if already_restored:
-                    self.rollback_verified = True
-                else:
-                    if attachments:
+                if attachments:
+                    if len(attachments) != 1 or (
+                        attachments[0].get("InstanceId") != self.original_instance
+                        or attachments[0].get("Device") != self.original_device
+                        or attachments[0].get("State") not in {"attaching", "attached"}
+                    ):
                         raise SafetyViolation(
                             "EBS rollback found an unexpected volume attachment"
                         )
+                else:
                     state = volume.get("State")
                     if state == "in-use":
                         raise SafetyViolation(
@@ -3645,18 +3830,8 @@ class EBSChaosExperiment(ChaosExperiment):
                         InstanceId=self.original_instance,
                         Device=self.original_device,
                     )
-                    restored = self._wait_for_volume_state(
-                        self.volume_id, "in-use", False
-                    )
-                    if not any(
-                        item.get("InstanceId") == self.original_instance
-                        and item.get("Device") == self.original_device
-                        for item in restored.get("Attachments", [])
-                    ):
-                        raise RuntimeError(
-                            "EBS rollback could not verify the restored attachment"
-                        )
-                    self.rollback_verified = True
+                self._wait_for_exact_attachment()
+                self.rollback_verified = True
                 logger.info(
                     f"Re-attached volume {self.volume_id} to instance {self.original_instance}"
                 )
@@ -3856,6 +4031,8 @@ class EFSChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback EFS experiments"""
+        if not self.dry_run:
+            self._require_execution_grant(dispatch=True)
         try:
             if hasattr(self, "original_throughput_mode"):
                 current = self.efs.describe_file_systems(
@@ -3922,6 +4099,55 @@ class VPCChaosExperiment(ChaosExperiment):
     def __init__(self, config: dict[str, Any], safety_controller: SafetyController):
         super().__init__(config, safety_controller)
         self.ec2 = self.client("ec2")
+
+    def _current_selected_routes(self) -> list[dict[str, Any]]:
+        tables = self.ec2.describe_route_tables(
+            RouteTableIds=[self.route_table_id]
+        ).get("RouteTables", [])
+        if len(tables) != 1 or tables[0].get("RouteTableId") != self.route_table_id:
+            raise SafetyViolation(
+                "Route recovery requires the exact reviewed route table"
+            )
+        return [
+            route
+            for route in tables[0].get("Routes", [])
+            if route.get("DestinationCidrBlock") == self.destination_cidr
+        ]
+
+    def _route_is_restored(self, routes: list[dict[str, Any]]) -> bool:
+        if len(routes) != 1 or routes[0].get("State") != "active":
+            return False
+        target = {
+            key: routes[0][key]
+            for key in self.ROUTE_TARGET_FIELDS
+            if routes[0].get(key)
+        }
+        return target == self.original_route_target
+
+    def _wait_for_active_route(self) -> None:
+        deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
+        while time.monotonic() < deadline:
+            routes = self._current_selected_routes()
+            if len(routes) > 1:
+                raise SafetyViolation(
+                    "Route recovery found ambiguous destination matches"
+                )
+            if routes:
+                target = {
+                    key: routes[0][key]
+                    for key in self.ROUTE_TARGET_FIELDS
+                    if routes[0].get(key)
+                }
+                if target != self.original_route_target:
+                    raise SafetyViolation(
+                        "Rollback found a conflicting route and refused to overwrite it"
+                    )
+                if routes[0].get("State") == "blackhole":
+                    raise SafetyViolation("Route recovery returned a blackhole route")
+                if self._route_is_restored(routes):
+                    return
+            time.sleep(min(5.0, max(0.1, deadline - time.monotonic())))
+        raise TimeoutError("Timed out waiting for an exact active restored route")
 
     def modify_subnet_acl(self, subnet_id: str, nacl_id: str) -> ExperimentResult:
         """Modify subnet's network ACL"""
@@ -4400,6 +4626,7 @@ class VPCChaosExperiment(ChaosExperiment):
         if self.dry_run:
             # A simulation authorizes no SDK recovery and proves no live restoration.
             return
+        self._require_execution_grant(dispatch=True)
         try:
             if hasattr(self, "original_association_id") and hasattr(
                 self, "original_nacl_id"
@@ -4450,30 +4677,27 @@ class VPCChaosExperiment(ChaosExperiment):
                 logger.info("Restored original NACL association")
 
             if hasattr(self, "route_table_id") and hasattr(self, "destination_cidr"):
-                current = self.ec2.describe_route_tables(
-                    RouteTableIds=[self.route_table_id]
-                )["RouteTables"][0].get("Routes", [])
-                existing = next(
-                    (
-                        route
-                        for route in current
-                        if route.get("DestinationCidrBlock") == self.destination_cidr
-                    ),
-                    None,
-                )
+                current = self._current_selected_routes()
+                if len(current) > 1:
+                    raise SafetyViolation(
+                        "Route recovery found ambiguous destination matches"
+                    )
+                existing = current[0] if current else None
                 if existing is None:
                     self.ec2.create_route(
                         RouteTableId=self.route_table_id,
                         DestinationCidrBlock=self.destination_cidr,
                         **self.original_route_target,
                     )
-                elif not all(
-                    existing.get(key) == value
-                    for key, value in self.original_route_target.items()
-                ):
+                elif {
+                    key: existing[key]
+                    for key in self.ROUTE_TARGET_FIELDS
+                    if existing.get(key)
+                } != self.original_route_target:
                     raise SafetyViolation(
                         "Rollback found a conflicting route and refused to overwrite it"
                     )
+                self._wait_for_active_route()
                 logger.info("Restored route table")
 
             if hasattr(self, "group_id") and hasattr(self, "removed_rule"):
@@ -4881,6 +5105,8 @@ class RDSChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback RDS experiments"""
+        if not self.dry_run:
+            self._require_execution_grant(dispatch=True)
         try:
             if hasattr(self, "original_retention") and hasattr(self, "db_identifier"):
                 raise SafetyViolation(
@@ -5215,6 +5441,8 @@ class LambdaChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Restore owned fields with revision checks and preserve unrelated edits."""
+        if not self.dry_run:
+            self._require_execution_grant(dispatch=True)
         if not hasattr(self, "function_name") or not self.mutation_attempts:
             return
         current = self.lambda_client.get_function_configuration(
@@ -5623,6 +5851,8 @@ class S3ChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Restore only owned S3 changes, refusing conflicting concurrent state."""
+        if not self.dry_run:
+            self._require_execution_grant(dispatch=True)
         if self.dry_run:
             # A simulation authorizes no SDK recovery and proves no live restoration.
             return
@@ -6069,6 +6299,8 @@ class SNSChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback SNS experiments"""
+        if not self.dry_run:
+            self._require_execution_grant(dispatch=True)
         if self.dry_run:
             # A simulation authorizes no SDK recovery and proves no live restoration.
             return
@@ -6361,6 +6593,8 @@ class ELBChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback ELB experiments"""
+        if not self.dry_run:
+            self._require_execution_grant(dispatch=True)
         try:
             if hasattr(self, "original_targets") and hasattr(self, "target_group_arn"):
                 # Re-register targets
@@ -6738,6 +6972,8 @@ class ECSChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback ECS experiments"""
+        if not self.dry_run:
+            self._require_execution_grant(dispatch=True)
         try:
             if hasattr(self, "original_desired_count") and hasattr(self, "service"):
                 # Restore service desired count
@@ -8149,6 +8385,8 @@ class DirectoryServiceChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback Directory Service experiments"""
+        if not self.dry_run:
+            self._require_execution_grant(dispatch=True)
         try:
             if hasattr(self, "forwarder_details") and hasattr(self, "directory_id"):
                 # Re-create conditional forwarder
@@ -8289,6 +8527,8 @@ class AppStreamChaosExperiment(ChaosExperiment):
 
     def rollback(self):
         """Rollback AppStream experiments"""
+        if not self.dry_run:
+            self._require_execution_grant(dispatch=True)
         try:
             if hasattr(self, "fleet_name"):
                 if hasattr(self, "original_state") and self.original_state == "RUNNING":

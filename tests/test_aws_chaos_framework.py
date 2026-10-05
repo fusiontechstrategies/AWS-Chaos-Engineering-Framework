@@ -139,6 +139,7 @@ class FakeAWS:
                 "Volumes": [
                     {
                         "VolumeId": VOLUME_ID,
+                        "MultiAttachEnabled": False,
                         "Size": 8,
                         "VolumeType": "io2",
                         "State": "in-use",
@@ -288,6 +289,8 @@ class FakeAWS:
             ("lambda", "get_function_concurrency"): {"ReservedConcurrentExecutions": 5},
             ("lambda", "get_function_configuration"): {
                 "FunctionName": "chaos-test-function",
+                "FunctionArn": f"arn:aws-us-gov:lambda:{REGION}:{ACCOUNT_ID}:function:chaos-test-function",
+                "RevisionId": "memory-original-revision",
                 "LastUpdateStatus": "Successful",
                 "Timeout": 30,
                 "MemorySize": 256,
@@ -1020,6 +1023,42 @@ def make_experiment(experiment_type, action_config, fake_aws, *, dry_run=True):
     return experiment
 
 
+def prepare_lambda_memory(aws, *, forward_failure=False):
+    """Ordinary sequential snapshots for admitted conditional memory/recovery."""
+    values = {"function_name": "chaos-test-function", "memory_mb": 128}
+    original = {
+        "FunctionName": values["function_name"],
+        "FunctionArn": f"arn:aws-us-gov:lambda:{REGION}:{ACCOUNT_ID}:function:chaos-test-function",
+        "RevisionId": "memory-original-revision",
+        "MemorySize": 256,
+        "LastUpdateStatus": "Successful",
+    }
+    changed = {**original, "RevisionId": "memory-owned-revision", "MemorySize": 128}
+    restored = {**original, "RevisionId": "memory-restored-revision"}
+    aws.read_overrides[("lambda", "get_function_configuration")] = [
+        original,
+        *([] if forward_failure else [changed]),
+        changed,
+        restored,
+        restored,
+    ]
+    return values
+
+
+def planning_only_experiment(kind, values, aws):
+    """Exercise a withdrawn public live contract and return its legitimate plan."""
+    before = list(aws.calls)
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(kind, values, aws, dry_run=False)
+    assert aws.calls == before
+    planned = make_experiment(kind, values, aws, dry_run=True)
+    assert planned.dry_run and not framework.experiment_metadata(kind).live_supported
+    assert planned.mutation_attempts == []
+    return planned
+
+
 @pytest.mark.parametrize(
     ("experiment_type", "action_config"),
     sorted(action_configs().items(), key=lambda item: item[0].value),
@@ -1216,55 +1255,37 @@ def test_evidence_report_redacts_identity_and_targets_by_default(
 
 
 def test_automatic_rollback_failure_is_reported_as_experiment_failure() -> None:
-    class BrokenRollbackExperiment:
-        mutation_attempts = ["lambda.put_function_concurrency"]
-        mutation_operations = ["lambda.put_function_concurrency"]
-        rollback_attempts: list[str] = []
-        rollback_operations: list[str] = []
-        rollback_errors: list[str] = []
-        rollback_verified = False
-        rollback_mode = "automatic"
+    aws = FakeAWS(reject_writes=False)
+    values = {**prepare_lambda_memory(aws), "auto_rollback": True}
+    orchestrator = make_orchestrator(
+        framework.ChaosType.LAMBDA_MEMORY_LIMIT, values, aws, dry_run=False
+    )
+    original = aws.respond
 
-        def run_rollback(self) -> None:
-            self.rollback_attempts.append("lambda.delete_function_concurrency")
+    def ordinary_failure(service, operation, request):
+        if (
+            operation == "update_function_configuration"
+            and request.get("MemorySize") == 256
+        ):
+            aws.calls.append((service, operation, request))
             raise RuntimeError("simulated rollback failure")
+        return original(service, operation, request)
 
-    experiment = BrokenRollbackExperiment()
-    orchestrator = object.__new__(framework.ChaosOrchestrator)
-    orchestrator.config = {"global": {}, "safety": {}}
-    orchestrator.region = REGION
-    orchestrator.dry_run = False
-    orchestrator.live = True
-    orchestrator.operator_principal_arn = BREAK_GLASS_ARN
-    orchestrator.active_access_key_id = OTHER_ACCESS_KEY
-    orchestrator._report_sensitive_values = set()
-    orchestrator._sensitive_values_lock = threading.Lock()
-    orchestrator._active_experiments_lock = threading.Lock()
-    orchestrator.active_experiments = []
-    orchestrator.safety_controller = FakeSafetyController(
-        FakeAWS(reject_writes=False), live=True
-    )
-    orchestrator._validate_target_scope = lambda *_args: None
-    orchestrator._create_experiment = lambda *_args: experiment
-    orchestrator._execute_experiment = lambda *_args: framework.ExperimentResult(
-        experiment_id="rollback-test",
-        experiment_type=framework.ChaosType.LAMBDA_THROTTLE,
-        start_time=framework.utc_now(),
-        status="completed",
-    )
-
+    aws.respond = ordinary_failure
     result = orchestrator._run_single_experiment(
-        {
-            "type": "lambda_throttle",
-            "function_name": "chaos-test-function",
-            "auto_rollback": True,
-        }
+        {"type": "lambda_memory_limit", **values, "auto_rollback": True}
     )
-
     assert result.status == "failed"
     assert result.rollback_successful is False
     assert result.rollback_errors == ["simulated rollback failure"]
     assert any("Rollback failed" in error for error in result.errors)
+    assert result.mutation_attempts == ["lambda.update_function_configuration"]
+    assert result.rollback_attempts == ["lambda.update_function_configuration"]
+    requests = [r for _, op, r in aws.calls if op == "update_function_configuration"]
+    assert [r["RevisionId"] for r in requests] == [
+        "memory-original-revision",
+        "memory-owned-revision",
+    ]
 
 
 def test_configuration_rejects_gated_action() -> None:
@@ -1288,149 +1309,67 @@ def test_live_s3_policy_is_planning_only_without_conditional_update() -> None:
 
 
 def test_live_route_removal_restores_exact_route() -> None:
-    fake_aws = FakeAWS(reject_writes=False)
-    fake_aws.read_overrides[("ec2", "describe_route_tables")] = [
-        fake_aws.respond("ec2", "describe_route_tables", {}),
-        {"RouteTables": [{"Routes": []}]},
-    ]
-    fake_aws.calls.clear()
-    action_config = action_configs()[framework.ChaosType.VPC_ROUTE_TABLE_MODIFY]
-    experiment = make_experiment(
-        framework.ChaosType.VPC_ROUTE_TABLE_MODIFY,
-        action_config,
-        fake_aws,
-        dry_run=False,
-    )
-
+    fake_aws = FakeAWS(reject_writes=True)
+    kind = framework.ChaosType.VPC_ROUTE_TABLE_MODIFY
+    action_config = action_configs()[kind]
+    experiment = planning_only_experiment(kind, action_config, fake_aws)
     result = experiment.modify_route_table(**action_config)
-    experiment.run_rollback()
-
     assert result.status == "completed"
-    delete_call = next(call for call in fake_aws.calls if call[1] == "delete_route")
-    create_call = next(call for call in fake_aws.calls if call[1] == "create_route")
-    assert delete_call[2]["DestinationCidrBlock"] == "10.20.0.0/16"
-    assert create_call[2]["GatewayId"] == "igw-0123456789abcdef0"
-    assert create_call[2]["DestinationCidrBlock"] == "10.20.0.0/16"
+    assert experiment.route_table_id == action_config["route_table_id"]
+    assert experiment.destination_cidr == "10.20.0.0/16"
+    assert experiment.original_route_target == {"GatewayId": "igw-0123456789abcdef0"}
+    assert experiment.original_route["DestinationCidrBlock"] == "10.20.0.0/16"
+    assert result.affected_resources == [action_config["route_table_id"]]
+    assert not any(
+        call[1] in {"delete_route", "create_route"} for call in fake_aws.calls
+    )
+    assert not experiment.mutation_attempts and not experiment.rollback_attempts
+    before = list(fake_aws.calls)
+    experiment.rollback()
+    assert fake_aws.calls == before and not experiment.rollback_verified
 
 
 def test_live_ebs_detach_creates_no_snapshot_and_restores_attachment() -> None:
-    fake_aws = FakeAWS(reject_writes=False)
-    initial_volume = fake_aws.respond("ec2", "describe_volumes", {})
-    available_volume = {
-        "Volumes": [
-            {
-                "VolumeId": VOLUME_ID,
-                "VolumeType": "io2",
-                "Iops": 3000,
-                "State": "available",
-                "Attachments": [],
-            }
-        ]
-    }
-    restored_volume = {
-        "Volumes": [
-            {
-                "VolumeId": VOLUME_ID,
-                "VolumeType": "io2",
-                "Iops": 3000,
-                "State": "in-use",
-                "Attachments": [
-                    {
-                        "InstanceId": INSTANCE_ID,
-                        "Device": "/dev/xvdf",
-                        "State": "attached",
-                    }
-                ],
-            }
-        ]
-    }
-    fake_aws.read_overrides[("ec2", "describe_volumes")] = [
-        initial_volume,
-        copy.deepcopy(initial_volume),
-        available_volume,
-        available_volume,
-        restored_volume,
-    ]
-    fake_aws.calls.clear()
-    original_respond = fake_aws.respond
-
-    def respond(service: str, operation: str, request: dict[str, Any]) -> Any:
-        if service == "ec2" and operation == "create_snapshot":
-            raise AssertionError("An approved detach must not create data copies")
-        return original_respond(service, operation, request)
-
-    fake_aws.respond = respond  # type: ignore[method-assign]
-    action_config = action_configs()[framework.ChaosType.EBS_DETACH_VOLUME]
-    experiment = make_experiment(
-        framework.ChaosType.EBS_DETACH_VOLUME,
-        action_config,
-        fake_aws,
-        dry_run=False,
-    )
-
+    fake_aws = FakeAWS(reject_writes=True)
+    kind = framework.ChaosType.EBS_DETACH_VOLUME
+    action_config = action_configs()[kind]
+    experiment = planning_only_experiment(kind, action_config, fake_aws)
     result = experiment.detach_volume(**action_config)
-    experiment.run_rollback()
-
     assert result.status == "completed"
     assert "safety_snapshot_id" not in result.additional_info
     operation_names = [operation for _service, operation, _request in fake_aws.calls]
     assert "create_snapshot" not in operation_names
-    assert "detach_volume" in operation_names
-    assert "attach_volume" in operation_names
-    assert experiment.rollback_verified is True
+    assert "detach_volume" not in operation_names
+    assert "attach_volume" not in operation_names
+    assert experiment.volume_id == VOLUME_ID
+    assert experiment.original_instance == INSTANCE_ID
+    assert experiment.original_device == "/dev/xvdf"
+    assert set(result.affected_resources) == {VOLUME_ID, INSTANCE_ID}
+    assert framework.ChaosOrchestrator._blast_radius(kind, action_config) == 2
+    assert not experiment.mutation_attempts and not experiment.rollback_attempts
+    before = list(fake_aws.calls)
+    experiment.rollback()
+    assert fake_aws.calls == before and not experiment.rollback_verified
 
 
 def test_live_efs_throughput_waits_and_restores_original_mode() -> None:
-    fake_aws = FakeAWS(reject_writes=False)
-    initial = fake_aws.respond("efs", "describe_file_systems", {})
-    changed = {
-        "FileSystems": [
-            {
-                "FileSystemId": "fs-0123456789abcdef0",
-                "ThroughputMode": "provisioned",
-                "ProvisionedThroughputInMibps": 1.0,
-                "LifeCycleState": "available",
-            }
-        ]
-    }
-    restored = {
-        "FileSystems": [
-            {
-                "FileSystemId": "fs-0123456789abcdef0",
-                "ThroughputMode": "provisioned",
-                "ProvisionedThroughputInMibps": 2.0,
-                "LifeCycleState": "available",
-            }
-        ]
-    }
-    fake_aws.read_overrides[("efs", "describe_file_systems")] = [
-        initial,
-        changed,
-        changed,
-        restored,
-    ]
-    fake_aws.calls.clear()
-    action_config = action_configs()[framework.ChaosType.EFS_THROTTLE_THROUGHPUT]
-    experiment = make_experiment(
-        framework.ChaosType.EFS_THROTTLE_THROUGHPUT,
-        action_config,
-        fake_aws,
-        dry_run=False,
-    )
-
-    result = experiment.throttle_throughput(**action_config)
-    experiment.run_rollback()
-
-    assert result.status == "completed"
-    updates = [call for call in fake_aws.calls if call[1] == "update_file_system"]
-    assert updates[0][2]["ThroughputMode"] == "provisioned"
-    assert updates[0][2]["ProvisionedThroughputInMibps"] == 1.0
-    assert updates[1][2] == {
-        "FileSystemId": "fs-0123456789abcdef0",
-        "ThroughputMode": "provisioned",
-        "ProvisionedThroughputInMibps": 2.0,
-    }
-    assert experiment.rollback_verified is True
+    aws = FakeAWS(reject_writes=False)
+    kind = framework.ChaosType.EFS_THROTTLE_THROUGHPUT
+    values = action_configs()[kind]
+    item = planning_only_experiment(kind, values, aws)
+    assert item.throttle_throughput(**values).status == "completed"
+    assert item.original_throughput_mode == "provisioned"
+    assert item.original_provisioned_throughput == 2.0
+    assert values["provisioned_throughput"] == 1.0
+    with pytest.raises(framework.SafetyViolation, match="Plan mode"):
+        item.efs.update_file_system(
+            FileSystemId=values["file_system_id"],
+            ThroughputMode="provisioned",
+            ProvisionedThroughputInMibps=1.0,
+        )
+    assert not [call for call in aws.calls if call[1] == "update_file_system"]
+    assert item.mutation_attempts == [] and item.rollback_attempts == []
+    assert not item.rollback_verified
 
 
 def test_live_opensearch_count_is_planning_only_without_conditional_update() -> None:
@@ -1444,63 +1383,49 @@ def test_live_opensearch_count_is_planning_only_without_conditional_update() -> 
 
 
 def test_live_appstream_stop_waits_and_restores_running_state() -> None:
-    fake_aws = FakeAWS(reject_writes=False)
-    fake_aws.read_overrides[("appstream", "describe_fleets")] = [
-        {"Fleets": [{"Name": "chaos-test-fleet", "State": "RUNNING"}]},
-        {"Fleets": [{"Name": "chaos-test-fleet", "State": "STOPPED"}]},
-        {"Fleets": [{"Name": "chaos-test-fleet", "State": "STOPPED"}]},
-        {"Fleets": [{"Name": "chaos-test-fleet", "State": "RUNNING"}]},
-    ]
-    action_config = action_configs()[framework.ChaosType.APPSTREAM_FLEET_STOP]
-    experiment = make_experiment(
-        framework.ChaosType.APPSTREAM_FLEET_STOP,
-        action_config,
-        fake_aws,
-        dry_run=False,
-    )
-
-    result = experiment.stop_fleet(**action_config)
-    experiment.run_rollback()
-
-    assert result.status == "completed"
-    operations = [operation for _service, operation, _request in fake_aws.calls]
-    assert "stop_fleet" in operations
-    assert "start_fleet" in operations
-    assert experiment.rollback_verified is True
+    aws = FakeAWS(reject_writes=False)
+    kind = framework.ChaosType.APPSTREAM_FLEET_STOP
+    values = action_configs()[kind]
+    item = planning_only_experiment(kind, values, aws)
+    assert item.stop_fleet(**values).status == "completed"
+    assert item.original_state == "RUNNING"
+    for operation in ("stop_fleet", "start_fleet"):
+        with pytest.raises(framework.SafetyViolation, match="Plan mode"):
+            getattr(item.appstream, operation)(Name=values["fleet_name"])
+    assert not [call for call in aws.calls if call[1] in {"stop_fleet", "start_fleet"}]
+    assert item.mutation_attempts == [] and item.rollback_attempts == []
+    assert not item.rollback_verified
 
 
 def test_route_rollback_refuses_to_overwrite_conflict() -> None:
-    fake_aws = FakeAWS(reject_writes=False)
-    fake_aws.read_overrides[("ec2", "describe_route_tables")] = [
-        fake_aws.respond("ec2", "describe_route_tables", {}),
-        {
-            "RouteTables": [
-                {
-                    "Routes": [
-                        {
-                            "DestinationCidrBlock": "10.20.0.0/16",
-                            "NatGatewayId": "nat-0123456789abcdef0",
-                            "Origin": "CreateRoute",
-                        }
-                    ]
-                }
-            ]
-        },
-    ]
-    fake_aws.calls.clear()
-    action_config = action_configs()[framework.ChaosType.VPC_ROUTE_TABLE_MODIFY]
-    experiment = make_experiment(
-        framework.ChaosType.VPC_ROUTE_TABLE_MODIFY,
-        action_config,
-        fake_aws,
-        dry_run=False,
-    )
+    fake_aws = FakeAWS(reject_writes=True)
+    initial = fake_aws.respond("ec2", "describe_route_tables", {})
+    conflict = {
+        "RouteTables": [
+            {
+                "RouteTableId": "rtb-0123456789abcdef0",
+                "Routes": [
+                    {
+                        "DestinationCidrBlock": "10.20.0.0/16",
+                        "NatGatewayId": "nat-0123456789abcdef0",
+                        "Origin": "CreateRoute",
+                        "State": "active",
+                    }
+                ],
+            }
+        ],
+    }
+    kind = framework.ChaosType.VPC_ROUTE_TABLE_MODIFY
+    action_config = action_configs()[kind]
+    experiment = planning_only_experiment(kind, action_config, fake_aws)
+    fake_aws.read_overrides[("ec2", "describe_route_tables")] = [initial, conflict]
     assert experiment.modify_route_table(**action_config).status == "completed"
-
-    with pytest.raises(framework.SafetyViolation, match="conflicting route"):
-        experiment.run_rollback()
-
+    assert not experiment._route_is_restored(conflict["RouteTables"][0]["Routes"])
+    with pytest.raises(framework.SafetyViolation, match="conflict"):
+        experiment._wait_for_active_route()
     assert not any(call[1] == "create_route" for call in fake_aws.calls)
+    assert not experiment.mutation_attempts and not experiment.rollback_attempts
+    assert not experiment.rollback_verified
 
 
 def test_live_waf_rule_change_uses_lock_token_and_restores() -> None:

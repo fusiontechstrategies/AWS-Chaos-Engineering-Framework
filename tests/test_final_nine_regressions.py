@@ -13,6 +13,7 @@ from test_aws_chaos_framework import (
     action_configs,
     make_experiment,
     make_orchestrator,
+    prepare_lambda_memory,
 )
 
 import aws_chaos_framework as f
@@ -48,19 +49,12 @@ def test_later_orchestrator_signal_stops_earlier_controller_and_keeps_rollback(
     cfg = config_for(f.ChaosType.EC2_REBOOT, instance_ids=[INSTANCE_ID])
     path = tmp_path / "config.yaml"
     path.write_text(f.yaml.safe_dump(cfg), encoding="utf-8")
-    values = {"instance_ids": [INSTANCE_ID]}
-    first = make_orchestrator(f.ChaosType.EC2_STOP, values, aws, dry_run=False)
-    earlier = first._create_experiment(f.ChaosType.EC2_STOP, values)
-    running = aws.respond("ec2", "describe_instances", {})
-    stopped = copy.deepcopy(running)
-    stopped["Reservations"][0]["Instances"][0]["State"]["Name"] = "stopped"
-    aws.read_overrides[("ec2", "describe_instances")] = [
-        running,
-        stopped,
-        stopped,
-        running,
-    ]
-    assert earlier.stop_instances(**values).status == "completed"
+    values = prepare_lambda_memory(aws)
+    first = make_orchestrator(
+        f.ChaosType.LAMBDA_MEMORY_LIMIT, values, aws, dry_run=False
+    )
+    earlier = first._create_experiment(f.ChaosType.LAMBDA_MEMORY_LIMIT, values)
+    assert earlier.modify_memory_limit(**values).status == "completed"
     second = f.ChaosOrchestrator(str(path), output_dir=str(tmp_path / "second"))
     handlers[f.signal.SIGTERM](f.signal.SIGTERM, None)
     assert (
@@ -69,12 +63,24 @@ def test_later_orchestrator_signal_stops_earlier_controller_and_keeps_rollback(
     )
     assert first.safety_controller.emergency_stop.is_set()
     with pytest.raises(f.SafetyViolation, match="active approved handler"):
-        earlier.ec2.reboot_instances(InstanceIds=[INSTANCE_ID])
-    assert not any(call[1] == "reboot_instances" for call in aws.calls)
+        earlier.lambda_client.update_function_configuration(
+            FunctionName=values["function_name"],
+            MemorySize=128,
+            RevisionId="memory-owned-revision",
+        )
+    assert (
+        len([call for call in aws.calls if call[1] == "update_function_configuration"])
+        == 1
+    )
     with pytest.raises(f.EmergencyStop):
         earlier._wait_forward(100)
     earlier.run_rollback()
-    assert earlier.rollback_operations == ["ec2.start_instances"]
+    assert earlier.rollback_operations == ["lambda.update_function_configuration"]
+    writes = [r for _, op, r in aws.calls if op == "update_function_configuration"]
+    assert [r["RevisionId"] for r in writes] == [
+        "memory-original-revision",
+        "memory-owned-revision",
+    ]
     third = f.SafetyController({}, session, REGION, True)
     assert third.emergency_stop.is_set()
 
@@ -534,17 +540,11 @@ def test_live_preflight_and_duration_failure_latch_every_controller(path, raises
 
     item.safety_controller.check_safety_conditions = unsafe
     item.safety_controller.emergency_stop.wait = lambda *args: False
-    earlier = make_experiment(f.ChaosType.EC2_STOP, values, aws, dry_run=False)
-    running = aws.respond("ec2", "describe_instances", {})
-    stopped = copy.deepcopy(running)
-    stopped["Reservations"][0]["Instances"][0]["State"]["Name"] = "stopped"
-    aws.read_overrides[("ec2", "describe_instances")] = [
-        running,
-        stopped,
-        stopped,
-        running,
-    ]
-    assert earlier.stop_instances(**values).status == "completed"
+    memory = prepare_lambda_memory(aws)
+    earlier = make_experiment(
+        f.ChaosType.LAMBDA_MEMORY_LIMIT, memory, aws, dry_run=False
+    )
+    assert earlier.modify_memory_limit(**memory).status == "completed"
     with pytest.raises((f.SafetyViolation, f.EmergencyStop)):
         if path == "suite":
             item._run_experiment_suite("ordinary")
@@ -556,9 +556,13 @@ def test_live_preflight_and_duration_failure_latch_every_controller(path, raises
             item._wait_with_runtime_checks(30)
     assert f._PROCESS_EMERGENCY_STOP.is_set()
     with pytest.raises(f.SafetyViolation, match="active approved handler"):
-        earlier.ec2.reboot_instances(InstanceIds=[INSTANCE_ID])
+        earlier.lambda_client.update_function_configuration(
+            FunctionName=memory["function_name"],
+            MemorySize=128,
+            RevisionId="memory-owned-revision",
+        )
     earlier.run_rollback()
-    assert earlier.rollback_operations == ["ec2.start_instances"]
+    assert earlier.rollback_operations == ["lambda.update_function_configuration"]
 
 
 def test_stop_during_final_sqs_owner_read_blocks_dispatch_and_attempt():

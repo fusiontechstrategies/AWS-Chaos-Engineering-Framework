@@ -22,6 +22,7 @@ from test_aws_chaos_framework import (
     FakeAWS,
     make_experiment,
     make_orchestrator,
+    planning_only_experiment,
 )
 
 import aws_chaos_framework as f
@@ -828,11 +829,11 @@ def test_experiment_account_override_is_refused_and_owner_changes_confirmation()
     orchestrator.safety_controller = controller
     with pytest.raises(f.SafetyViolation, match="cannot override"):
         orchestrator._create_experiment(
-            f.ChaosType.S3_OBJECT_DELETE, {"account_id": "999999999999"}
+            f.ChaosType.LAMBDA_MEMORY_LIMIT, {"account_id": "999999999999"}
         )
     with pytest.raises(f.SafetyViolation, match="cannot override"):
         orchestrator._run_single_experiment_locked(
-            {"type": "s3_object_delete", "account_id": "999999999999"}
+            {"type": "lambda_memory_limit", "account_id": "999999999999"}
         )
     config = {
         "schema_version": 1,
@@ -842,8 +843,9 @@ def test_experiment_account_override_is_refused_and_owner_changes_confirmation()
             "test": {
                 "experiments": [
                     {
-                        "type": f.ChaosType.EC2_REBOOT.value,
-                        "instance_ids": [INSTANCE_ID],
+                        "type": "lambda_memory_limit",
+                        "function_name": "chaos-test-function",
+                        "memory_mb": 128,
                     }
                 ]
             }
@@ -872,22 +874,17 @@ def test_real_botocore_owner_mismatch_refuses_delete_and_valid_owner_succeeds(fa
     controller.check_safety_conditions = lambda: (True, [])
     with pytest.raises(f.SafetyViolation, match="plan-only"):
         f.S3ChaosExperiment({"dry_run": False}, controller)
-    owner = make_experiment(
+    aws = FakeAWS(reject_writes=False)
+    owner = planning_only_experiment(
         f.ChaosType.S3_OBJECT_DELETE,
         {"bucket_name": BUCKET, "prefix": PREFIX, "max_objects": 1},
-        FakeAWS(reject_writes=False),
-        dry_run=False,
+        aws,
     )
     owner.s3 = f.AwsClientProxy("s3", client, owner)
     read = {
         "Bucket": BUCKET,
         "Prefix": PREFIX,
         "MaxKeys": 1,
-        "ExpectedBucketOwner": ACCOUNT_ID,
-    }
-    delete = {
-        "Bucket": BUCKET,
-        "Delete": {"Objects": [{"Key": PREFIX + "object"}]},
         "ExpectedBucketOwner": ACCOUNT_ID,
     }
     with Stubber(client) as stub:
@@ -903,27 +900,24 @@ def test_real_botocore_owner_mismatch_refuses_delete_and_valid_owner_succeeds(fa
             stub.add_response(
                 "list_objects_v2", {"Contents": [{"Key": PREFIX + "object"}]}, read
             )
-            if failure == "delete":
-                stub.add_client_error(
-                    "delete_objects",
-                    service_error_code="AccessDenied",
-                    service_message="Owner mismatch",
-                    http_status_code=403,
-                    expected_params=delete,
-                )
-            else:
-                stub.add_response(
-                    "delete_objects", {"Deleted": [{"Key": PREFIX + "object"}]}, delete
-                )
         result = owner.delete_objects(BUCKET, PREFIX, 1)
+        assert result.status == ("failed" if failure == "list" else "completed")
+        request = {
+            "Bucket": BUCKET,
+            "Delete": {"Objects": [{"Key": PREFIX + "object"}]},
+            "ExpectedBucketOwner": "999999999999"
+            if failure == "delete"
+            else ACCOUNT_ID,
+        }
+        with pytest.raises(
+            f.SafetyViolation,
+            match="owner differs" if failure == "delete" else "Plan mode",
+        ):
+            owner.s3.delete_objects(**request)
         stub.assert_no_pending_responses()
-    assert result.status == ("completed" if failure is None else "failed")
-    assert owner.mutation_attempts == (
-        [] if failure == "list" else ["s3.delete_objects"]
-    )
-    assert owner.mutation_operations == (
-        ["s3.delete_objects"] if failure is None else []
-    )
+    assert owner.mutation_attempts == []
+    assert owner.mutation_operations == []
+    assert owner.rollback_attempts == []
 
 
 @pytest.mark.parametrize(

@@ -4,16 +4,20 @@ import copy
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from test_aws_chaos_framework import (
     ACCOUNT_ID,
     INSTANCE_ID,
+    REGION,
     VOLUME_ID,
     FakeAWS,
     FakeSafetyController,
     action_configs,
     make_experiment,
+    planning_only_experiment,
+    prepare_lambda_memory,
 )
 from test_final_scan_regressions import worker
 
@@ -147,14 +151,17 @@ def test_termination_rechecks_relationship_after_other_baseline_reads():
     ],
 )
 def test_detach_refuses_unapproved_or_changed_attachment(attack):
-    aws = FakeAWS(reject_writes=False)
-    config = action_configs()[framework.ChaosType.EBS_DETACH_VOLUME]
-    item = make_experiment(
-        framework.ChaosType.EBS_DETACH_VOLUME, config, aws, dry_run=False
-    )
+    aws = FakeAWS(reject_writes=True)
+    kind = framework.ChaosType.EBS_DETACH_VOLUME
+    config = action_configs()[kind]
+    item = planning_only_experiment(kind, config, aws)
     volume = aws.respond("ec2", "describe_volumes", {})
     attachment = volume["Volumes"][0]["Attachments"][0]
     changed = None
+    scope = framework.ChaosOrchestrator._target_values({"type": kind.value, **config})
+    tuple_target = f"attachment:{INSTANCE_ID}:/dev/xvdf"
+    assert scope == {VOLUME_ID, INSTANCE_ID, tuple_target}
+    assert framework.ChaosOrchestrator._blast_radius(kind, config) == 2
     if attack == "instance":
         attachment["InstanceId"] = OTHER_INSTANCE
     elif attack == "device":
@@ -165,48 +172,92 @@ def test_detach_refuses_unapproved_or_changed_attachment(attack):
         volume["Volumes"][0]["VolumeId"] = OTHER_VOLUME
     elif attack == "allowlist":
         item.safety_controller.config["target_allowlist"].remove(INSTANCE_ID)
+        assert INSTANCE_ID in scope - set(
+            item.safety_controller.config["target_allowlist"]
+        )
     elif attack == "tuple_allowlist":
-        item.safety_controller.config["target_allowlist"].remove(
-            f"attachment:{INSTANCE_ID}:/dev/xvdf"
+        item.safety_controller.config["target_allowlist"].remove(tuple_target)
+        assert tuple_target in scope - set(
+            item.safety_controller.config["target_allowlist"]
         )
     elif attack == "radius":
         item.safety_controller.config["max_blast_radius"] = 1
+        assert (
+            framework.ChaosOrchestrator._blast_radius(kind, config)
+            > item.safety_controller.config["max_blast_radius"]
+        )
     elif attack == "changed_before_write":
         changed = copy.deepcopy(volume)
         changed["Volumes"][0]["Attachments"][0]["InstanceId"] = OTHER_INSTANCE
-    aws.read_overrides[("ec2", "describe_volumes")] = [volume] + (
-        [changed] if changed else []
-    )
-    assert item.detach_volume(**config).status == "failed"
+        changed["Volumes"][0]["MultiAttachEnabled"] = True
+    aws.read_overrides[("ec2", "describe_volumes")] = [volume]
+    result = item.detach_volume(**config)
+    if attack in {"instance", "device", "multiple", "wrong_volume"}:
+        assert result.status == "failed" and result.errors
+    else:
+        # Planning computes scope; it does not grant or reject live authorization.
+        assert result.status == "completed"
+        assert {item.volume_id, item.original_instance} == {VOLUME_ID, INSTANCE_ID}
+        assert item.original_device == "/dev/xvdf"
+    if changed is not None:
+        aws.read_overrides[("ec2", "describe_volumes")] = [changed]
+        later = item.ec2.describe_volumes(VolumeIds=[VOLUME_ID])
+        assert later["Volumes"][0]["Attachments"][0]["InstanceId"] == OTHER_INSTANCE
+        assert later["Volumes"][0]["MultiAttachEnabled"] is True
+        # This is later read-only evidence, not the old live guarded-write interval.
+    approval = framework.yaml.safe_load(framework.SAMPLE_CONFIG)
+    approval["global"].update(account_id=ACCOUNT_ID, region=REGION)
+    approval["safety"] = copy.deepcopy(item.safety_controller.config)
+    approval["experiment_suites"] = {
+        "ordinary": {"experiments": [{"type": kind.value, **config}]}
+    }
+    framework.validate_config_data(approval)
+    before = list(aws.calls)
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        framework.confirmation_token(approval, "ordinary")
+    with pytest.raises(
+        framework.SafetyViolation, match="Direct experiment construction is plan-only"
+    ):
+        framework.EBSChaosExperiment(
+            {**item.config, "dry_run": False}, item.safety_controller
+        )
+    for operation in ("detach_volume", "attach_volume"):
+        with pytest.raises(framework.SafetyViolation):
+            getattr(item.ec2, operation)(
+                VolumeId=VOLUME_ID, InstanceId=INSTANCE_ID, Device="/dev/xvdf"
+            )
+    assert aws.calls == before
     assert not writes(aws)
-    assert not item.mutation_attempts
+    assert not item.mutation_attempts and not item.rollback_attempts
 
 
 def test_detach_write_contains_exact_reviewed_attachment_tuple():
-    aws = FakeAWS(reject_writes=False)
-    config = action_configs()[framework.ChaosType.EBS_DETACH_VOLUME]
-    item = make_experiment(
-        framework.ChaosType.EBS_DETACH_VOLUME, config, aws, dry_run=False
-    )
-    initial = aws.respond("ec2", "describe_volumes", {})
-    available = copy.deepcopy(initial)
-    available["Volumes"][0]["State"] = "available"
-    available["Volumes"][0]["Attachments"] = []
-    aws.read_overrides[("ec2", "describe_volumes")] = [
-        initial,
-        copy.deepcopy(initial),
-        available,
-    ]
+    aws = FakeAWS(reject_writes=True)
+    kind = framework.ChaosType.EBS_DETACH_VOLUME
+    config = action_configs()[kind]
+    item = planning_only_experiment(kind, config, aws)
     result = item.detach_volume(**config)
     assert result.status == "completed"
     assert set(result.affected_resources) == {VOLUME_ID, INSTANCE_ID}
-    assert writes(aws) == [
-        (
-            "ec2",
-            "detach_volume",
-            {"VolumeId": VOLUME_ID, "InstanceId": INSTANCE_ID, "Device": "/dev/xvdf"},
-        )
-    ]
+    captured = {
+        "VolumeId": item.volume_id,
+        "InstanceId": item.original_instance,
+        "Device": item.original_device,
+    }
+    assert captured == {
+        "VolumeId": VOLUME_ID,
+        "InstanceId": INSTANCE_ID,
+        "Device": "/dev/xvdf",
+    }
+    assert item.config["attachment"] == {
+        "instance_id": INSTANCE_ID,
+        "device": "/dev/xvdf",
+    }
+    assert framework.ChaosOrchestrator._blast_radius(kind, config) == 2
+    assert writes(aws) == []
+    assert not item.mutation_attempts and not item.rollback_attempts
 
 
 @pytest.mark.parametrize(
@@ -218,6 +269,7 @@ def test_child_relationship_scope_and_live_token_restrictions(kind):
     suite = next(iter(config["experiment_suites"]))
     action = {"type": kind.value, **action_configs()[kind]}
     config["experiment_suites"][suite]["experiments"] = [action]
+    framework.validate_config_data(config)
     if kind == framework.ChaosType.EC2_TERMINATE:
         original_scope = framework.ChaosOrchestrator._target_values(action)
         with pytest.raises(framework.ConfigurationError):
@@ -228,11 +280,26 @@ def test_child_relationship_scope_and_live_token_restrictions(kind):
             framework.confirmation_token(config, suite)
         field = "delete_on_termination_volumes"
     else:
-        original = framework.confirmation_token(config, suite)
+        original_scope = framework.ChaosOrchestrator._target_values(action)
+        with pytest.raises(
+            framework.ConfigurationError, match="Live approval is unavailable"
+        ):
+            framework.confirmation_token(config, suite)
         action["attachment"]["device"] = "/dev/xvdz"
         field = "attachment"
-        assert original != framework.confirmation_token(config, suite)
+        assert framework.ChaosOrchestrator._target_values(action) != original_scope
+        assert (
+            "attachment:" + INSTANCE_ID + ":/dev/xvdz"
+            in framework.ChaosOrchestrator._target_values(action)
+        )
+        framework.validate_config_data(config)
+        with pytest.raises(
+            framework.ConfigurationError, match="Live approval is unavailable"
+        ):
+            framework.confirmation_token(config, suite)
     del action[field]
+    with pytest.raises(framework.ConfigurationError, match=field):
+        framework.validate_config_data(config)
     with pytest.raises(framework.ConfigurationError):
         framework.confirmation_token(config, suite)
 
@@ -397,6 +464,11 @@ def transition_states(aws, case):
         leaf(pending)[field] = "modifying"
     elif method == "_wait_for_configuration":
         leaf(pending)[field] = "InProgress"
+        for response in (pending, ready):
+            response["FunctionName"] = args[0]
+            response["FunctionArn"] = (
+                f"arn:aws-us-gov:lambda:{REGION}:{ACCOUNT_ID}:function:{args[0]}"
+            )
     elif method == "_wait_for_domain_idle":
         leaf(pending)[field] = True
     if method == "_wait_for_instance_state":
@@ -443,15 +515,62 @@ def test_every_forward_transition_polls_alarm_changes_and_stops_promptly(
     cls, method, args, service, operation, _collection, _field = case
     aws = FakeAWS()
     pending, _ready = transition_states(aws, case)
-    aws.read_overrides[(service, operation)] = [pending]
-    if cls is framework.OpenSearchChaosExperiment:
-        with pytest.raises(
-            framework.ConfigurationError, match="Live approval is unavailable"
+    withdrawn = cls in {
+        framework.EC2ChaosExperiment,
+        framework.EBSChaosExperiment,
+        framework.EFSChaosExperiment,
+        framework.RDSChaosExperiment,
+        framework.ECSChaosExperiment,
+        framework.AppStreamChaosExperiment,
+        framework.OpenSearchChaosExperiment,
+    }
+    if withdrawn:
+        # Original service data/args still exercise its read-only planning waiter.
+        item = transition_owner(cls, aws, 10, dry_run=True)
+        aws.read_overrides[(service, operation)] = [
+            copy.deepcopy(pending) for _ in range(3)
+        ]
+        plan_clock = [0.0]
+        plan_waits = []
+
+        def plan_sleep(seconds):
+            plan_waits.append(seconds)
+            plan_clock[0] += seconds
+
+        with (
+            patch.object(framework.time, "monotonic", lambda: plan_clock[0]),
+            patch.object(framework.time, "sleep", plan_sleep),
+            pytest.raises(TimeoutError),
         ):
-            transition_owner(cls, aws, 60)
+            getattr(item, method)(*args, False)
+        assert plan_waits and all(0 < seconds <= 10 for seconds in plan_waits)
+        assert sum(plan_waits) == plan_clock[0] == 10
+        assert (
+            item.dry_run and not item.mutation_attempts and not item.rollback_attempts
+        )
         assert not writes(aws)
-        return
-    item = transition_owner(cls, aws, 60)
+        # Shared forward safety is separately exercised by a supported public
+        # conditional Lambda configuration owner, not the withdrawn service.
+        live_aws = FakeAWS()
+        kind = framework.ChaosType.LAMBDA_MEMORY_LIMIT
+        values = action_configs()[kind]
+        item = make_experiment(
+            kind, {**values, "state_timeout_seconds": 60}, live_aws, dry_run=False
+        )
+        pending_memory = live_aws.respond("lambda", "get_function_configuration", {})
+        pending_memory["LastUpdateStatus"] = "InProgress"
+        live_aws.read_overrides[("lambda", "get_function_configuration")] = [
+            pending_memory
+        ]
+        monitor_method, monitor_args = (
+            "_wait_for_configuration",
+            [values["function_name"]],
+        )
+    else:
+        live_aws = aws
+        aws.read_overrides[(service, operation)] = [pending]
+        item = transition_owner(cls, aws, 60)
+        monitor_method, monitor_args = method, args
     safety = item.safety_controller
     safety.config["monitor_interval_seconds"] = 5
     clock = [0.0]
@@ -472,11 +591,12 @@ def test_every_forward_transition_polls_alarm_changes_and_stops_promptly(
         or (not alarm[0], ["Synthetic alarm entered ALARM"] if alarm[0] else [])
     )
     with pytest.raises(framework.EmergencyStop, match="Runtime safety"):
-        getattr(item, method)(*args, True)
+        getattr(item, monitor_method)(*monitor_args, True)
     assert polls[-1] is True and False in polls
     assert waits and max(waits) <= 5
     assert safety.emergency_stop.is_set()
     assert not writes(aws)
+    assert not writes(live_aws)
 
 
 @pytest.mark.parametrize("case", WAIT_CASES, ids=lambda case: case[1])
@@ -484,16 +604,50 @@ def test_every_recovery_transition_ignores_stop_event_and_safety_alarm(case):
     cls, method, args, service, operation, _collection, _field = case
     aws = FakeAWS()
     _pending, ready = transition_states(aws, case)
+    withdrawn = cls in {
+        framework.EC2ChaosExperiment,
+        framework.EBSChaosExperiment,
+        framework.EFSChaosExperiment,
+        framework.RDSChaosExperiment,
+        framework.ECSChaosExperiment,
+        framework.AppStreamChaosExperiment,
+        framework.OpenSearchChaosExperiment,
+    }
+    item = transition_owner(cls, aws, 10, dry_run=withdrawn)
+    if withdrawn:
+        # Real owned conditional recovery retains the shared stop exemption.
+        live_aws = FakeAWS(reject_writes=False)
+        values = prepare_lambda_memory(live_aws)
+        memory = make_experiment(
+            framework.ChaosType.LAMBDA_MEMORY_LIMIT, values, live_aws, dry_run=False
+        )
+        assert memory.modify_memory_limit(**values).status == "completed"
+        memory.safety_controller.emergency_stop.set()
+        memory.safety_controller.check_safety_conditions = lambda: (
+            _ for _ in ()
+        ).throw(AssertionError("Recovery must not poll forward guards"))
+        memory.run_rollback()
+        assert memory.rollback_verified
+        requests = [
+            request
+            for _, op, request in live_aws.calls
+            if op == "update_function_configuration"
+        ]
+        assert [request["RevisionId"] for request in requests] == [
+            "memory-original-revision",
+            "memory-owned-revision",
+        ]
+        assert memory.mutation_attempts == ["lambda.update_function_configuration"]
+        assert memory.rollback_attempts == ["lambda.update_function_configuration"]
+        assert (
+            item.dry_run and not item.mutation_attempts and not item.rollback_attempts
+        )
     aws.read_overrides[(service, operation)] = [ready]
-    item = transition_owner(
-        cls, aws, 10, dry_run=cls is framework.OpenSearchChaosExperiment
-    )
     safety = item.safety_controller
     safety.emergency_stop.set()
     safety.check_safety_conditions = lambda: (_ for _ in ()).throw(
         AssertionError("Recovery must not poll forward guards")
     )
-    item._in_rollback = True
     getattr(item, method)(*args, False)
     assert not writes(aws)
 
@@ -543,7 +697,13 @@ def test_absent_duplicate_wrong_or_incomplete_targets_never_complete(
         del entry["TargetGroupArn"]
     aws.read_overrides[(service, operation)] = [response]
     config = action_configs()[kind]
-    item = make_experiment(kind, config, aws, dry_run=dry_run)
+    if kind in {
+        framework.ChaosType.ELB_LISTENER_RULE_MODIFY,
+        framework.ChaosType.ELB_HEALTH_CHECK_MODIFY,
+    }:
+        item = planning_only_experiment(kind, config, aws)
+    else:
+        item = make_experiment(kind, config, aws, dry_run=dry_run)
     result = object.__new__(framework.ChaosOrchestrator)._execute_experiment(
         item, kind, config
     )
@@ -554,17 +714,16 @@ def test_absent_duplicate_wrong_or_incomplete_targets_never_complete(
 
 def test_orchestrator_refuses_live_no_write_completion():
     aws = FakeAWS()
-    item = worker(aws, framework.ChaosType.EC2_STOP, {"instance_ids": [INSTANCE_ID]})
+    values = prepare_lambda_memory(aws)
+    item = worker(aws, framework.ChaosType.LAMBDA_MEMORY_LIMIT, values)
     item._execute_experiment = lambda *_: framework.ExperimentResult(
         "synthetic",
-        framework.ChaosType.EC2_STOP,
+        framework.ChaosType.LAMBDA_MEMORY_LIMIT,
         framework.utc_now(),
         status="completed",
-        affected_resources=[INSTANCE_ID],
+        affected_resources=[values["function_name"]],
     )
-    result = item._run_single_experiment(
-        {"type": "ec2_stop", "instance_ids": [INSTANCE_ID]}
-    )
+    result = item._run_single_experiment({"type": "lambda_memory_limit", **values})
     assert result.status == "failed"
     assert "mutation attempt" in result.errors[0]
     assert not writes(aws)
@@ -705,44 +864,101 @@ def test_direct_forward_or_legacy_cleanup_cannot_clobber_concurrent_state(
     ],
 )
 def test_incomplete_ec2_recovery_blocks_later_live_work(response):
+    # EC2 stop/start is planning-only. Retain exact two-instance collection
+    # verification independently from the supported conditional recovery latch.
+    targets = [INSTANCE_ID, OTHER_INSTANCE]
+    aws = FakeAWS(reject_writes=True)
+    values = {"instance_ids": targets}
+    before = list(aws.calls)
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(framework.ChaosType.EC2_STOP, values, aws, dry_run=False)
+    assert aws.calls == before
+    item = make_experiment(framework.ChaosType.EC2_STOP, values, aws, dry_run=True)
+    assert item.dry_run
+    selected = {"InstanceId": INSTANCE_ID, "State": {"Name": "running"}}
+    invalid_collections = [
+        response,
+        [selected, copy.deepcopy(selected)],
+        [selected, {"InstanceId": "i-01112223334445556", "State": {"Name": "running"}}],
+        [selected],
+    ]
+    for instances in invalid_collections:
+        aws.read_overrides[("ec2", "describe_instances")] = [
+            {"Reservations": [{"Instances": copy.deepcopy(instances)}]},
+            {"Reservations": [{"Instances": copy.deepcopy(instances)}]},
+        ]
+        with pytest.raises(
+            framework.SafetyViolation, match="exact selected instance set"
+        ):
+            item._instance_states(targets)
+        with pytest.raises(
+            framework.SafetyViolation, match="exact selected instance set"
+        ):
+            item._wait_for_instance_state(targets, "running", False)
+        assert not writes(aws)
+        assert not item.mutation_attempts and not item.rollback_attempts
+        assert not item.rollback_verified
+
+    pending = [{"InstanceId": value, "State": {"Name": "pending"}} for value in targets]
+    aws.read_overrides[("ec2", "describe_instances")] = [
+        {"Reservations": [{"Instances": copy.deepcopy(pending)}]},
+        {"Reservations": [{"Instances": copy.deepcopy(pending)}]},
+    ]
+    assert item._instance_states(targets) == dict.fromkeys(targets, "pending")
+    with (
+        patch.object(framework.time, "monotonic", side_effect=[0.0, 1.0, 2.0, 601.0]),
+        patch.object(framework.time, "sleep") as sleep,
+        pytest.raises(TimeoutError, match="Timed out waiting for EC2 state running"),
+    ):
+        item._wait_for_instance_state(targets, "running", False)
+    sleep.assert_called_once_with(5.0)
+    assert all(
+        request["InstanceIds"] == targets
+        for _, op, request in aws.calls
+        if op == "describe_instances"
+    )
+    assert not writes(aws)
+    assert not item.mutation_attempts and not item.rollback_attempts
+    assert not item.rollback_verified
+
+    # A genuine public Lambda memory lifecycle supplies both conditional writes;
+    # an ordinary unsuccessful recovery response must latch later live work.
     aws = FakeAWS(reject_writes=False)
-    original = aws.respond
-    state = {"stopped": False, "recovered": False}
-
-    def respond(service, operation, request):
-        if service == "ec2" and operation == "describe_instances":
-            aws.calls.append((service, operation, request))
-            instances = (
-                response
-                if state["recovered"]
-                else [
-                    {
-                        "InstanceId": value,
-                        "State": {"Name": "stopped" if state["stopped"] else "running"},
-                    }
-                    for value in [INSTANCE_ID, OTHER_INSTANCE]
-                ]
-            )
-            return {"Reservations": [{"Instances": copy.deepcopy(instances)}]}
-        if service == "ec2" and operation == "stop_instances":
-            state["stopped"] = True
-        if service == "ec2" and operation == "start_instances":
-            state["recovered"] = True
-        return original(service, operation, request)
-
-    aws.respond = respond
-    values = {"instance_ids": [INSTANCE_ID, OTHER_INSTANCE]}
-    orchestrator = worker(aws, framework.ChaosType.EC2_STOP, values)
-    result = orchestrator._run_single_experiment({"type": "ec2_stop", **values})
+    values = {**prepare_lambda_memory(aws), "auto_rollback": True}
+    snapshots = aws.read_overrides[("lambda", "get_function_configuration")]
+    snapshots[3] = {**snapshots[3], "LastUpdateStatus": "Failed"}
+    orchestrator = worker(aws, framework.ChaosType.LAMBDA_MEMORY_LIMIT, values)
+    result = orchestrator._run_single_experiment(
+        {"type": "lambda_memory_limit", **values}
+    )
     assert result.status == "failed" and result.rollback_successful is False
-    assert result.mutation_attempts == ["ec2.stop_instances"]
-    assert result.rollback_attempts == ["ec2.start_instances"]
+    assert result.rollback_errors == ["Lambda configuration update failed"]
+    assert result.mutation_attempts == ["lambda.update_function_configuration"]
+    assert result.rollback_attempts == ["lambda.update_function_configuration"]
+    requests = [
+        request for _, op, request in aws.calls if op == "update_function_configuration"
+    ]
+    assert requests == [
+        {
+            "FunctionName": values["function_name"],
+            "MemorySize": 128,
+            "RevisionId": "memory-original-revision",
+        },
+        {
+            "FunctionName": values["function_name"],
+            "MemorySize": 256,
+            "RevisionId": "memory-owned-revision",
+        },
+    ]
     assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert orchestrator.safety_controller.emergency_stop.is_set()
     before = list(aws.calls)
     with pytest.raises(framework.EmergencyStop, match="Process-wide emergency stop"):
-        worker(aws)._run_single_experiment(
-            {"type": "ec2_stop", "instance_ids": [INSTANCE_ID]}
-        )
+        worker(
+            aws, framework.ChaosType.LAMBDA_MEMORY_LIMIT, values
+        )._run_single_experiment({"type": "lambda_memory_limit", **values})
     assert aws.calls == before
 
 
