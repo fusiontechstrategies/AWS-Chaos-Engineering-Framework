@@ -175,7 +175,7 @@ dispatch. The controller's captured account alone does not grant an ownerless
 client experiment approval or recovery authority.
 Owned plan-mode clients permit reads but refuse direct mutation dispatch,
 including calls marked as recovery. Planning never grants write authority.
-The S3 proxy accepts only the twelve direct bucket operations used by the
+The S3 proxy accepts only the thirteen direct bucket operations used by the
 supported experiments. Raw SDK paginators, waiters, presigned URL/post helpers
 and other bucket methods are refused because they can retain an unwrapped SDK
 client or omit the approved owner. SDK reads are classified by an exact reviewed
@@ -364,6 +364,35 @@ Exceeding a bound refuses admission. The matcher uses bounded dynamic programmin
 The fixed `prod` and `production` name-token rule remains active independently of
 these globs, with `-`, `_` and `/` as separators. It cannot be removed by changing
 the configured list. Defaults are `prod` and `production`.
+
+## Selected VPC scope
+
+With `--vpc-id`, the exact target allowlist is necessary but not sufficient.
+Each VPC-addressable live target must also be in the matching discovered
+inventory for that VPC, which includes only resources with the required safety
+tags. Live `ec2_reboot` instances, `vpc_subnet_acl_modify` subnets and
+replacement NACLs, and `vpc_endpoint_delete` endpoints must appear in the
+corresponding discovered instance, subnet, NACL or endpoint set. Before
+mutating, each handler checks the exact describe response: the instance
+`VpcId`, the current subnet NACL association's `VpcId`, or the endpoint
+`VpcId`. The subnet's current (original) NACL must also be in the discovered
+NACL set, because recovery re-associates the subnet with it. An
+`efs_mount_target_delete` target is admitted only when the exact mount-target
+response reports the selected `VpcId` and a discovered subnet; that relationship
+is only known when the handler reads the mount target, so it is enforced there,
+before the deletion, rather than at suite start.
+`vpc_peering_delete` needs both endpoints in the selected VPC. Reviewed
+endpoints must be distinct VPCs, so peering deletion is always refused under
+`--vpc-id`. Other live types that do not address a VPC resource, such as S3, SQS,
+Kinesis, CloudFront, WAF, KMS, ECR and SES, are unaffected. All remaining live
+types are refused under `--vpc-id`, including RDS, Lambda, ECS and Directory
+Service, because this tool does not verify their VPC placement and tags. A live
+suite whose configured target contradicts the selected VPC fails with a
+configuration error after discovery and before any experiment starts, except for
+the EFS relationship above. Required tags come from the discovery snapshot taken
+when the suite starts; a tag removed later is not re-read before a write. Without
+`--vpc-id`, admission is unchanged. Separately, every live S3 write now first
+reads the bucket location, so it needs the `s3:GetBucketLocation` permission.
 
 ## VPC peering endpoint approval
 

@@ -113,6 +113,7 @@ READ_ONLY_OPERATIONS = {
         {
             "get_bucket_encryption",
             "get_bucket_lifecycle_configuration",
+            "get_bucket_location",
             "get_bucket_policy",
             "get_bucket_versioning",
             "list_objects_v2",
@@ -247,6 +248,7 @@ S3_OWNER_BOUND_OPERATIONS = frozenset(
         "delete_objects",
         "get_bucket_lifecycle_configuration",
         "put_bucket_lifecycle_configuration",
+        "get_bucket_location",
     }
 )
 
@@ -1529,6 +1531,47 @@ def require_runtime_safety(
         raise error_type("Emergency stop requested")
 
 
+def normalize_s3_bucket_region(location: Any) -> str:
+    """Map a GetBucketLocation constraint, including legacy values, to a region."""
+    if location is None or location == "":
+        return "us-east-1"
+    if location == "EU":
+        return "eu-west-1"
+    if not isinstance(location, str) or not REGION_PATTERN.fullmatch(location):
+        raise SafetyViolation("S3 returned an unrecognized bucket location")
+    return location
+
+
+def bind_s3_signing_region(client: Any) -> None:
+    """Refuse an S3 write that botocore would redirect and re-sign elsewhere."""
+    meta = getattr(client, "meta", None)
+    events = getattr(meta, "events", None)
+    if events is None:
+        # Region redirection is a botocore event handler; a client without an
+        # event system cannot follow one. The owner-bound location check applies.
+        return
+    expected = meta.region_name
+    writes = {
+        meta.method_to_api_mapping[name]
+        for name in S3_OWNER_BOUND_OPERATIONS - READ_ONLY_OPERATIONS["s3"]
+    }
+
+    def refuse_redirected_write(
+        request: Any, operation_name: str, **_kwargs: Any
+    ) -> None:
+        signing = request.context.get("signing", {})
+        if operation_name in writes and signing.get("region", expected) != expected:
+            raise SafetyViolation(
+                "S3 write would be redirected outside the reviewed region"
+            )
+
+    events.register_first(
+        "before-sign.s3",
+        refuse_redirected_write,
+        unique_id="aws-chaos-s3-write-signing-region",
+    )
+
+
 class AwsClientProxy:
     """Record successful AWS mutations without logging request arguments."""
 
@@ -1738,6 +1781,21 @@ class AwsClientProxy:
                         raise SafetyViolation(
                             "SQS QueueArn changed before purge dispatch"
                         )
+                if self._service == "s3":
+                    # botocore can transparently redirect and re-sign a request
+                    # to the bucket's actual region. Bind the write to the
+                    # reviewed region with an owner-bound location read first.
+                    location = self._client.get_bucket_location(
+                        Bucket=kwargs["Bucket"],
+                        ExpectedBucketOwner=kwargs["ExpectedBucketOwner"],
+                    )
+                    if not isinstance(location, dict) or (
+                        normalize_s3_bucket_region(location.get("LocationConstraint"))
+                        != expected_region
+                    ):
+                        raise SafetyViolation(
+                            "S3 bucket region differs from the reviewed region"
+                        )
                 if not self._owner._is_recovery_dispatch() and (
                     _PROCESS_EMERGENCY_STOP.stop_requested()
                     or self._owner.safety_controller.emergency_stop.is_set()
@@ -1838,6 +1896,8 @@ class SafetyController:
                     region_name=client_region,
                     config=self._sdk_config,
                 )
+                if service == "s3":
+                    bind_s3_signing_region(self._clients[key])
             raw_client = self._clients[key]
         return AwsClientProxy(service, raw_client, owner)
 
@@ -2033,6 +2093,9 @@ class _ExecutionGrant:
     region: str
     controller: Any
     targets: frozenset[str]
+    # The selected --vpc-id and its discovered (resource type, ID) inventory.
+    vpc_id: str | None = None
+    vpc_inventory: frozenset[tuple[str, str]] = frozenset()
 
 
 def _canonical_execution_data(value: Any) -> str:
@@ -2447,6 +2510,93 @@ def peering_endpoint_scope(config: dict[str, Any]) -> tuple[dict[str, Any], set[
     return canonical, {endpoint["vpc_id"] for endpoint in canonical.values()} | {
         "selector:vpc_peering_delete:" + digest
     }
+
+
+# With --vpc-id, every VPC-addressable live parent and child must also belong to
+# the typed inventory discovered in that VPC with the required safety tags. EFS
+# mount targets are absent from EC2 inventory; their handler admits only the
+# exact describe response whose subnet is discovered inventory in that VPC.
+VPC_SCOPED_TARGET_INVENTORY: dict[ChaosType, tuple[tuple[str, str], ...]] = {
+    ChaosType.EC2_REBOOT: (("instance_ids", "instances"),),
+    ChaosType.EFS_MOUNT_TARGET_DELETE: (),
+    ChaosType.VPC_SUBNET_ACL_MODIFY: (("subnet_id", "subnets"), ("nacl_id", "nacls")),
+    ChaosType.VPC_ENDPOINT_DELETE: (("endpoint_id", "vpc_endpoints"),),
+}
+# These types address no VPC resource, so --vpc-id does not constrain them. Any
+# other type, including RDS, Lambda, ECS and Directory Service resources whose
+# VPC placement and tags are not verified here, is refused under --vpc-id.
+VPC_INDEPENDENT_EXPERIMENTS = frozenset(
+    {
+        ChaosType.S3_BUCKET_POLICY_DENY,
+        ChaosType.S3_BUCKET_VERSIONING_SUSPEND,
+        ChaosType.S3_BUCKET_ENCRYPTION_DISABLE,
+        ChaosType.S3_OBJECT_DELETE,
+        ChaosType.S3_LIFECYCLE_MODIFY,
+        ChaosType.SQS_QUEUE_PURGE,
+        ChaosType.SQS_QUEUE_POLICY_RESTRICT,
+        ChaosType.SQS_MESSAGE_DELAY,
+        ChaosType.SQS_VISIBILITY_TIMEOUT,
+        ChaosType.SNS_SUBSCRIPTION_DELETE,
+        ChaosType.SNS_TOPIC_POLICY_RESTRICT,
+        ChaosType.SNS_MESSAGE_ATTRIBUTE_CORRUPT,
+        ChaosType.KINESIS_SHARD_SPLIT,
+        ChaosType.KINESIS_SHARD_MERGE,
+        ChaosType.KINESIS_RETENTION_MODIFY,
+        ChaosType.KINESIS_THROUGHPUT_LIMIT,
+        ChaosType.CLOUDFRONT_BEHAVIOR_MODIFY,
+        ChaosType.CLOUDFRONT_ORIGIN_FAILOVER,
+        ChaosType.CLOUDFRONT_CACHE_INVALIDATE,
+        ChaosType.WAF_RULE_MODIFY,
+        ChaosType.WAF_RATE_LIMIT_MODIFY,
+        ChaosType.WAF_IP_SET_MODIFY,
+        ChaosType.KMS_KEY_DISABLE,
+        ChaosType.KMS_KEY_POLICY_RESTRICT,
+        ChaosType.KMS_GRANT_REVOKE,
+        ChaosType.IAM_POLICY_DETACH,
+        ChaosType.IAM_ROLE_MODIFY,
+        ChaosType.IAM_USER_ACCESS_KEY_DEACTIVATE,
+        ChaosType.ECR_IMAGE_DELETE,
+        ChaosType.ECR_REPOSITORY_POLICY_RESTRICT,
+        ChaosType.CODECOMMIT_TRIGGER_DELETE,
+        ChaosType.CODECOMMIT_BRANCH_PROTECT,
+        ChaosType.SES_CONFIGURATION_SET_DELETE,
+        ChaosType.SES_SENDING_QUOTA_LIMIT,
+    }
+)
+
+
+def validate_vpc_target_scope(
+    experiment_type: ChaosType,
+    config: dict[str, Any],
+    vpc_id: str,
+    inventory: dict[str, list[str]],
+) -> None:
+    """Refuse a live target that contradicts the selected --vpc-id scope."""
+    if experiment_type in VPC_INDEPENDENT_EXPERIMENTS:
+        return
+    if experiment_type == ChaosType.VPC_PEERING_DELETE:
+        # Deletion affects both endpoints. Both must be the selected VPC; since
+        # the reviewed endpoints must be distinct VPCs, this always refuses.
+        endpoints, _targets = peering_endpoint_scope(config)
+        if any(endpoint["vpc_id"] != vpc_id for endpoint in endpoints.values()):
+            raise ConfigurationError(
+                "VPC peering deletion requires both endpoints in the selected VPC"
+            )
+    fields = VPC_SCOPED_TARGET_INVENTORY.get(experiment_type)
+    if fields is None:
+        raise ConfigurationError(
+            f"{experiment_type.value} cannot prove membership in the selected VPC"
+        )
+    for key, resource_type in fields:
+        value = config.get(key)
+        values = value if isinstance(value, list) else [value]
+        available = set(inventory.get(resource_type, []))
+        if not values or any(
+            not isinstance(item, str) or item not in available for item in values
+        ):
+            raise ConfigurationError(
+                f"{key} is outside the selected VPC's exactly tagged inventory"
+            )
 
 
 MAX_DENIED_PATTERNS = 32
@@ -3145,6 +3295,13 @@ class ChaosExperiment:
                 raise SafetyViolation("A derived target matches a denied pattern")
         return targets
 
+    def _live_vpc_scope(self) -> _ExecutionGrant | None:
+        """Return live --vpc-id authority that each pre-mutation response must match."""
+        if self.dry_run:
+            return None
+        grant = self._require_execution_grant()
+        return grant if grant.vpc_id else None
+
 
 class EC2ChaosExperiment(ChaosExperiment):
     """EC2-based chaos experiments"""
@@ -3343,7 +3500,20 @@ class EC2ChaosExperiment(ChaosExperiment):
         )
 
         try:
-            states = self._instance_states(instance_ids)
+            instances = self._instance_details(instance_ids)
+            scope = self._live_vpc_scope()
+            if scope is not None and any(
+                instance.get("VpcId") != scope.vpc_id
+                or ("instances", instance.get("InstanceId")) not in scope.vpc_inventory
+                for instance in instances
+            ):
+                raise SafetyViolation(
+                    "EC2 reboot target is outside the selected VPC's tagged inventory"
+                )
+            states = {
+                instance["InstanceId"]: instance["State"]["Name"]
+                for instance in instances
+            }
             if set(states) != set(instance_ids) or any(
                 state != "running" for state in states.values()
             ):
@@ -3904,6 +4074,16 @@ class EFSChaosExperiment(ChaosExperiment):
             mt_info = self.efs.describe_mount_targets(MountTargetId=mount_target_id)
             if mt_info["MountTargets"]:
                 mt = mt_info["MountTargets"][0]
+                scope = self._live_vpc_scope()
+                if scope is not None and (
+                    len(mt_info["MountTargets"]) != 1
+                    or mt.get("MountTargetId") != mount_target_id
+                    or mt.get("VpcId") != scope.vpc_id
+                    or ("subnets", mt.get("SubnetId")) not in scope.vpc_inventory
+                ):
+                    raise SafetyViolation(
+                        "EFS mount target subnet is outside the selected VPC's tagged inventory"
+                    )
                 self.file_system_id = mt["FileSystemId"]
                 self.subnet_id = mt["SubnetId"]
                 self.security_groups = mt.get("SecurityGroups", [])
@@ -4180,6 +4360,18 @@ class VPCChaosExperiment(ChaosExperiment):
             ):
                 raise ConfigurationError(
                     "The selected subnet needs one exact NACL association"
+                )
+            scope = self._live_vpc_scope()
+            # The original NACL is also a write target: recovery re-associates the
+            # subnet with it, so it must be in the same tagged inventory.
+            if scope is not None and (
+                acls[0].get("VpcId") != scope.vpc_id
+                or ("subnets", subnet_id) not in scope.vpc_inventory
+                or ("nacls", nacl_id) not in scope.vpc_inventory
+                or ("nacls", acls[0]["NetworkAclId"]) not in scope.vpc_inventory
+            ):
+                raise SafetyViolation(
+                    "Subnet or NACL is outside the selected VPC's tagged inventory"
                 )
             if acls[0]["NetworkAclId"] == nacl_id:
                 raise ConfigurationError(
@@ -4524,6 +4716,15 @@ class VPCChaosExperiment(ChaosExperiment):
                     raise SafetyViolation(
                         "Peering endpoint metadata differs from the reviewed tuple"
                     )
+                scope = self._live_vpc_scope()
+                if scope is not None and (
+                    any(item["vpc_id"] != scope.vpc_id for item in actual.values())
+                    or ("peering_connections", peering_connection_id)
+                    not in scope.vpc_inventory
+                ):
+                    raise SafetyViolation(
+                        "VPC peering deletion requires both endpoints in the selected VPC"
+                    )
                 if not self.dry_run:
                     if any(
                         endpoint["owner_id"] != self.expected_account
@@ -4592,6 +4793,16 @@ class VPCChaosExperiment(ChaosExperiment):
             )
             if endpoint_info["VpcEndpoints"]:
                 self.endpoint_details = endpoint_info["VpcEndpoints"][0]
+                scope = self._live_vpc_scope()
+                if scope is not None and (
+                    len(endpoint_info["VpcEndpoints"]) != 1
+                    or self.endpoint_details.get("VpcEndpointId") != endpoint_id
+                    or self.endpoint_details.get("VpcId") != scope.vpc_id
+                    or ("vpc_endpoints", endpoint_id) not in scope.vpc_inventory
+                ):
+                    raise SafetyViolation(
+                        "VPC endpoint is outside the selected VPC's tagged inventory"
+                    )
 
                 if not self.dry_run:
                     # Delete endpoint
@@ -9718,6 +9929,15 @@ class ChaosOrchestrator:
 
         if self.vpc_id:
             self._discover_resources()
+            if self.live:
+                # Refuse a contradictory scope before any experiment can mutate.
+                for item in suite["experiments"]:
+                    validate_vpc_target_scope(
+                        ChaosType(item["type"]),
+                        {**self.config.get("global", {}), **item},
+                        self.vpc_id,
+                        self.discovered_resources,
+                    )
 
         logger.info("Starting experiment suite %s", suite_name)
 
@@ -10042,6 +10262,15 @@ class ChaosOrchestrator:
             )
         if denied_target_matches(denied_policy_globs(safety), targets):
             raise SafetyViolation("A target matches a denied target pattern")
+        vpc_id = getattr(self, "vpc_id", None)
+        if vpc_id:
+            # The literal allowlist is necessary but not sufficient in VPC scope.
+            validate_vpc_target_scope(
+                experiment_type,
+                config,
+                vpc_id,
+                getattr(self, "discovered_resources", {}),
+            )
 
     def _wait_with_runtime_checks(self, duration_seconds: int) -> None:
         """Wait cooperatively while rechecking configured steady-state guards."""
@@ -10704,6 +10933,7 @@ class ChaosOrchestrator:
                 active_access_key_id=self.active_access_key_id,
             )
             self._authorize_live_creation(experiment_type, runtime)
+            vpc_id = getattr(self, "vpc_id", None) or None
             grant = _ExecutionGrant(
                 experiment_type,
                 _canonical_execution_data(runtime),
@@ -10711,6 +10941,16 @@ class ChaosOrchestrator:
                 self.region,
                 self.safety_controller,
                 frozenset(self._target_values(runtime)),
+                vpc_id,
+                frozenset(
+                    (resource_type, value)
+                    for resource_type, values in getattr(
+                        self, "discovered_resources", {}
+                    ).items()
+                    for value in values
+                )
+                if vpc_id
+                else frozenset(),
             )
             if not hasattr(self.safety_controller, "_execution_creation"):
                 self.safety_controller._execution_creation = threading.local()
