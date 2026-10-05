@@ -15,6 +15,7 @@ from test_aws_chaos_framework import (
     action_configs,
     make_experiment,
     make_orchestrator,
+    prepare_lambda_memory,
 )
 
 import aws_chaos_framework as f
@@ -83,8 +84,13 @@ def test_handler_rejects_different_target_type_and_changed_configuration():
 
 def test_public_recovery_refuses_before_owned_forward_lifecycle():
     aws = FakeAWS(reject_writes=False)
-    kind = f.ChaosType.EC2_STOP
-    item = make_experiment(kind, {"instance_ids": [INSTANCE_ID]}, aws, dry_run=False)
+    kind = f.ChaosType.LAMBDA_MEMORY_LIMIT
+    item = make_experiment(
+        kind,
+        {"function_name": "chaos-test-function", "memory_mb": 128},
+        aws,
+        dry_run=False,
+    )
     with pytest.raises(f.SafetyViolation, match="completed approved handler lifecycle"):
         item.run_rollback()
     assert not aws.calls and not item.rollback_attempts and not item.mutation_attempts
@@ -95,43 +101,32 @@ def test_public_lifecycle_refuses_reentry_and_preserves_owned_phase_accounting(
     forward_failure,
 ):
     aws = FakeAWS(reject_writes=False)
-    kind = f.ChaosType.EC2_STOP
-    item = make_experiment(kind, {"instance_ids": [INSTANCE_ID]}, aws, dry_run=False)
-
-    def state(value):
-        return {
-            "Reservations": [
-                {"Instances": [{"InstanceId": INSTANCE_ID, "State": {"Name": value}}]}
-            ]
-        }
-
-    aws.read_overrides[("ec2", "describe_instances")] = [
-        state("running"),
-        *([] if forward_failure else [state("stopped")]),
-        state("stopped"),
-        state("running"),
-    ]
+    values = prepare_lambda_memory(aws, forward_failure=forward_failure)
+    item = make_experiment(f.ChaosType.LAMBDA_MEMORY_LIMIT, values, aws, dry_run=False)
     phases = []
-    # Observe the existing ordinary guard without replacing its decision.
     item.safety_controller.check_safety_conditions = MagicMock(
         wraps=item.safety_controller.check_safety_conditions
     )
     respond = aws.respond
 
     def ordinary_callback(service, operation, request):
-        if operation in {"stop_instances", "start_instances"}:
+        if operation == "update_function_configuration":
             phases.append((operation, item._is_recovery_dispatch()))
             with pytest.raises(
                 f.SafetyViolation, match="experiment lifecycle is active"
             ):
                 item.run_rollback()
-        if operation == "stop_instances" and forward_failure:
+        if (
+            operation == "update_function_configuration"
+            and request["MemorySize"] == 128
+            and forward_failure
+        ):
             aws.calls.append((service, operation, request))
             raise RuntimeError("ordinary ambiguous SDK failure")
         return respond(service, operation, request)
 
     aws.respond = ordinary_callback
-    result = item.stop_instances([INSTANCE_ID])
+    result = item.modify_memory_limit(**values)
     assert result.status == ("failed" if forward_failure else "completed")
     if forward_failure:
         assert "ordinary ambiguous SDK failure" in result.errors[0]
@@ -140,15 +135,23 @@ def test_public_lifecycle_refuses_reentry_and_preserves_owned_phase_accounting(
     item.safety_controller.emergency_stop_all()
     item.run_rollback()
     assert item.safety_controller.check_safety_conditions.call_count == forward_polls
-    assert phases == [("stop_instances", False), ("start_instances", True)]
-    assert item.mutation_attempts == ["ec2.stop_instances"]
+    assert phases == [
+        ("update_function_configuration", False),
+        ("update_function_configuration", True),
+    ]
+    assert item.mutation_attempts == ["lambda.update_function_configuration"]
     assert item.mutation_operations == (
-        [] if forward_failure else ["ec2.stop_instances"]
+        [] if forward_failure else ["lambda.update_function_configuration"]
     )
-    assert item.rollback_attempts == ["ec2.start_instances"]
-    assert item.rollback_operations == ["ec2.start_instances"]
+    assert item.rollback_attempts == ["lambda.update_function_configuration"]
+    assert item.rollback_operations == ["lambda.update_function_configuration"]
     assert item.rollback_verified and not item.rollback_errors
     assert not item._is_recovery_dispatch()
+    writes = [r for _, op, r in aws.calls if op == "update_function_configuration"]
+    assert [r["RevisionId"] for r in writes] == [
+        "memory-original-revision",
+        "memory-owned-revision",
+    ]
 
 
 def test_confirmed_handler_uses_detached_approved_argument_containers():

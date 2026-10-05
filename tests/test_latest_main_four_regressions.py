@@ -22,6 +22,8 @@ from test_aws_chaos_framework import (
     FakeAWS,
     make_experiment,
     make_orchestrator,
+    planning_only_experiment,
+    prepare_lambda_memory,
 )
 
 import aws_chaos_framework as f
@@ -47,6 +49,22 @@ def live_ec2(kind=f.ChaosType.EC2_REBOOT):
     aws = FakeAWS(reject_writes=False)
     owner = make_experiment(kind, {"instance_ids": [INSTANCE_ID]}, aws, dry_run=False)
     return owner, owner.safety_controller, aws
+
+
+def conditional_lambda_stop_fixture(*, accepted_write=True):
+    """Genuine public conditional action with ordinary sequential state data."""
+    aws = FakeAWS(reject_writes=False)
+    values = prepare_lambda_memory(aws, forward_failure=True)
+    if not accepted_write:
+        original = copy.deepcopy(
+            aws.read_overrides[("lambda", "get_function_configuration")][0]
+        )
+        aws.read_overrides[("lambda", "get_function_configuration")] = [
+            original,
+            copy.deepcopy(original),
+        ]
+    owner = make_experiment(f.ChaosType.LAMBDA_MEMORY_LIMIT, values, aws, dry_run=False)
+    return owner, owner.safety_controller, aws, values
 
 
 def instance_response(state="running"):
@@ -601,30 +619,31 @@ def test_same_thread_signal_request_is_deferred_without_dispatch_or_deadlock():
 
 
 def test_stop_waits_for_accepted_sdk_call_and_blocks_later_calls_but_not_recovery():
-    owner, controller, aws = stopped_ec2_fixture()
+    owner, controller, aws, values = conditional_lambda_stop_fixture()
     later, _, later_aws = live_ec2()
     # The stop request in the SDK callback prevents the forward state wait.
-    aws.read_overrides[("ec2", "describe_instances")] = [
-        instance_response("running"),
-        instance_response("stopped"),
-        instance_response("running"),
-    ]
     starts = []
     recovery_starts = []
     respond = aws.respond
 
     def admitted_call(service, operation, request):
-        if operation == "stop_instances":
+        if (
+            operation == "update_function_configuration"
+            and request.get("MemorySize") == 128
+        ):
             starts.append(controller.emergency_stop.is_set())
             controller.emergency_stop_all()
             assert controller.emergency_stop.wait(0)
             assert not controller.emergency_stop.is_set()
-        elif operation == "start_instances":
+        elif (
+            operation == "update_function_configuration"
+            and request.get("MemorySize") == 256
+        ):
             recovery_starts.append(controller.emergency_stop.is_set())
         return respond(service, operation, request)
 
     aws.respond = admitted_call
-    result = owner.stop_instances([INSTANCE_ID])
+    result = owner.modify_memory_limit(**values)
     assert result.status == "failed"
     assert any("Emergency stop" in error for error in result.errors)
     assert starts == [False]
@@ -637,17 +656,30 @@ def test_stop_waits_for_accepted_sdk_call_and_blocks_later_calls_but_not_recover
     owner._in_rollback = True
     try:
         with pytest.raises(f.SafetyViolation, match="active approved handler"):
-            owner.ec2.start_instances(InstanceIds=[INSTANCE_ID])
+            owner.lambda_client.update_function_configuration(
+                FunctionName=values["function_name"],
+                MemorySize=256,
+                RevisionId="memory-owned-revision",
+            )
     finally:
         owner._in_rollback = False
     assert not owner.rollback_attempts and not owner.rollback_operations
     owner.run_rollback()
-    assert owner.mutation_attempts == ["ec2.stop_instances"]
-    assert owner.mutation_operations == ["ec2.stop_instances"]
+    assert owner.mutation_attempts == ["lambda.update_function_configuration"]
+    assert owner.mutation_operations == ["lambda.update_function_configuration"]
     assert recovery_starts == [True]
-    assert owner.rollback_attempts == ["ec2.start_instances"]
-    assert owner.rollback_operations == ["ec2.start_instances"]
+    assert owner.rollback_attempts == ["lambda.update_function_configuration"]
+    assert owner.rollback_operations == ["lambda.update_function_configuration"]
     assert owner.rollback_verified and not owner.rollback_errors
+    requests = [
+        request
+        for _, operation, request in aws.calls
+        if operation == "update_function_configuration"
+    ]
+    assert [request["RevisionId"] for request in requests] == [
+        "memory-original-revision",
+        "memory-owned-revision",
+    ]
 
 
 def test_reentrant_stop_inside_already_started_sdk_call_latches_after_return():
@@ -681,7 +713,9 @@ def test_reentrant_stop_inside_already_started_sdk_call_latches_after_return():
 @pytest.mark.parametrize("stop_at", ["before_handler", "admission", "sdk_return"])
 def test_stop_dispatch_stress_has_no_sdk_start_after_latch(monkeypatch, stop_at):
     """Deterministic lifecycle control retaining the historical test's invariant."""
-    owner, controller, aws = stopped_ec2_fixture()
+    owner, controller, aws, values = conditional_lambda_stop_fixture(
+        accepted_write=stop_at == "sdk_return"
+    )
     later, _, later_aws = live_ec2()
     states = []
     recovery_states = []
@@ -696,40 +730,37 @@ def test_stop_dispatch_stress_has_no_sdk_start_after_latch(monkeypatch, stop_at)
             assert not controller.emergency_stop.is_set()
 
     def raw_call(service, operation, request):
-        if operation == "stop_instances":
+        if (
+            operation == "update_function_configuration"
+            and request.get("MemorySize") == 128
+        ):
             states.append(controller.emergency_stop.is_set())
             if stop_at == "sdk_return":
                 controller.emergency_stop_all()
                 assert controller.emergency_stop.stop_requested()
                 assert not controller.emergency_stop.is_set()
-        elif operation == "start_instances":
+        elif (
+            operation == "update_function_configuration"
+            and request.get("MemorySize") == 256
+        ):
             recovery_states.append(controller.emergency_stop.is_set())
         return respond(service, operation, request)
 
     monkeypatch.setattr(owner, "_record_mutation_attempt", record_admission)
     monkeypatch.setattr(aws, "respond", raw_call)
-    aws.read_overrides[("ec2", "describe_instances")] = (
-        [
-            instance_response("running"),
-            instance_response("stopped"),
-            instance_response("running"),
-        ]
-        if stop_at == "sdk_return"
-        else [instance_response("running"), instance_response("running")]
-    )
     if stop_at == "before_handler":
         controller.emergency_stop_all()
-    result = owner.stop_instances([INSTANCE_ID])
+    result = owner.modify_memory_limit(**values)
     assert result.status == "failed"
     assert any("Emergency stop" in error for error in result.errors)
     assert states == ([False] if stop_at == "sdk_return" else [])
     assert not any(states)
     assert controller.emergency_stop.is_set()
     assert owner.mutation_attempts == (
-        [] if stop_at == "before_handler" else ["ec2.stop_instances"]
+        [] if stop_at == "before_handler" else ["lambda.update_function_configuration"]
     )
     assert owner.mutation_operations == (
-        ["ec2.stop_instances"] if stop_at == "sdk_return" else []
+        ["lambda.update_function_configuration"] if stop_at == "sdk_return" else []
     )
     refused = later.reboot_instances([INSTANCE_ID])
     assert refused.status == "failed"
@@ -741,9 +772,19 @@ def test_stop_dispatch_stress_has_no_sdk_start_after_latch(monkeypatch, stop_at)
         assert owner.rollback_verified and not owner.rollback_errors
     assert recovery_states == ([True] if stop_at == "sdk_return" else [])
     assert owner.rollback_attempts == (
-        ["ec2.start_instances"] if stop_at == "sdk_return" else []
+        ["lambda.update_function_configuration"] if stop_at == "sdk_return" else []
     )
     assert owner.rollback_operations == owner.rollback_attempts
+    requests = [
+        request
+        for _, operation, request in aws.calls
+        if operation == "update_function_configuration"
+    ]
+    assert [request["RevisionId"] for request in requests] == (
+        ["memory-original-revision", "memory-owned-revision"]
+        if stop_at == "sdk_return"
+        else []
+    )
 
 
 @pytest.mark.parametrize("operation", sorted(f.S3_OWNER_BOUND_OPERATIONS))
@@ -828,11 +869,11 @@ def test_experiment_account_override_is_refused_and_owner_changes_confirmation()
     orchestrator.safety_controller = controller
     with pytest.raises(f.SafetyViolation, match="cannot override"):
         orchestrator._create_experiment(
-            f.ChaosType.S3_OBJECT_DELETE, {"account_id": "999999999999"}
+            f.ChaosType.LAMBDA_MEMORY_LIMIT, {"account_id": "999999999999"}
         )
     with pytest.raises(f.SafetyViolation, match="cannot override"):
         orchestrator._run_single_experiment_locked(
-            {"type": "s3_object_delete", "account_id": "999999999999"}
+            {"type": "lambda_memory_limit", "account_id": "999999999999"}
         )
     config = {
         "schema_version": 1,
@@ -842,8 +883,9 @@ def test_experiment_account_override_is_refused_and_owner_changes_confirmation()
             "test": {
                 "experiments": [
                     {
-                        "type": f.ChaosType.EC2_REBOOT.value,
-                        "instance_ids": [INSTANCE_ID],
+                        "type": "lambda_memory_limit",
+                        "function_name": "chaos-test-function",
+                        "memory_mb": 128,
                     }
                 ]
             }
@@ -872,22 +914,17 @@ def test_real_botocore_owner_mismatch_refuses_delete_and_valid_owner_succeeds(fa
     controller.check_safety_conditions = lambda: (True, [])
     with pytest.raises(f.SafetyViolation, match="plan-only"):
         f.S3ChaosExperiment({"dry_run": False}, controller)
-    owner = make_experiment(
+    aws = FakeAWS(reject_writes=False)
+    owner = planning_only_experiment(
         f.ChaosType.S3_OBJECT_DELETE,
         {"bucket_name": BUCKET, "prefix": PREFIX, "max_objects": 1},
-        FakeAWS(reject_writes=False),
-        dry_run=False,
+        aws,
     )
     owner.s3 = f.AwsClientProxy("s3", client, owner)
     read = {
         "Bucket": BUCKET,
         "Prefix": PREFIX,
         "MaxKeys": 1,
-        "ExpectedBucketOwner": ACCOUNT_ID,
-    }
-    delete = {
-        "Bucket": BUCKET,
-        "Delete": {"Objects": [{"Key": PREFIX + "object"}]},
         "ExpectedBucketOwner": ACCOUNT_ID,
     }
     with Stubber(client) as stub:
@@ -903,27 +940,24 @@ def test_real_botocore_owner_mismatch_refuses_delete_and_valid_owner_succeeds(fa
             stub.add_response(
                 "list_objects_v2", {"Contents": [{"Key": PREFIX + "object"}]}, read
             )
-            if failure == "delete":
-                stub.add_client_error(
-                    "delete_objects",
-                    service_error_code="AccessDenied",
-                    service_message="Owner mismatch",
-                    http_status_code=403,
-                    expected_params=delete,
-                )
-            else:
-                stub.add_response(
-                    "delete_objects", {"Deleted": [{"Key": PREFIX + "object"}]}, delete
-                )
         result = owner.delete_objects(BUCKET, PREFIX, 1)
+        assert result.status == ("failed" if failure == "list" else "completed")
+        request = {
+            "Bucket": BUCKET,
+            "Delete": {"Objects": [{"Key": PREFIX + "object"}]},
+            "ExpectedBucketOwner": "999999999999"
+            if failure == "delete"
+            else ACCOUNT_ID,
+        }
+        with pytest.raises(
+            f.SafetyViolation,
+            match="owner differs" if failure == "delete" else "Plan mode",
+        ):
+            owner.s3.delete_objects(**request)
         stub.assert_no_pending_responses()
-    assert result.status == ("completed" if failure is None else "failed")
-    assert owner.mutation_attempts == (
-        [] if failure == "list" else ["s3.delete_objects"]
-    )
-    assert owner.mutation_operations == (
-        ["s3.delete_objects"] if failure is None else []
-    )
+    assert owner.mutation_attempts == []
+    assert owner.mutation_operations == []
+    assert owner.rollback_attempts == []
 
 
 @pytest.mark.parametrize(
