@@ -23,6 +23,7 @@ from test_aws_chaos_framework import (
     make_experiment,
     make_orchestrator,
     planning_only_experiment,
+    prepare_lambda_memory,
 )
 
 import aws_chaos_framework as f
@@ -48,6 +49,22 @@ def live_ec2(kind=f.ChaosType.EC2_REBOOT):
     aws = FakeAWS(reject_writes=False)
     owner = make_experiment(kind, {"instance_ids": [INSTANCE_ID]}, aws, dry_run=False)
     return owner, owner.safety_controller, aws
+
+
+def conditional_lambda_stop_fixture(*, accepted_write=True):
+    """Genuine public conditional action with ordinary sequential state data."""
+    aws = FakeAWS(reject_writes=False)
+    values = prepare_lambda_memory(aws, forward_failure=True)
+    if not accepted_write:
+        original = copy.deepcopy(
+            aws.read_overrides[("lambda", "get_function_configuration")][0]
+        )
+        aws.read_overrides[("lambda", "get_function_configuration")] = [
+            original,
+            copy.deepcopy(original),
+        ]
+    owner = make_experiment(f.ChaosType.LAMBDA_MEMORY_LIMIT, values, aws, dry_run=False)
+    return owner, owner.safety_controller, aws, values
 
 
 def instance_response(state="running"):
@@ -602,30 +619,31 @@ def test_same_thread_signal_request_is_deferred_without_dispatch_or_deadlock():
 
 
 def test_stop_waits_for_accepted_sdk_call_and_blocks_later_calls_but_not_recovery():
-    owner, controller, aws = stopped_ec2_fixture()
+    owner, controller, aws, values = conditional_lambda_stop_fixture()
     later, _, later_aws = live_ec2()
     # The stop request in the SDK callback prevents the forward state wait.
-    aws.read_overrides[("ec2", "describe_instances")] = [
-        instance_response("running"),
-        instance_response("stopped"),
-        instance_response("running"),
-    ]
     starts = []
     recovery_starts = []
     respond = aws.respond
 
     def admitted_call(service, operation, request):
-        if operation == "stop_instances":
+        if (
+            operation == "update_function_configuration"
+            and request.get("MemorySize") == 128
+        ):
             starts.append(controller.emergency_stop.is_set())
             controller.emergency_stop_all()
             assert controller.emergency_stop.wait(0)
             assert not controller.emergency_stop.is_set()
-        elif operation == "start_instances":
+        elif (
+            operation == "update_function_configuration"
+            and request.get("MemorySize") == 256
+        ):
             recovery_starts.append(controller.emergency_stop.is_set())
         return respond(service, operation, request)
 
     aws.respond = admitted_call
-    result = owner.stop_instances([INSTANCE_ID])
+    result = owner.modify_memory_limit(**values)
     assert result.status == "failed"
     assert any("Emergency stop" in error for error in result.errors)
     assert starts == [False]
@@ -638,17 +656,30 @@ def test_stop_waits_for_accepted_sdk_call_and_blocks_later_calls_but_not_recover
     owner._in_rollback = True
     try:
         with pytest.raises(f.SafetyViolation, match="active approved handler"):
-            owner.ec2.start_instances(InstanceIds=[INSTANCE_ID])
+            owner.lambda_client.update_function_configuration(
+                FunctionName=values["function_name"],
+                MemorySize=256,
+                RevisionId="memory-owned-revision",
+            )
     finally:
         owner._in_rollback = False
     assert not owner.rollback_attempts and not owner.rollback_operations
     owner.run_rollback()
-    assert owner.mutation_attempts == ["ec2.stop_instances"]
-    assert owner.mutation_operations == ["ec2.stop_instances"]
+    assert owner.mutation_attempts == ["lambda.update_function_configuration"]
+    assert owner.mutation_operations == ["lambda.update_function_configuration"]
     assert recovery_starts == [True]
-    assert owner.rollback_attempts == ["ec2.start_instances"]
-    assert owner.rollback_operations == ["ec2.start_instances"]
+    assert owner.rollback_attempts == ["lambda.update_function_configuration"]
+    assert owner.rollback_operations == ["lambda.update_function_configuration"]
     assert owner.rollback_verified and not owner.rollback_errors
+    requests = [
+        request
+        for _, operation, request in aws.calls
+        if operation == "update_function_configuration"
+    ]
+    assert [request["RevisionId"] for request in requests] == [
+        "memory-original-revision",
+        "memory-owned-revision",
+    ]
 
 
 def test_reentrant_stop_inside_already_started_sdk_call_latches_after_return():
@@ -682,7 +713,9 @@ def test_reentrant_stop_inside_already_started_sdk_call_latches_after_return():
 @pytest.mark.parametrize("stop_at", ["before_handler", "admission", "sdk_return"])
 def test_stop_dispatch_stress_has_no_sdk_start_after_latch(monkeypatch, stop_at):
     """Deterministic lifecycle control retaining the historical test's invariant."""
-    owner, controller, aws = stopped_ec2_fixture()
+    owner, controller, aws, values = conditional_lambda_stop_fixture(
+        accepted_write=stop_at == "sdk_return"
+    )
     later, _, later_aws = live_ec2()
     states = []
     recovery_states = []
@@ -697,40 +730,37 @@ def test_stop_dispatch_stress_has_no_sdk_start_after_latch(monkeypatch, stop_at)
             assert not controller.emergency_stop.is_set()
 
     def raw_call(service, operation, request):
-        if operation == "stop_instances":
+        if (
+            operation == "update_function_configuration"
+            and request.get("MemorySize") == 128
+        ):
             states.append(controller.emergency_stop.is_set())
             if stop_at == "sdk_return":
                 controller.emergency_stop_all()
                 assert controller.emergency_stop.stop_requested()
                 assert not controller.emergency_stop.is_set()
-        elif operation == "start_instances":
+        elif (
+            operation == "update_function_configuration"
+            and request.get("MemorySize") == 256
+        ):
             recovery_states.append(controller.emergency_stop.is_set())
         return respond(service, operation, request)
 
     monkeypatch.setattr(owner, "_record_mutation_attempt", record_admission)
     monkeypatch.setattr(aws, "respond", raw_call)
-    aws.read_overrides[("ec2", "describe_instances")] = (
-        [
-            instance_response("running"),
-            instance_response("stopped"),
-            instance_response("running"),
-        ]
-        if stop_at == "sdk_return"
-        else [instance_response("running"), instance_response("running")]
-    )
     if stop_at == "before_handler":
         controller.emergency_stop_all()
-    result = owner.stop_instances([INSTANCE_ID])
+    result = owner.modify_memory_limit(**values)
     assert result.status == "failed"
     assert any("Emergency stop" in error for error in result.errors)
     assert states == ([False] if stop_at == "sdk_return" else [])
     assert not any(states)
     assert controller.emergency_stop.is_set()
     assert owner.mutation_attempts == (
-        [] if stop_at == "before_handler" else ["ec2.stop_instances"]
+        [] if stop_at == "before_handler" else ["lambda.update_function_configuration"]
     )
     assert owner.mutation_operations == (
-        ["ec2.stop_instances"] if stop_at == "sdk_return" else []
+        ["lambda.update_function_configuration"] if stop_at == "sdk_return" else []
     )
     refused = later.reboot_instances([INSTANCE_ID])
     assert refused.status == "failed"
@@ -742,9 +772,19 @@ def test_stop_dispatch_stress_has_no_sdk_start_after_latch(monkeypatch, stop_at)
         assert owner.rollback_verified and not owner.rollback_errors
     assert recovery_states == ([True] if stop_at == "sdk_return" else [])
     assert owner.rollback_attempts == (
-        ["ec2.start_instances"] if stop_at == "sdk_return" else []
+        ["lambda.update_function_configuration"] if stop_at == "sdk_return" else []
     )
     assert owner.rollback_operations == owner.rollback_attempts
+    requests = [
+        request
+        for _, operation, request in aws.calls
+        if operation == "update_function_configuration"
+    ]
+    assert [request["RevisionId"] for request in requests] == (
+        ["memory-original-revision", "memory-owned-revision"]
+        if stop_at == "sdk_return"
+        else []
+    )
 
 
 @pytest.mark.parametrize("operation", sorted(f.S3_OWNER_BOUND_OPERATIONS))

@@ -103,7 +103,7 @@ recovery sets the process-wide live-execution latch and blocks later live work.
 
 The following types support dry-run planning and advertise `live_supported: false`:
 
-- `s3_bucket_policy_deny`, `sns_topic_policy_restrict`
+- `s3_bucket_policy_deny`, `sns_topic_policy_restrict`, `sns_subscription_delete`
 - `ebs_throttle_iops`, `ebs_detach_volume`, `opensearch_cluster_config_modify`
 - `vpc_route_table_modify`
 - `vpc_security_group_modify`, `vpc_nacl_block_traffic`
@@ -163,10 +163,14 @@ See the request contracts for
 [ELB](https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/API_ModifyTargetGroup.html)
 and [AppStream](https://docs.aws.amazon.com/appstream2/latest/APIReference/API_StartFleet.html).
 
-SNS subscription deletion retains its declared irreversible scope for an exact
-subscription ARN. Automatic or legacy `Subscribe` recovery is refused: the
-subscription request cannot condition recreation on a caller-owned revision.
-Operators must reconcile any historical subscription recovery separately.
+SNS subscription deletion now retains read-only planning for an exact subscription
+ARN; its live irreversible deletion contract is withdrawn. `Unsubscribe` and
+`Subscribe` SDK mutations are both refused, including historical automatic
+recovery. The subscription request cannot condition recreation on a caller-owned
+revision, and an irreversible approval does not restore live support. Pure
+account, partition, region and Firehose IAM role validators remain available as
+identity checks; they do not grant execution authority. Operators must reconcile
+historical subscription outcomes separately.
 SES configuration-set deletion likewise keeps its declared irreversible scope;
 legacy configuration-set recreation is refused. Previously unsupported S3
 encryption restoration is also refused at SDK dispatch. These paths cannot be

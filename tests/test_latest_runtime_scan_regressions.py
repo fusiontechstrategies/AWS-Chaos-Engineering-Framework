@@ -849,6 +849,8 @@ def test_direct_forward_or_legacy_cleanup_cannot_clobber_concurrent_state(
             if service == "s3"
             else {"SyntheticState": current}
         )
+        if service == "lambda":
+            request["FunctionName"] = "chaos-test-function"
         getattr(proxy, method)(**request)
     assert current == original
     assert not aws.calls

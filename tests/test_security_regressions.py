@@ -278,10 +278,17 @@ def test_ecs_recovery_does_not_accept_desired_count_without_running_tasks(monkey
 def test_confirmation_token_binds_reviewed_plan_and_safety():
     config = framework.yaml.safe_load(framework.SAMPLE_CONFIG)
     config["global"]["account_id"] = ACCOUNT_ID
-    for suite_config in config["experiment_suites"].values():
-        for action in suite_config["experiments"]:
-            if action.get("instance_ids") in ("@discovered", "@random_discovered"):
-                action["instance_ids"] = ["i-0123456789abcdef0"]
+    config["experiment_suites"] = {
+        "ordinary": {
+            "experiments": [
+                {
+                    "type": framework.ChaosType.EC2_REBOOT.value,
+                    "instance_ids": [INSTANCE_ID],
+                    "duration": 300,
+                }
+            ]
+        }
+    }
     suite = next(iter(config["experiment_suites"]))
     token = framework.confirmation_token(config, suite)
     changed = copy.deepcopy(config)
@@ -575,10 +582,17 @@ def test_constructor_live_token_matches_offline_token_without_config_mutation(
 
     config = framework.yaml.safe_load(framework.SAMPLE_CONFIG)
     config["global"]["account_id"] = ACCOUNT_ID
-    for suite_config in config["experiment_suites"].values():
-        for action in suite_config["experiments"]:
-            if action.get("instance_ids") in ("@discovered", "@random_discovered"):
-                action["instance_ids"] = ["i-0123456789abcdef0"]
+    config["experiment_suites"] = {
+        "ordinary": {
+            "experiments": [
+                {
+                    "type": framework.ChaosType.EC2_REBOOT.value,
+                    "instance_ids": [INSTANCE_ID],
+                    "duration": 300,
+                }
+            ]
+        }
+    }
     path = tmp_path / "config.yaml"
     path.write_text(framework.yaml.safe_dump(config))
     aws = FakeAWS()
@@ -1907,6 +1921,30 @@ def test_native_sns_firehose_role_reference_is_narrow_and_owner_bound(attack):
         stub.assert_no_pending_responses()
 
 
+def assert_sns_subscription_live_refuses_without_effects(subscription):
+    """Current public admission and reconstruction refuse before any SDK call."""
+    aws = FakeAWS(reject_writes=False)
+    values = {"subscription_arn": subscription}
+    assert not framework.experiment_metadata(
+        framework.ChaosType.SNS_SUBSCRIPTION_DELETE
+    ).live_supported
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(
+            framework.ChaosType.SNS_SUBSCRIPTION_DELETE, values, aws, dry_run=False
+        )
+    with pytest.raises(
+        framework.SafetyViolation, match="Direct experiment construction is plan-only"
+    ):
+        framework.SNSChaosExperiment(
+            {**values, "account_id": ACCOUNT_ID, "region": REGION, "dry_run": False},
+            FakeSafetyController(aws, live=True),
+        )
+    assert not aws.calls
+    return aws
+
+
 @pytest.mark.parametrize("protocol", ["lambda", "firehose"])
 @pytest.mark.parametrize(
     "attack",
@@ -1956,37 +1994,53 @@ def test_native_sns_snapshot_admission_precedes_irreversible_fault(protocol, att
     }
     if protocol == "firehose" and "SubscriptionRoleArn" in details:
         request["Attributes"] = {"SubscriptionRoleArn": details["SubscriptionRoleArn"]}
+    # Former live unsubscribe/subscribe success is withdrawn and unexecuted.
+    refused_aws = assert_sns_subscription_live_refuses_without_effects(subscription)
     session = framework.boto3.Session(
         aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
     )
+    raw = session.client("sns", region_name=REGION)
     owner = make_experiment(
         framework.ChaosType.SNS_SUBSCRIPTION_DELETE,
         {"subscription_arn": subscription},
-        SimpleNamespace(
-            client=lambda service: session.client(service, region_name=REGION)
-        ),
-        dry_run=False,
+        SimpleNamespace(client=lambda service: raw),
+        dry_run=True,
     )
-    with Stubber(owner.sns._client) as stub:
+    with Stubber(raw) as stub:
         stub.add_response(
             "get_subscription_attributes",
             {"Attributes": details},
             {"SubscriptionArn": subscription},
         )
+        snapshot = owner.sns.get_subscription_attributes(SubscriptionArn=subscription)
+        assert snapshot["Attributes"] == details
         if good:
-            stub.add_response("unsubscribe", {}, {"SubscriptionArn": subscription})
-            stub.add_response("subscribe", {"SubscriptionArn": subscription}, request)
-        result = owner.delete_subscription(subscription)
-        assert result.status == ("completed" if good else "failed"), result.errors
-        owner.run_rollback()
-        if good:
-            assert owner.mutation_operations == ["sns.unsubscribe"]
-            assert owner.rollback_operations == ["sns.subscribe"]
-            assert (
-                not owner.rollback_verified
-            )  # Recreation never proves full irreversible recovery.
+            framework.validate_sdk_request_arns(
+                "sns", "subscribe", request, ACCOUNT_ID, REGION
+            )
         else:
-            assert not owner.mutation_attempts and not owner.rollback_attempts
+            with pytest.raises(framework.SafetyViolation):
+                framework.validate_sdk_request_arns(
+                    "sns", "subscribe", request, ACCOUNT_ID, REGION
+                )
+        # Independent valid requests reach only the plan's no-effect boundary.
+        canonical = {
+            "TopicArn": topic,
+            "Protocol": "lambda",
+            "Endpoint": f"arn:aws-us-gov:lambda:{REGION}:{ACCOUNT_ID}:function:reviewed",
+        }
+        for operation, values in (
+            ("unsubscribe", {"SubscriptionArn": subscription}),
+            ("subscribe", canonical),
+        ):
+            assert "sns." + operation in framework.CONCURRENCY_UNSAFE_MUTATIONS
+            with pytest.raises(framework.SafetyViolation, match="Plan mode refuses"):
+                getattr(owner.sns, operation)(**values)
+        owner.run_rollback()
+        assert not owner.rollback_verified
+        assert not owner.mutation_attempts and not owner.rollback_attempts
+        assert not owner.mutation_operations and not owner.rollback_operations
+        assert not refused_aws.calls
         stub.assert_no_pending_responses()
 
 
@@ -2019,8 +2073,6 @@ def test_native_sns_snapshot_admission_precedes_irreversible_fault(protocol, att
 def test_native_sns_role_grammar_precedes_dispatch_and_irreversible_fault(
     entrypoint, resource, valid
 ):
-    from botocore.stub import Stubber
-
     topic = f"arn:aws-us-gov:sns:{REGION}:{ACCOUNT_ID}:reviewed"
     subscription = topic + ":01234567-89ab-cdef-0123-456789abcdef"
     role = f"arn:aws-us-gov:iam::{ACCOUNT_ID}:{resource}"
@@ -2031,59 +2083,56 @@ def test_native_sns_role_grammar_precedes_dispatch_and_irreversible_fault(
         "Endpoint": endpoint,
         "Attributes": {"SubscriptionRoleArn": role},
     }
-    session = framework.boto3.Session(
-        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
-    )
-    owner = make_experiment(
-        framework.ChaosType.SNS_SUBSCRIPTION_DELETE,
-        {"subscription_arn": subscription},
-        SimpleNamespace(
-            client=lambda service: session.client(service, region_name=REGION)
-        ),
-        dry_run=False,
-    )
-    with Stubber(owner.sns._client) as stub:
-        if entrypoint == "delete":
-            stub.add_response(
-                "get_subscription_attributes",
-                {
-                    "Attributes": {
-                        "TopicArn": topic,
-                        "Protocol": "firehose",
-                        "Endpoint": endpoint,
-                        "SubscriptionRoleArn": role,
-                    }
-                },
-                {"SubscriptionArn": subscription},
+    # All original role/entrypoint data remains pure grammar evidence.
+    if valid:
+        framework.validate_sdk_request_arns(
+            "sns", "subscribe", request, ACCOUNT_ID, REGION
+        )
+    else:
+        with pytest.raises(framework.SafetyViolation):
+            framework.validate_sdk_request_arns(
+                "sns", "subscribe", request, ACCOUNT_ID, REGION
             )
-            if valid:
-                stub.add_response("unsubscribe", {}, {"SubscriptionArn": subscription})
-                stub.add_response(
-                    "subscribe", {"SubscriptionArn": subscription}, request
-                )
-            result = owner.delete_subscription(subscription)
-            assert result.status == ("completed" if valid else "failed"), result.errors
-            owner.run_rollback()
-            if valid:
-                assert owner.mutation_operations == ["sns.unsubscribe"]
-                assert owner.rollback_operations == ["sns.subscribe"]
-                assert not owner.rollback_verified
-            else:
-                assert not owner.mutation_attempts and not owner.rollback_attempts
-        else:
-            if valid:
-                framework.validate_sdk_request_arns(
-                    "sns", "subscribe", request, ACCOUNT_ID, REGION
-                )
-            else:
-                with pytest.raises(framework.SafetyViolation):
-                    framework.validate_sdk_request_arns(
-                        "sns", "subscribe", request, ACCOUNT_ID, REGION
-                    )
-            # Subscribe has authority only inside the owned delete recovery.
-            with pytest.raises(
-                framework.SafetyViolation, match="active approved handler"
-            ):
-                owner.sns.subscribe(**request)
-            assert not owner.mutation_attempts
-        stub.assert_no_pending_responses()
+    refused_aws = assert_sns_subscription_live_refuses_without_effects(subscription)
+    if entrypoint == "direct":
+        # An independent valid request preserves the inactive handler invariant.
+        aws = FakeAWS(reject_writes=False)
+        owner = make_experiment(
+            framework.ChaosType.EC2_REBOOT,
+            {"instance_ids": [INSTANCE_ID]},
+            aws,
+            dry_run=False,
+        )
+        canonical = {
+            **request,
+            "Attributes": {
+                "SubscriptionRoleArn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/reviewed"
+            },
+        }
+        with pytest.raises(framework.SafetyViolation, match="active approved handler"):
+            owner.client("sns").subscribe(**canonical)
+        assert not aws.calls
+        assert not owner.mutation_attempts and not owner.rollback_attempts
+    else:
+        # Former live deletion/recreation assertions are withdrawn/unexecuted.
+        plan_aws = FakeAWS(reject_writes=True)
+        owner = make_experiment(
+            framework.ChaosType.SNS_SUBSCRIPTION_DELETE,
+            {"subscription_arn": subscription},
+            plan_aws,
+            dry_run=True,
+        )
+        with pytest.raises(framework.SafetyViolation, match="Plan mode refuses"):
+            owner.sns.unsubscribe(SubscriptionArn=subscription)
+        with pytest.raises(framework.SafetyViolation, match="Plan mode refuses"):
+            owner.sns.subscribe(
+                TopicArn=topic,
+                Protocol="firehose",
+                Endpoint=endpoint,
+                Attributes={
+                    "SubscriptionRoleArn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/reviewed"
+                },
+            )
+        assert not plan_aws.calls
+        assert not owner.mutation_attempts and not owner.rollback_attempts
+    assert not refused_aws.calls

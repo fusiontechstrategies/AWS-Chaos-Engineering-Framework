@@ -520,6 +520,7 @@ FIS_PREFERRED_EXPERIMENTS = frozenset(
 
 CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
     {
+        ChaosType.SNS_SUBSCRIPTION_DELETE,
         ChaosType.VPC_ROUTE_TABLE_MODIFY,
         ChaosType.EBS_DETACH_VOLUME,
         ChaosType.EC2_STOP,
@@ -567,6 +568,7 @@ CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
 # terminal predicates do not supply ownership for their forward/restore writes.
 CONCURRENCY_UNSAFE_MUTATIONS = frozenset(
     {
+        "sns.unsubscribe",
         "ec2.delete_route",
         "ec2.create_route",
         "ec2.detach_volume",
