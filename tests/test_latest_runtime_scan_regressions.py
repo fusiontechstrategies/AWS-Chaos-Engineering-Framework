@@ -735,6 +735,7 @@ def test_subnet_no_change_cannot_produce_a_fault_completion(dry_run):
     config = {
         "subnet_id": "subnet-0123456789abcdef0",
         "nacl_id": "acl-0123456789abcdef0",
+        "original_nacl_id": "acl-0123456789abcdef0",
     }
     item = make_experiment(
         framework.ChaosType.VPC_SUBNET_ACL_MODIFY, config, aws, dry_run=dry_run

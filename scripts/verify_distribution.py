@@ -88,6 +88,7 @@ APPROVED_SOURCE_PATHS = frozenset(
         "tests/test_archive_security.py",
         "tests/test_aws_chaos_framework.py",
         "tests/test_final_cloud_eight_recovery_controls.py",
+        "tests/test_final_cloud_eight_scope_controls.py",
         "tests/test_final_cloud_six_controls.py",
         "tests/test_final_nine_regressions.py",
         "tests/test_route_ebs_planning_only.py",

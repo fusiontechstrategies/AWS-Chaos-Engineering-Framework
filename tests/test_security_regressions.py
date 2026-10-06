@@ -612,7 +612,9 @@ def test_constructor_live_token_matches_offline_token_without_config_mutation(
             "Arn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ChaosOperator",
         }
     )
-    frozen = SimpleNamespace(access_key="ASIA" + "Z" * 16, token="synthetic")
+    frozen = SimpleNamespace(
+        access_key="ASIA" + "Z" * 16, secret_key="synthetic", token="synthetic"
+    )
     session = SimpleNamespace(
         client=lambda service, **kwargs: (
             identity if service == "sts" else aws.client(service)

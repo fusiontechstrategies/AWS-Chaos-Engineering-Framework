@@ -2,6 +2,19 @@
 
 ## Unreleased security follow-ups
 
+- Pin live sessions to one verified credential snapshot, keeping the selected
+  profile's non-credential configuration, so a refreshable profile cannot later
+  sign as another account, and require name-only RDS and Kinesis
+  reads to return the reviewed account-bearing ARN before mutation.
+- Make S3 lifecycle expiration planning only (no conditional lifecycle revision);
+  plans require a canonical nonempty `prefix`, keep unrelated rules, report a
+  privacy-filtered `lifecycle_plan` and reject any key outside the lifecycle
+  schema before token generation.
+- Require `original_nacl_id` for `vpc_subnet_acl_modify`; it is bound into the
+  token, allowlist, execution grant and `--vpc-id` scope, and both the forward
+  handler and recovery refuse a different observed or recorded original NACL.
+- Name FIS template targets by ordinal in guardrail diagnostics, and record ECS
+  task stops one task at a time so a partial failure keeps confirmed evidence.
 - Require irreversible approval for RDS retention and S3 lifecycle changes and
   refuse claims that deleted data was recovered.
 - Remove unapproved implicit EC2 termination snapshots and serialize complete live
