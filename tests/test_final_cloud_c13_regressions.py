@@ -517,7 +517,7 @@ def test_canonical_commercial_govcloud_china_and_fips_origins_are_bound(
 def test_fips_approval_selects_exactly_one_canonical_variant():
     _parents, regional = framework.canonical_endpoint_origin("sts", "us-east-1", False)
     _parents, fips = framework.canonical_endpoint_origin("sts", "us-east-1", True)
-    assert "sts-fips.us-east-1.amazonaws.com" in fips
+    assert fips == {"sts-fips.us-east-1.amazonaws.com"}
     assert not regional & fips
     assert not framework.is_canonical_request_url(
         "sts", "https://sts-fips.us-east-1.amazonaws.com/", regional
