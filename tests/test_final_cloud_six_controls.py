@@ -517,10 +517,12 @@ def test_allowlisted_target_outside_vpc_or_tags_is_a_configuration_error(kind, v
     assert mutation_calls(aws) == []
 
 
+# RDS reboot is planning only, so live admission refuses it before any VPC
+# check; a live-supported Lambda type covers the unverifiable-membership case.
 @pytest.mark.parametrize(
     "kind",
     [
-        framework.ChaosType.RDS_REBOOT,
+        framework.ChaosType.LAMBDA_MEMORY_LIMIT,
         framework.ChaosType.LAMBDA_TIMEOUT_MODIFY,
         framework.ChaosType.ECS_TASK_STOP,
         framework.ChaosType.DS_TRUST_DELETE,

@@ -18,6 +18,7 @@ from test_aws_chaos_framework import (
     action_configs,
     make_experiment,
     make_orchestrator,
+    planning_only_experiment,
     prepare_lambda_memory,
 )
 
@@ -624,17 +625,18 @@ QUEUED_FAULTS = [
 ]
 
 
-@pytest.mark.parametrize("dry_run", [False, True], ids=["live", "plan"])
 @pytest.mark.parametrize("fault", QUEUED_FAULTS)
 @pytest.mark.parametrize("kind", [RETENTION, RDS_REBOOT], ids=lambda k: k.value)
 def test_rds_apply_immediately_and_reboot_refuse_queued_changes(
-    kind, fault, dry_run, monkeypatch
+    kind, fault, monkeypatch
 ):
-    aws = FakeAWS(reject_writes=dry_run)
+    # Live reboot/retention is planning only; the queued-change checks still
+    # apply to the plan as defence in depth.
+    aws = FakeAWS(reject_writes=True)
     aws.read_overrides[("rds", "describe_db_instances")] = [queued_instance(fault)]
     # A bounded wait keeps a missing guard a fast failure, never a hang.
     values = {**action_configs()[kind], "state_timeout_seconds": 10}
-    item = make_experiment(kind, values, aws, dry_run=dry_run)
+    item = planning_only_experiment(kind, values, aws)
     monkeypatch.setattr(item, "_wait_forward", lambda seconds: None)
     if kind == RETENTION:
         result = item.modify_backup_retention(
@@ -653,20 +655,13 @@ def test_rds_apply_immediately_and_reboot_refuse_queued_changes(
 
 
 @pytest.mark.parametrize("kind", [RETENTION, RDS_REBOOT], ids=lambda k: k.value)
-def test_rds_in_sync_instance_without_pending_changes_is_admitted(kind, monkeypatch):
-    aws = FakeAWS(reject_writes=False)
-    before = queued_instance("none")
-    after = copy.deepcopy(before)
-    if kind == RETENTION:
-        after["DBInstances"][0]["BackupRetentionPeriod"] = 0
-        reads = [before, after]
-    else:
-        rebooting = copy.deepcopy(before)
-        rebooting["DBInstances"][0]["DBInstanceStatus"] = "rebooting"
-        reads = [before, rebooting, after]
-    aws.read_overrides[("rds", "describe_db_instances")] = reads
+def test_rds_in_sync_instance_without_pending_changes_is_planned_not_dispatched(
+    kind, monkeypatch
+):
+    aws = FakeAWS(reject_writes=True)
+    aws.read_overrides[("rds", "describe_db_instances")] = [queued_instance("none")]
     values = action_configs()[kind]
-    item = make_experiment(kind, values, aws, dry_run=False)
+    item = planning_only_experiment(kind, values, aws)
     monkeypatch.setattr(item, "_wait_forward", lambda seconds: None)
     if kind == RETENTION:
         result = item.modify_backup_retention(**values)
@@ -676,13 +671,12 @@ def test_rds_in_sync_instance_without_pending_changes_is_admitted(kind, monkeypa
         call = writes(aws, "reboot_db_instance")
     assert result.status == "completed", result.errors
     assert "queued_change_refusal" not in result.additional_info
-    assert len(call) == 1
+    assert call == [] and item.mutation_attempts == []
 
 
-@pytest.mark.parametrize("dry_run", [False, True], ids=["live", "plan"])
 @pytest.mark.parametrize("fault", ["cluster-pending", "member-pending-reboot"])
-def test_rds_cluster_failover_refuses_queued_changes(fault, dry_run, monkeypatch):
-    aws = FakeAWS(reject_writes=dry_run)
+def test_rds_cluster_failover_refuses_queued_changes(fault, monkeypatch):
+    aws = FakeAWS(reject_writes=True)
     cluster = copy.deepcopy(FakeAWS().respond("rds", "describe_db_clusters", {}))
     if fault == "cluster-pending":
         cluster["DBClusters"][0]["PendingModifiedValues"] = {"EngineVersion": "8.0.40"}
@@ -691,7 +685,7 @@ def test_rds_cluster_failover_refuses_queued_changes(fault, dry_run, monkeypatch
         member["DBClusterParameterGroupStatus"] = "pending-reboot"
     aws.read_overrides[("rds", "describe_db_clusters")] = [cluster]
     values = {**action_configs()[RDS_FAILOVER], "state_timeout_seconds": 10}
-    item = make_experiment(RDS_FAILOVER, values, aws, dry_run=dry_run)
+    item = planning_only_experiment(RDS_FAILOVER, values, aws)
     monkeypatch.setattr(item, "_wait_forward", lambda seconds: None)
     result = item.failover_db_cluster("chaos-test-cluster")
     assert result.status == "failed"
@@ -1050,9 +1044,10 @@ def rds_cluster(**changes) -> dict:
     return response
 
 
-def reboot_member(aws, monkeypatch, *, dry_run=False):
+def reboot_member(aws, monkeypatch):
+    # Live reboot is planning only; every check below runs against the plan.
     values = {**action_configs()[RDS_REBOOT], "state_timeout_seconds": 10}
-    item = make_experiment(RDS_REBOOT, values, aws, dry_run=dry_run)
+    item = planning_only_experiment(RDS_REBOOT, values, aws)
     monkeypatch.setattr(item, "_wait_forward", lambda seconds: None)
     return item, item.reboot_db_instance(values["db_instance_identifier"])
 
@@ -1088,18 +1083,15 @@ CLUSTER_DOMAIN_FAULTS = [
 ]
 
 
-@pytest.mark.parametrize("dry_run", [False, True], ids=["live", "plan"])
 @pytest.mark.parametrize("fault", CLUSTER_DOMAIN_FAULTS)
-def test_clustered_reboot_refuses_queued_cluster_parameter_domain(
-    fault, dry_run, monkeypatch
-):
-    aws = FakeAWS(reject_writes=dry_run)
+def test_clustered_reboot_refuses_queued_cluster_parameter_domain(fault, monkeypatch):
+    aws = FakeAWS(reject_writes=True)
     # The instance parameter domain itself is clean and available.
     aws.read_overrides[("rds", "describe_db_instances")] = [
         rds_instance(DBClusterIdentifier=CLUSTER)
     ]
     aws.read_overrides[("rds", "describe_db_clusters")] = [cluster_member_fault(fault)]
-    item, result = reboot_member(aws, monkeypatch, dry_run=dry_run)
+    item, result = reboot_member(aws, monkeypatch)
     assert result.status == "failed"
     assert "RDS reboot refused" in result.errors[0]
     assert result.additional_info["queued_change_refusal"]
@@ -1149,35 +1141,33 @@ def test_clustered_reboot_refuses_unreadable_cluster_identity(
     assert writes(aws, "reboot_db_instance") == []
 
 
-def test_clean_cluster_member_reboot_is_admitted(monkeypatch):
-    aws = FakeAWS(reject_writes=False)
-    before = rds_instance(DBClusterIdentifier=CLUSTER)
-    rebooting = copy.deepcopy(before)
-    rebooting["DBInstances"][0]["DBInstanceStatus"] = "rebooting"
+def test_clean_cluster_member_reboot_is_planned_not_dispatched(monkeypatch):
+    aws = FakeAWS(reject_writes=True)
     aws.read_overrides[("rds", "describe_db_instances")] = [
-        before,
-        rebooting,
-        copy.deepcopy(before),
+        rds_instance(DBClusterIdentifier=CLUSTER)
     ]
     aws.read_overrides[("rds", "describe_db_clusters")] = [rds_cluster()]
     item, result = reboot_member(aws, monkeypatch)
     assert result.status == "completed", result.errors
     assert "queued_change_refusal" not in result.additional_info
-    assert writes(aws, "reboot_db_instance") == [
-        {"DBInstanceIdentifier": "chaos-test-db", "ForceFailover": False}
-    ]
+    assert ("rds", "describe_db_clusters", {"DBClusterIdentifier": CLUSTER}) in (
+        aws.calls
+    )
+    assert writes(aws, "reboot_db_instance") == []
+    assert item.mutation_attempts == []
 
 
 def test_unclustered_reboot_reads_no_cluster(monkeypatch):
     aws = FakeAWS(reject_writes=True)
-    item, result = reboot_member(aws, monkeypatch, dry_run=True)
+    item, result = reboot_member(aws, monkeypatch)
     assert result.status == "completed", result.errors
     assert not any(name == "describe_db_clusters" for _, name, _ in aws.calls)
 
 
-def failover(aws, monkeypatch, *, dry_run=False):
+def failover(aws, monkeypatch):
+    # Live failover is planning only; every check below runs against the plan.
     values = {**action_configs()[RDS_FAILOVER], "state_timeout_seconds": 10}
-    item = make_experiment(RDS_FAILOVER, values, aws, dry_run=dry_run)
+    item = planning_only_experiment(RDS_FAILOVER, values, aws)
     monkeypatch.setattr(item, "_wait_forward", lambda seconds: None)
     return item, item.failover_db_cluster(CLUSTER)
 
@@ -1221,16 +1211,13 @@ MEMBER_FAULTS = {
 }
 
 
-@pytest.mark.parametrize("dry_run", [False, True], ids=["live", "plan"])
 @pytest.mark.parametrize("fault", list(MEMBER_FAULTS))
-def test_failover_refuses_a_member_with_queued_instance_changes(
-    fault, dry_run, monkeypatch
-):
-    aws = FakeAWS(reject_writes=dry_run)
+def test_failover_refuses_a_member_with_queued_instance_changes(fault, monkeypatch):
+    aws = FakeAWS(reject_writes=True)
     # The cluster-level domain is clean; only a member instance domain is not.
     expected, reads = MEMBER_FAULTS[fault]
     aws.read_overrides[("rds", "describe_db_instances")] = copy.deepcopy(reads)
-    item, result = failover(aws, monkeypatch, dry_run=dry_run)
+    item, result = failover(aws, monkeypatch)
     assert result.status == "failed"
     assert "RDS failover refused" in result.errors[0]
     assert result.additional_info["queued_change_refusal"].startswith(expected)
@@ -1280,7 +1267,7 @@ def test_failover_member_reads_are_bounded(monkeypatch):
 
 def test_clean_failover_reads_every_member_instance_once(monkeypatch):
     aws = FakeAWS(reject_writes=True)
-    item, result = failover(aws, monkeypatch, dry_run=True)
+    item, result = failover(aws, monkeypatch)
     assert result.status == "completed", result.errors
     member_reads = [
         request["DBInstanceIdentifier"]
