@@ -161,6 +161,7 @@ jobs:
       id-token: write
       contents: read
       actions: read
+      attestations: read
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       SOURCE_COMMIT: ${{ needs.verify.outputs.source-commit }}
@@ -203,12 +204,49 @@ jobs:
           name: verified-python-distributions
           path: verified-payload
 
+      # The handoff and its bundled manifest come from the lower-privilege verify
+      # job. This protected job independently resolves the tag, downloads the
+      # public release evidence and verifies the protected release-promotion
+      # provenance for that evidence and for the exact handed-off packages.
+      - name: Independently authenticate release subjects in the protected job
+        id: trusted
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${RELEASE_TAG#v}"
+          git -C trusted-verifier fetch --no-tags origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          commit="$(git -C trusted-verifier rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          git -C trusted-verifier merge-base --is-ancestor "$commit" origin/main
+          test "$(gh api "repos/$GH_REPO/commits/$commit" --jq '.commit.verification.verified')" = true
+          test "$commit" = "$SOURCE_COMMIT"
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = false
+          test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease')" = false
+          mkdir trusted-release trusted-attestations
+          gh release download "$RELEASE_TAG" --pattern release-evidence.json --dir trusted-release
+          signer="https://github.com/$GH_REPO/.github/workflows/release-promotion.yml@refs/heads/main"
+          for subject in trusted-release/release-evidence.json \
+            "verified-payload/packages/aws_chaos_engineering_framework-${version}-py3-none-any.whl" \
+            "verified-payload/packages/aws_chaos_engineering_framework-${version}.tar.gz"; do
+            gh attestation verify "$subject" --repo "$GH_REPO" \
+              --cert-identity "$signer" \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com \
+              --source-ref refs/heads/main --deny-self-hosted-runners \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --format json > "trusted-attestations/${subject##*/}.json"
+          done
+          echo "source-commit=$commit" >> "$GITHUB_OUTPUT"
+
       - name: Reverify exact bytes immediately before publishing
+        env:
+          TRUSTED_SOURCE_COMMIT: ${{ steps.trusted.outputs.source-commit }}
         shell: bash
         run: |
           set -euo pipefail
           python -I trusted-verifier/scripts/publish_payload.py verify verified-payload \
-            --tag "$RELEASE_TAG" --source-commit "$SOURCE_COMMIT"
+            --tag "$RELEASE_TAG" --source-commit "$TRUSTED_SOURCE_COMMIT" \
+            --trusted-evidence trusted-release/release-evidence.json \
+            --attestations trusted-attestations --repository "$GH_REPO"
 
       - name: Publish with PyPI trusted publishing
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
