@@ -341,6 +341,39 @@ RDS failover requires a different exact writer and available cluster state.
 RDS reboot requires an observed rebooting state followed by available. An API
 acceptance or an unchanged available response alone does not prove completion.
 
+`ApplyImmediately` also applies every pending modification. A reboot applies
+`pending-reboot` DB parameter-group changes and, for a cluster member, static
+cluster parameters awaiting the next instance restart. Backup-retention changes
+and reboots therefore require an available instance with no
+`PendingModifiedValues`, at least one DB parameter group, every group
+`in-sync` and every option-group membership `in-sync`. A reboot of an instance
+that reports a `DBClusterIdentifier` also reads that exact cluster and requires
+it to be available, with no cluster `PendingModifiedValues`, and the instance
+to appear exactly once in its members with an `in-sync` cluster parameter
+group; an unreadable cluster or a missing member is refused.
+
+Failover can restart cluster members. Whether a given failover activates queued
+parameters is engine specific and not stated by the AWS API model, so failover
+is refused conservatively unless both parameter domains are clean: no cluster
+`PendingModifiedValues`, every member's cluster parameter group `in-sync`, and
+every member instance (at most 16, each read once) passing the same instance
+checks as a reboot. The checks use reads taken immediately before the write and
+apply in plan mode too. Every refusal from these checks, including an
+unavailable instance or cluster, records `queued_change_refusal`. They are not
+conditional writes: a change queued after those reads is outside this boundary.
+
+Lambda environment handlers read variables only when `Environment.Variables` is
+present and `Environment.Error` is absent; a missing `Environment` means no
+variables. Unreadable environments (for example a denied KMS decrypt) refuse
+forward work and recovery instead of writing or verifying an empty map;
+recovery verification compares readable variables, so a restored empty map
+verifies whether AWS returns empty `Variables` or omits `Environment`. Execution
+grants for types without a reviewed live implementation are refused, and the
+writes used only by those types, including S3 encryption deletion, are also
+denied at the SDK proxy. Directory
+Service trust deletion requires exactly one returned trust with the approved
+`TrustId`.
+
 SQS purge configuration requires `queue_arn` as well as `queue_url`. The reviewed
 ARN must exactly match the configured partition, region and account, and the
 native HTTPS queue URL must name the same account and queue. Operators obtain

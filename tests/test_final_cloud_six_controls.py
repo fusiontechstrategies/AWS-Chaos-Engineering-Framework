@@ -816,9 +816,17 @@ def owner_bound_s3_in_forward_dispatch(aws):
         {"LocationConstraint": None},
     ],
 )
-def test_s3_lifecycle_location_errors_fail_closed(response):
-    # The owner-bound location read still guards every S3 write that is not
-    # retired; an encryption write stands in for any such admitted write.
+def test_s3_lifecycle_location_errors_fail_closed(response, monkeypatch):
+    # The owner-bound location read still guards every S3 write that is
+    # admitted. Every owner-bound S3 write is now also denied at the proxy, so
+    # this test-only path lifts that one denial to reach the location guard;
+    # test_s3_encryption_delete_is_denied_before_the_location_read covers the
+    # production deny list.
+    monkeypatch.setattr(
+        framework,
+        "CONCURRENCY_UNSAFE_MUTATIONS",
+        framework.CONCURRENCY_UNSAFE_MUTATIONS - {"s3.delete_bucket_encryption"},
+    )
     aws = FakeAWS(reject_writes=False)
     owner, s3 = owner_bound_s3_in_forward_dispatch(aws)
     original = aws.respond
@@ -837,6 +845,17 @@ def test_s3_lifecycle_location_errors_fail_closed(response):
     assert s3_calls(aws) == [
         ("get_bucket_location", {"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT_ID})
     ]
+    assert owner.mutation_attempts == []
+    assert mutation_calls(aws) == []
+
+
+def test_s3_encryption_delete_is_denied_before_the_location_read():
+    assert "s3.delete_bucket_encryption" in framework.CONCURRENCY_UNSAFE_MUTATIONS
+    aws = FakeAWS(reject_writes=False)
+    owner, s3 = owner_bound_s3_in_forward_dispatch(aws)
+    with pytest.raises(framework.SafetyViolation, match="conditional ownership"):
+        s3.delete_bucket_encryption(Bucket=BUCKET)
+    assert s3_calls(aws) == []
     assert owner.mutation_attempts == []
     assert mutation_calls(aws) == []
 

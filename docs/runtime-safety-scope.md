@@ -284,3 +284,20 @@ A WAF request that is already satisfied is refused before dispatch as a failed
 result, with no write, ownership marker or recovery claim. This covers the
 current rule action type, the current rate limit, or an IP-set request without a
 CIDR that is canonically new. One canonically new address is required.
+Ownership is computed against canonical CIDRs: an operator entry that is the
+same network in another textual form is pre-existing state, is not written again
+and is never owned. Recovery removes only entries whose canonical form is an
+owned addition, at the confirmed generation.
+
+## Plan parity and queued service changes
+
+FIS plans apply every structural guardrail that live validation applies (action
+recovery, alarm stop condition from `safety_alarms`, selection bounds, target
+allowlist, exact instance ARNs and required tags). Plan mode skips only the live
+CloudWatch alarm-state read, so a template with a structural violation is
+reported as failed with the same `guardrail_violations`, never as planned. This
+is structural parity only: alarm state is not checked, and live FIS starts stay
+disabled regardless of the plan result. RDS
+queued-change refusals, Lambda unreadable-environment refusals and the exact
+Directory Service trust match are evaluated in plan mode as well; see
+[security boundaries](security-boundaries.md#destructive-call-and-transition-evidence).

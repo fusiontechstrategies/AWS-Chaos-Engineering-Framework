@@ -71,6 +71,12 @@ class FakeAWS:
         if not is_read and self.write_responses.get(override_key):
             return self.write_responses[override_key].pop(0)
 
+        # A by-name RDS instance read describes the requested instance, so a
+        # cluster's member reads each observe their own identity.
+        db_instance = request.get("DBInstanceIdentifier")
+        if not isinstance(db_instance, str) or db_instance.startswith("arn:"):
+            db_instance = "chaos-test-db"
+
         policy = json.dumps(
             {
                 "Version": "2012-10-17",
@@ -274,11 +280,23 @@ class FakeAWS:
             ("rds", "describe_db_instances"): {
                 "DBInstances": [
                     {
-                        "DBInstanceIdentifier": "chaos-test-db",
-                        "DBInstanceArn": f"arn:aws-us-gov:rds:{REGION}:{ACCOUNT_ID}:db:chaos-test-db",
+                        "DBInstanceIdentifier": db_instance,
+                        "DBInstanceArn": f"arn:aws-us-gov:rds:{REGION}:{ACCOUNT_ID}:db:{db_instance}",
                         "DBInstanceStatus": "available",
                         "BackupRetentionPeriod": 7,
                         "MultiAZ": True,
+                        "DBParameterGroups": [
+                            {
+                                "DBParameterGroupName": "chaos-test-params",
+                                "ParameterApplyStatus": "in-sync",
+                            }
+                        ],
+                        "OptionGroupMemberships": [
+                            {
+                                "OptionGroupName": "chaos-test-options",
+                                "Status": "in-sync",
+                            }
+                        ],
                     }
                 ]
             },
@@ -983,6 +1001,9 @@ def make_orchestrator(
     targets = framework.ChaosOrchestrator._target_values(reviewed)
     radius = framework.ChaosOrchestrator._blast_radius(experiment_type, reviewed)
     safety = FakeSafetyController(fake_aws, live=not dry_run).config
+    if experiment_type == framework.ChaosType.FIS_TEMPLATE:
+        # FIS plans apply the live allowlist check to the template's own ARNs.
+        targets = [*targets, *safety["target_allowlist"]]
     safety.update(
         target_allowlist=sorted(targets),
         max_blast_radius=max(1, radius),

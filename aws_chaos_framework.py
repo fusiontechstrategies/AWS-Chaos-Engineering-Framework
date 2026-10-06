@@ -624,6 +624,14 @@ CONCURRENCY_UNSAFE_MUTATIONS = frozenset(
         "ecr.set_repository_policy",
         "ecr.delete_repository_policy",
         "codecommit.put_repository_triggers",
+        # Writes reachable only from experiment types without a reviewed live
+        # implementation; refused here as well as at the execution grant.
+        "s3.delete_bucket_encryption",
+        "kinesis.split_shard",
+        "kinesis.merge_shards",
+        "kinesis.update_shard_count",
+        "ecs.register_task_definition",
+        "cloudfront.update_distribution",
     }
 )
 
@@ -2751,6 +2759,8 @@ def validate_vpc_target_scope(
 
 
 MAX_DENIED_PATTERNS = 32
+# Aurora clusters hold at most 16 instances; failover reads each member once.
+MAX_RDS_CLUSTER_MEMBERS = 16
 MAX_DENIED_PATTERN_LENGTH = 128
 MAX_DENIED_TARGET_LENGTH = 2048
 MAX_DENIED_MATCH_WORK = 1_048_576
@@ -2991,6 +3001,13 @@ class ChaosExperiment:
                 "Live mutation and recovery are disabled without conditional ownership proof; reconcile manually"
             )
         if (
+            isinstance(grant, _ExecutionGrant)
+            and not experiment_metadata(grant.kind).live_supported
+        ):
+            raise SafetyViolation(
+                "Live mutation and recovery are disabled for an experiment type without a reviewed live implementation"
+            )
+        if (
             not isinstance(grant, _ExecutionGrant)
             or grant.controller is not self.safety_controller
             or grant.account != self.expected_account
@@ -3085,8 +3102,14 @@ class ChaosExperiment:
                     )
                 expected_addresses = set(self.rollback_ip_set_state["Addresses"])
             else:
-                expected_addresses = set(self.original_addresses) | set(
+                if not set(self.owned_address_additions) <= set(
                     scope["addresses_to_add"]
+                ):
+                    raise SafetyViolation(
+                        "WAF forward additions differ from reviewed children"
+                    )
+                expected_addresses = set(self.original_addresses) | set(
+                    self.owned_address_additions
                 )
             if snapshot["Addresses"] != sorted(expected_addresses):
                 raise SafetyViolation(
@@ -5129,6 +5152,137 @@ class RDSChaosExperiment(ChaosExperiment):
         super().__init__(config, safety_controller)
         self.rds = self.client("rds")
 
+    @staticmethod
+    def _queued_change_refusal(instance: dict[str, Any]) -> str | None:
+        """Name queued changes an ApplyImmediately write or reboot would also apply."""
+        if instance.get("DBInstanceStatus") != "available":
+            return "the DB instance is not available"
+        if instance.get("PendingModifiedValues"):
+            return "the DB instance has pending modifications"
+        groups = instance.get("DBParameterGroups")
+        if (
+            not isinstance(groups, list)
+            or not groups
+            or any(
+                not isinstance(group, dict)
+                or group.get("ParameterApplyStatus") != "in-sync"
+                for group in groups
+            )
+        ):
+            return "a DB parameter group is not proven in-sync"
+        options = instance.get("OptionGroupMemberships", [])
+        if not isinstance(options, list) or any(
+            not isinstance(option, dict) or option.get("Status") != "in-sync"
+            for option in options
+        ):
+            return "an option group membership is not in-sync"
+        return None
+
+    @staticmethod
+    def _refuse_queued_changes(
+        result: ExperimentResult, action: str, refusal: str
+    ) -> None:
+        """Record one refusal reason and fail before any RDS write."""
+        result.additional_info["queued_change_refusal"] = refusal
+        raise SafetyViolation(
+            f"RDS {action} refused: {refusal}; it could also apply queued "
+            "changes this run does not own, reconcile them first"
+        )
+
+    def _require_no_queued_changes(
+        self, instance: dict[str, Any], result: ExperimentResult, action: str
+    ) -> None:
+        """Refuse an action that would also activate changes queued by others."""
+        refusal = self._queued_change_refusal(instance)
+        if refusal is not None:
+            self._refuse_queued_changes(result, action, refusal)
+
+    def _cluster_member_domain_refusal(
+        self, instance: dict[str, Any], result: ExperimentResult
+    ) -> str | None:
+        """Check the parent cluster parameter domain of a clustered DB instance.
+
+        Static cluster parameters can take effect on the next instance restart,
+        so an in-sync instance does not prove its cluster domain is in-sync.
+        """
+        if "DBClusterIdentifier" not in instance:
+            return None
+        cluster_identifier = instance["DBClusterIdentifier"]
+        member_identifier = instance.get("DBInstanceIdentifier")
+        if not isinstance(cluster_identifier, str) or not cluster_identifier:
+            return "the parent DB cluster identity is unreadable"
+        try:
+            clusters = self.rds.describe_db_clusters(
+                DBClusterIdentifier=cluster_identifier
+            ).get("DBClusters", [])
+        except Exception:
+            result.additional_info["queued_change_refusal"] = (
+                "the parent DB cluster could not be read"
+            )
+            raise
+        if (
+            not isinstance(clusters, list)
+            or len(clusters) != 1
+            or not isinstance(clusters[0], dict)
+            or clusters[0].get("DBClusterIdentifier") != cluster_identifier
+        ):
+            return "the parent DB cluster could not be read"
+        cluster = clusters[0]
+        self._require_reviewed_rds_arn(
+            cluster.get("DBClusterArn"), cluster_identifier, "cluster"
+        )
+        if cluster.get("Status") != "available":
+            return "the parent DB cluster is not available"
+        if cluster.get("PendingModifiedValues"):
+            return "the parent DB cluster has pending modifications"
+        members = cluster.get("DBClusterMembers")
+        matches = [
+            member
+            for member in (members if isinstance(members, list) else [])
+            if isinstance(member, dict)
+            and isinstance(member_identifier, str)
+            and member.get("DBInstanceIdentifier") == member_identifier
+        ]
+        if len(matches) != 1:
+            return "the DB instance is not exactly one member of its parent cluster"
+        if matches[0].get("DBClusterParameterGroupStatus") != "in-sync":
+            return "the member DB cluster parameter group is not in-sync"
+        return None
+
+    def _failover_member_refusal(
+        self, members: list[dict[str, Any]], result: ExperimentResult
+    ) -> str | None:
+        """Require instance-domain cleanliness of every member failover may restart."""
+        if len(members) > MAX_RDS_CLUSTER_MEMBERS:
+            return "the DB cluster has more members than failover checks cover"
+        for ordinal, member in enumerate(members, start=1):
+            identifier = member["identifier"]
+            if not isinstance(identifier, str) or not identifier:
+                return f"cluster member #{ordinal} has no readable identity"
+            try:
+                instances = self.rds.describe_db_instances(
+                    DBInstanceIdentifier=identifier
+                ).get("DBInstances", [])
+            except Exception:
+                result.additional_info["queued_change_refusal"] = (
+                    f"cluster member #{ordinal} could not be read"
+                )
+                raise
+            if (
+                not isinstance(instances, list)
+                or len(instances) != 1
+                or not isinstance(instances[0], dict)
+                or instances[0].get("DBInstanceIdentifier") != identifier
+            ):
+                return f"cluster member #{ordinal} could not be read"
+            self._require_reviewed_rds_arn(
+                instances[0].get("DBInstanceArn"), identifier, "db"
+            )
+            refusal = self._queued_change_refusal(instances[0])
+            if refusal is not None:
+                return f"cluster member #{ordinal}: {refusal}"
+        return None
+
     def _require_reviewed_rds_arn(
         self, response_arn: Any, identifier: str, resource_type: str
     ) -> None:
@@ -5195,6 +5349,9 @@ class RDSChaosExperiment(ChaosExperiment):
             # Get cluster info before failover
             result.metrics_before = self._get_cluster_metrics(cluster_identifier)
             if result.metrics_before["status"] != "available":
+                result.additional_info["queued_change_refusal"] = (
+                    "the DB cluster is not available"
+                )
                 raise SafetyViolation("The selected RDS cluster is not available")
             if len(result.metrics_before["members"]) < 2:
                 raise SafetyViolation(
@@ -5208,6 +5365,22 @@ class RDSChaosExperiment(ChaosExperiment):
             ]
             if len(writers) != 1 or not writers[0]:
                 raise SafetyViolation("RDS pre-state must identify one exact writer")
+            # Failover can restart members. Whether a restart activates queued
+            # parameters is engine specific and not stated by the AWS model, so
+            # both parameter domains of every member must be clean.
+            if result.metrics_before["pending_modifications"]:
+                refusal = "the DB cluster has pending modifications"
+            elif any(
+                member["status"] != "in-sync"
+                for member in result.metrics_before["members"]
+            ):
+                refusal = "a member DB cluster parameter group is not in-sync"
+            else:
+                refusal = self._failover_member_refusal(
+                    result.metrics_before["members"], result
+                )
+            if refusal is not None:
+                self._refuse_queued_changes(result, "failover", refusal)
 
             if not self.dry_run:
                 self.rds.failover_db_cluster(DBClusterIdentifier=cluster_identifier)
@@ -5260,11 +5433,20 @@ class RDSChaosExperiment(ChaosExperiment):
                 instance.get("DBInstanceArn"), db_instance_identifier, "db"
             )
             if instance.get("DBInstanceStatus") != "available":
+                result.additional_info["queued_change_refusal"] = (
+                    "the DB instance is not available"
+                )
                 raise SafetyViolation("The selected RDS DB instance is not available")
             if force_failover and not instance.get("MultiAZ", False):
                 raise SafetyViolation(
                     "Forced RDS failover requires a Multi-AZ instance"
                 )
+            # A reboot activates pending-reboot parameter-group changes, and for
+            # a cluster member also static cluster parameters awaiting restart.
+            self._require_no_queued_changes(instance, result, "reboot")
+            refusal = self._cluster_member_domain_refusal(instance, result)
+            if refusal is not None:
+                self._refuse_queued_changes(result, "reboot", refusal)
 
             if not self.dry_run:
                 self.rds.reboot_db_instance(
@@ -5317,6 +5499,10 @@ class RDSChaosExperiment(ChaosExperiment):
             if db_info["DBInstances"]:
                 self._require_reviewed_rds_arn(
                     db_info["DBInstances"][0].get("DBInstanceArn"), db_identifier, "db"
+                )
+                # ApplyImmediately also applies every pending modification.
+                self._require_no_queued_changes(
+                    db_info["DBInstances"][0], result, "backup retention change"
                 )
                 self.original_retention = db_info["DBInstances"][0][
                     "BackupRetentionPeriod"
@@ -5443,7 +5629,11 @@ class RDSChaosExperiment(ChaosExperiment):
         self._require_reviewed_rds_arn(
             cluster.get("DBClusterArn"), cluster_identifier, "cluster"
         )
+        pending = cluster.get("PendingModifiedValues") or {}
         return {
+            "pending_modifications": (
+                sorted(pending) if isinstance(pending, dict) else ["unreadable"]
+            ),
             "status": cluster.get("Status"),
             "primary_endpoint": cluster.get("Endpoint"),
             "reader_endpoint": cluster.get("ReaderEndpoint"),
@@ -5604,9 +5794,31 @@ class LambdaChaosExperiment(ChaosExperiment):
         self.lambda_confirmed_revision = None
 
     @staticmethod
-    def _configuration_value(current: dict[str, Any], property_name: str) -> Any:
+    def _readable_environment(current: dict[str, Any]) -> dict[str, Any]:
+        """Return variables only when readable; an absent Environment is empty."""
+        if "Environment" not in current:
+            return {}
+        environment = current["Environment"]
+        # Environment.Error (for example a denied KMS decrypt) or a missing
+        # Variables member is unreadable state, never an empty environment.
+        if (
+            not isinstance(environment, dict)
+            or "Error" in environment
+            or not isinstance(environment.get("Variables"), dict)
+        ):
+            raise SafetyViolation(
+                "Lambda environment variables are unreadable; refusing to treat "
+                "them as empty, reconcile manually"
+            )
+        return copy.deepcopy(environment["Variables"])
+
+    @classmethod
+    def _configuration_value(cls, current: dict[str, Any], property_name: str) -> Any:
         if property_name == "Environment":
-            return current.get("Environment", {}).get("Variables", {})
+            try:
+                return cls._readable_environment(current)
+            except SafetyViolation:
+                return None
         return current.get(property_name)
 
     def _confirm_configuration_write(
@@ -5747,7 +5959,7 @@ class LambdaChaosExperiment(ChaosExperiment):
             response = self.lambda_client.get_function_configuration(
                 FunctionName=function_name
             )
-            self.original_env = response.get("Environment", {}).get("Variables", {})
+            self.original_env = self._readable_environment(response)
             self.function_name = function_name
 
             # Add chaos environment variable
@@ -5907,7 +6119,7 @@ class LambdaChaosExperiment(ChaosExperiment):
             response = self.lambda_client.get_function_configuration(
                 FunctionName=function_name
             )
-            self.original_env = response.get("Environment", {}).get("Variables", {})
+            self.original_env = self._readable_environment(response)
             self.function_name = function_name
 
             # Corrupt environment variables
@@ -5965,9 +6177,8 @@ class LambdaChaosExperiment(ChaosExperiment):
             )
         update = {}
         if hasattr(self, "original_env"):
-            environment = copy.deepcopy(
-                current.get("Environment", {}).get("Variables", {})
-            )
+            current_environment = self._readable_environment(current)
+            environment = copy.deepcopy(current_environment)
             owned = self.owned_env
             missing = object()
             for key in set(owned) | set(self.original_env):
@@ -5982,7 +6193,7 @@ class LambdaChaosExperiment(ChaosExperiment):
                         environment[key] = self.original_env[key]
                     else:
                         environment.pop(key, None)
-            if environment != current.get("Environment", {}).get("Variables", {}):
+            if environment != current_environment:
                 update["Environment"] = {"Variables": environment}
         for attribute, property_name in (
             ("timeout", "Timeout"),
@@ -6020,8 +6231,11 @@ class LambdaChaosExperiment(ChaosExperiment):
             restored = self.lambda_client.get_function_configuration(
                 FunctionName=self.function_name
             )
+            # Environment is compared as readable variables: an omitted
+            # Environment is an empty map, while Environment.Error never verifies.
             if any(
-                restored.get(property_name) != value
+                self._configuration_value(restored, property_name)
+                != (value["Variables"] if property_name == "Environment" else value)
                 for property_name, value in update.items()
             ):
                 raise SafetyViolation("Lambda configuration recovery is not verified")
@@ -8125,6 +8339,14 @@ class WAFChaosExperiment(ChaosExperiment):
         super().__init__(config, safety_controller)
         self.wafv2 = self.client("wafv2")
 
+    @staticmethod
+    def _canonical_ip_set_entry(address: Any) -> Any:
+        """Compare IP-set entries as canonical CIDRs; unparsable text stays literal."""
+        try:
+            return str(ipaddress.ip_network(address, strict=False))
+        except (TypeError, ValueError):
+            return address
+
     def _clear_recovery_ownership(self) -> None:
         # Original-state records remain for read-only verification evidence.
         self.rule_write_confirmed = False
@@ -8381,12 +8603,9 @@ class WAFChaosExperiment(ChaosExperiment):
                 Id=ip_set_id,
             )
             ip_set = response["IPSet"]
-            existing = set()
-            for address in ip_set["Addresses"]:
-                try:
-                    existing.add(str(ipaddress.ip_network(address, strict=False)))
-                except ValueError:
-                    existing.add(address)
+            existing = {
+                self._canonical_ip_set_entry(address) for address in ip_set["Addresses"]
+            }
             if not set(addresses_to_add) - existing:
                 raise ConfigurationError(
                     "WAF IP-set request adds no new approved address; "
@@ -8394,9 +8613,9 @@ class WAFChaosExperiment(ChaosExperiment):
                 )
             self.original_addresses = list(ip_set["Addresses"])
             self.ip_set_write_confirmed = False
-            self.owned_address_additions = set(addresses_to_add) - set(
-                self.original_addresses
-            )
+            # Ownership is canonical: an operator entry equivalent in another
+            # textual form is pre-existing state, never an owned addition.
+            self.owned_address_additions = set(addresses_to_add) - existing
             self.ip_set_id = ip_set_id
             self.ip_set_name = ip_set_name
             self.ip_set_scope = scope
@@ -8414,7 +8633,7 @@ class WAFChaosExperiment(ChaosExperiment):
                     "Name": ip_set_name,
                     "Id": ip_set_id,
                     "Addresses": sorted(
-                        set(self.original_addresses + addresses_to_add)
+                        set(self.original_addresses) | self.owned_address_additions
                     ),
                     "LockToken": response["LockToken"],
                 }
@@ -8432,7 +8651,9 @@ class WAFChaosExperiment(ChaosExperiment):
                 )
                 self.ip_set_write_confirmed = True
                 result.affected_resources = sorted(approved)
-                logger.info(f"Added {len(addresses_to_add)} addresses to IP set")
+                logger.info(
+                    f"Added {len(self.owned_address_additions)} addresses to IP set"
+                )
             else:
                 logger.info("DRY RUN: Would modify IP set")
                 result.affected_resources = sorted(approved)
@@ -8525,8 +8746,10 @@ class WAFChaosExperiment(ChaosExperiment):
                     "Name": self.ip_set_name,
                     "Id": self.ip_set_id,
                     "Addresses": sorted(
-                        set(response["IPSet"]["Addresses"])
-                        - self.owned_address_additions
+                        address
+                        for address in set(response["IPSet"]["Addresses"])
+                        if self._canonical_ip_set_entry(address)
+                        not in self.owned_address_additions
                     ),
                     "LockToken": response["LockToken"],
                 }
@@ -8940,6 +9163,14 @@ class DirectoryServiceChaosExperiment(ChaosExperiment):
             # Get trust details for potential recreation
             trust_info = self.ds.describe_trusts(TrustIds=[trust_id])
             if trust_info["Trusts"]:
+                # Delete only the one trust whose identity is the approved ID.
+                if (
+                    len(trust_info["Trusts"]) != 1
+                    or trust_info["Trusts"][0].get("TrustId") != trust_id
+                ):
+                    raise SafetyViolation(
+                        "Directory Service must return exactly the approved trust"
+                    )
                 self.trust_details = trust_info["Trusts"][0]
 
                 if not self.dry_run:
@@ -9638,7 +9869,11 @@ class FISTemplateExperiment(ChaosExperiment):
         self.fis_experiment_id: str | None = None
 
     def _validate_template(self, template: dict[str, Any]) -> list[str]:
-        """Validate target scope, role identity, and stop conditions."""
+        """Validate target scope, role identity, and stop conditions.
+
+        Plan and live modes apply the same structural guardrails; plan mode
+        skips only the live CloudWatch alarm-state read.
+        """
         violations: list[str] = []
         safety = self.safety_controller.config
         live = not self.dry_run
@@ -9653,10 +9888,10 @@ class FISTemplateExperiment(ChaosExperiment):
                 or not arn[len(prefix) :]
             ):
                 continue
+            if arn[len(prefix) :] not in safety.get("safety_alarms", []):
+                continue
             if not live:
                 has_alarm_stop = True
-                continue
-            if arn[len(prefix) :] not in safety.get("safety_alarms", []):
                 continue
             alarms = self.client("cloudwatch").describe_alarms(
                 AlarmNames=[arn[len(prefix) :]]
@@ -9669,27 +9904,24 @@ class FISTemplateExperiment(ChaosExperiment):
                 for alarm in candidates
             ):
                 has_alarm_stop = True
-        if live:
-            actions = template.get("actions", {})
-            if not actions:
-                violations.append("FIS template contains no reviewed actions")
-            for action in actions.values():
-                action_id = action.get("actionId")
-                parameters = action.get("parameters", {})
-                if action_id == "aws:ec2:reboot-instances":
-                    continue
-                duration = str(parameters.get("startInstancesAfterDuration", ""))
-                if action_id == "aws:ec2:stop-instances" and re.fullmatch(
-                    r"PT(?:[1-9]|[1-5][0-9])M", duration
-                ):
-                    continue
-                violations.append(
-                    f"FIS action {action_id!r} lacks reviewed automatic recovery; live execution is disabled"
-                )
-        if (
-            live
-            and not has_alarm_stop
-            and not safety.get("_runtime_allow_fis_without_stop_conditions", False)
+        actions = template.get("actions", {})
+        if not actions:
+            violations.append("FIS template contains no reviewed actions")
+        for action in actions.values():
+            action_id = action.get("actionId")
+            parameters = action.get("parameters", {})
+            if action_id == "aws:ec2:reboot-instances":
+                continue
+            duration = str(parameters.get("startInstancesAfterDuration", ""))
+            if action_id == "aws:ec2:stop-instances" and re.fullmatch(
+                r"PT(?:[1-9]|[1-5][0-9])M", duration
+            ):
+                continue
+            violations.append(
+                f"FIS action {action_id!r} lacks reviewed automatic recovery; live execution is disabled"
+            )
+        if not has_alarm_stop and not safety.get(
+            "_runtime_allow_fis_without_stop_conditions", False
         ):
             violations.append("FIS template has no CloudWatch alarm stop condition")
 
@@ -9744,7 +9976,7 @@ class FISTemplateExperiment(ChaosExperiment):
                     violations.append(
                         f"FIS target {target_name} has an invalid selection mode"
                     )
-                if live and not allow_unbounded and not explicitly_bounded:
+                if not allow_unbounded and not explicitly_bounded:
                     violations.append(
                         f"FIS target {target_name} uses unbounded selection mode {selection}"
                     )
@@ -9759,7 +9991,7 @@ class FISTemplateExperiment(ChaosExperiment):
                     f"FIS target {target_name} has an invalid selection mode"
                 )
 
-            if live and resource_arns:
+            if resource_arns:
                 missing = [arn for arn in resource_arns if arn not in allowlist]
                 if missing:
                     violations.append(
@@ -9776,13 +10008,13 @@ class FISTemplateExperiment(ChaosExperiment):
                     violations.append(
                         "Reviewed FIS actions require exact local EC2 instance ARNs"
                     )
-            elif live:
+            else:
                 violations.append(
                     "Live FIS recovery verification requires explicit instance ARNs"
                 )
 
             resource_tags = target.get("resourceTags", {})
-            if live and not resource_arns and required_tags:
+            if not resource_arns and required_tags:
                 missing_tags = {
                     str(k): str(v)
                     for k, v in required_tags.items()
