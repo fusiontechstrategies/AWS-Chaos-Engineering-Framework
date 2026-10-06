@@ -11,6 +11,7 @@ from test_aws_chaos_framework import (
     REGION,
     FakeAWS,
     action_configs,
+    fake_client_meta,
     make_experiment,
     make_orchestrator,
     prepare_lambda_memory,
@@ -278,7 +279,11 @@ def test_guardduty_active_old_finding_in_later_detector_and_page_blocks():
             else {"FindingIds": [], "NextToken": "later-finding-page"}
         )
 
-    client = SimpleNamespace(list_detectors=detectors, list_findings=findings)
+    client = SimpleNamespace(
+        list_detectors=detectors,
+        list_findings=findings,
+        meta=fake_client_meta("guardduty"),
+    )
     safety = f.SafetyController(
         {"fail_closed": True},
         SimpleNamespace(client=lambda *args, **kwargs: client),
@@ -321,7 +326,9 @@ def test_securityhub_notified_blocks_but_resolved_suppressed_archived_do_not(
             else {"Findings": []}
         )
 
-    client = SimpleNamespace(get_findings=findings)
+    client = SimpleNamespace(
+        get_findings=findings, meta=fake_client_meta("securityhub")
+    )
     safety = f.SafetyController(
         {"fail_closed": True},
         SimpleNamespace(client=lambda *args, **kwargs: client),
@@ -333,7 +340,8 @@ def test_securityhub_notified_blocks_but_resolved_suppressed_archived_do_not(
 
 def test_security_pages_cycle_fails_closed():
     client = SimpleNamespace(
-        get_findings=lambda **kwargs: {"Findings": [], "NextToken": "cycle"}
+        get_findings=lambda **kwargs: {"Findings": [], "NextToken": "cycle"},
+        meta=fake_client_meta("securityhub"),
     )
     safety = f.SafetyController(
         {"fail_closed": True},

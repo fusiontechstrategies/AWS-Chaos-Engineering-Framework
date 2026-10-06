@@ -23,6 +23,7 @@ from test_aws_chaos_framework import (
     FakeAWS,
     FakeSafetyController,
     action_configs,
+    fake_client_meta,
     make_experiment,
     make_orchestrator,
     planning_only_experiment,
@@ -232,7 +233,7 @@ def test_mutating_sdk_call_never_reaches_the_client_inside_admitted_dispatch(kin
     aws = FakeAWS(reject_writes=False)
     service, operation, request = WITHDRAWN[kind][2:]
     client = MagicMock(name=f"{service}-client")
-    client.meta.region_name = REGION
+    client.meta = fake_client_meta(service)
     aws.clients[service] = client
     owner = admitted_owner(aws)
     proxy = owner.client(service)

@@ -15,6 +15,7 @@ import copy
 import hashlib
 import inspect
 import ipaddress
+import itertools
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ import threading
 import time
 import unicodedata
 import uuid
+import weakref
 from collections.abc import Iterable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext
@@ -34,7 +36,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from functools import wraps
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -43,7 +45,10 @@ try:
     import boto3
     import yaml
     from botocore.config import Config as BotocoreConfig
-    from botocore.exceptions import ClientError
+    from botocore.endpoint_provider import EndpointProvider
+    from botocore.exceptions import ClientError, EndpointResolutionError
+    from botocore.loaders import Loader as BotocoreLoader
+    from botocore.session import Session as BotocoreSession
 except ImportError as exc:  # pragma: no cover - exercised by packaging smoke tests
     raise SystemExit(
         "Missing dependency. Install boto3, botocore, and PyYAML before running this tool."
@@ -1532,24 +1537,454 @@ def pin_session_credentials(
     different account than the one verified at live admission. Callers verify
     the identity of the returned session; it can then only expire, not change.
     The selected shared-config profile is kept, so its non-credential settings
-    (for example ca_bundle and use_fips_endpoint) still apply. Explicit session
-    credentials are static botocore Credentials cached on the session, so the
-    profile's provider chain is never consulted and nothing refreshes them.
+    (for example ca_bundle and use_fips_endpoint) still apply. Its routing does
+    not: the returned session is hardened by harden_session_origin, so every
+    client ignores configured endpoint URLs and refuses any request to a
+    non-canonical AWS host. The input session must already be hardened, since
+    resolving its credentials can create provider STS, SSO and SSO-OIDC clients.
+    Explicit session credentials are static botocore Credentials cached on the
+    session, so the profile's provider chain is never consulted and nothing
+    refreshes them.
     """
+    if _botocore_core(session) is not None and not is_origin_hardened(session):
+        raise SafetyViolation(
+            "Credentials must be resolved from an origin-hardened AWS session"
+        )
     credentials = session.get_credentials()
     frozen = credentials.get_frozen_credentials() if credentials else None
     if frozen is None or not frozen.access_key or not frozen.secret_key:
         raise SafetyViolation(
             "Could not verify the active AWS identity: no credentials resolved"
         )
-    return boto3.Session(
-        aws_access_key_id=frozen.access_key,
-        aws_secret_access_key=frozen.secret_key,
-        aws_session_token=frozen.token,
-        aws_account_id=getattr(frozen, "account_id", None),
-        region_name=region,
-        profile_name=profile_name,
+    return harden_session_origin(
+        boto3.Session(
+            aws_access_key_id=frozen.access_key,
+            aws_secret_access_key=frozen.secret_key,
+            aws_session_token=frozen.token,
+            aws_account_id=getattr(frozen, "account_id", None),
+            region_name=region,
+            profile_name=profile_name,
+        )
     )
+
+
+# Ruleset switches that only choose between two AWS-designated hosts (a legacy
+# global STS or S3 endpoint versus the regional one). Both choices are admitted,
+# so a profile's legacy setting keeps working; every other ruleset input stays at
+# botocore's bundled default, and each request must match one admitted host.
+TOLERATED_ENDPOINT_SWITCHES = frozenset(
+    {"AWS::STS::UseGlobalEndpoint", "AWS::S3::UseGlobalEndpoint"}
+)
+_CANONICAL_ENDPOINTS: dict[
+    tuple[str, str, bool], tuple[frozenset[str], frozenset[str]]
+] = {}
+_CANONICAL_ENDPOINTS_LOCK = threading.Lock()
+# AWS-owned parent domains outside a partition's dnsSuffix, reviewed per
+# (service, partition). Among every service the framework or botocore's
+# credential providers can create, only AWS Sign-In (the login provider's
+# token refresh client) has packaged rules that emit hosts outside the
+# partition dnsSuffix, and only these exact domains in the partitions whose
+# regions the framework admits. The regression tests enumerate the packaged
+# rules for every reachable service and region and require this table to equal
+# what they emit; a dual-stack suffix is never admitted because dual-stack is
+# pinned off.
+REVIEWED_SERVICE_DOMAINS: dict[tuple[str, str], frozenset[str]] = {
+    ("signin", "aws"): frozenset({"signin.aws.amazon.com"}),
+    ("signin", "aws-cn"): frozenset({"signin.amazonaws.cn"}),
+    ("signin", "aws-us-gov"): frozenset(
+        {"signin.amazonaws-us-gov.com", "signin-fips.amazonaws-us-gov.com"}
+    ),
+}
+
+
+def is_under_domains(host: str, domains: frozenset[str]) -> bool:
+    """True when host is one of domains or a name below one of them."""
+    return any(host == domain or host.endswith("." + domain) for domain in domains)
+
+
+@lru_cache(maxsize=1)
+def _bundled_endpoint_loader() -> Any:
+    """Read only botocore's packaged data, never ~/.aws/models or AWS_DATA_PATH.
+
+    A customer data path can replace endpoints.json or a service endpoint ruleset
+    and so redirect requests without any endpoint_url setting. The packaged data
+    is immutable, so one loader (and its parsed-file cache) is shared.
+    """
+    return BotocoreLoader(
+        extra_search_paths=[BotocoreLoader.BUILTIN_DATA_PATH],
+        include_default_search_paths=False,
+    )
+
+
+def _resolve_bundled_endpoint(provider: Any, parameters: dict[str, Any]) -> Any:
+    """Return one ruleset URL, or None for a switch combination it refuses."""
+    try:
+        return provider.resolve_endpoint(**parameters).url
+    except EndpointResolutionError:
+        return None
+
+
+def canonical_endpoint_origin(
+    service: str, region: str, use_fips: bool
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Return the approved AWS parent domains and canonical hosts for a client.
+
+    Hosts come from botocore's bundled partition data and the service's bundled
+    endpoint ruleset, evaluated with no custom endpoint, no dual-stack and exactly
+    the approved FIPS choice. The parent domains are the partition's packaged
+    dnsSuffix plus any reviewed per-service domain (REVIEWED_SERVICE_DOMAINS).
+    An unknown service, a region that no bundled partition lists explicitly, or
+    a host outside those parent domains fails closed.
+    """
+    key = (service, region, bool(use_fips))
+    with _CANONICAL_ENDPOINTS_LOCK:
+        cached = _CANONICAL_ENDPOINTS.get(key)
+        if cached is not None:
+            return cached
+        if not isinstance(region, str) or not REGION_PATTERN.fullmatch(region):
+            raise SafetyViolation("AWS SDK client region is not a reviewed region")
+        loader = _bundled_endpoint_loader()
+        try:
+            partitions = loader.load_data("partitions")
+            ruleset = loader.load_service_model(service, "endpoint-rule-set-1")
+        except Exception as exc:
+            raise SafetyViolation(
+                f"No bundled AWS endpoint rules for service {service}"
+            ) from exc
+        partition = next(
+            (
+                item
+                for item in partitions.get("partitions", [])
+                if region in item.get("regions", {})
+            ),
+            None,
+        )
+        if partition is None:
+            raise SafetyViolation(f"AWS region is not in a known partition: {region}")
+        parents = frozenset(
+            {str(partition["outputs"]["dnsSuffix"])}
+        ) | REVIEWED_SERVICE_DOMAINS.get((service, str(partition["id"])), frozenset())
+        builtins = {
+            name: spec.get("builtIn")
+            for name, spec in ruleset.get("parameters", {}).items()
+        }
+        fixed: dict[str, Any] = {}
+        for name, builtin in builtins.items():
+            if builtin == "AWS::Region":
+                fixed[name] = region
+            elif builtin == "AWS::UseFIPS":
+                fixed[name] = bool(use_fips)
+            elif builtin == "AWS::UseDualStack":
+                fixed[name] = False
+            elif builtin == "AWS::Auth::AccountIdEndpointMode":
+                # Clients pin account-based routing off (endpoint_origin_config),
+                # so no credential account ID ever selects the request host.
+                fixed[name] = "disabled"
+        if "AWS::Region" not in builtins.values() or (
+            use_fips and "AWS::UseFIPS" not in builtins.values()
+        ):
+            raise SafetyViolation(
+                f"Bundled endpoint rules cannot bind {service} to the approved origin"
+            )
+        switches = sorted(
+            name
+            for name, builtin in builtins.items()
+            if builtin in TOLERATED_ENDPOINT_SWITCHES
+        )
+        provider = EndpointProvider(ruleset, partitions)
+        hosts = set()
+        for choice in itertools.product((False, True), repeat=len(switches)):
+            url = _resolve_bundled_endpoint(
+                provider, {**fixed, **dict(zip(switches, choice, strict=True))}
+            )
+            if url is None:
+                continue
+            parts = urlsplit(url)
+            host = parts.hostname or ""
+            if (
+                parts.scheme != "https"
+                or parts.netloc != host
+                or parts.path not in {"", "/"}
+                or parts.query
+                or not is_under_domains(host, parents)
+            ):
+                raise SafetyViolation(
+                    "Bundled endpoint rules produced a non-canonical AWS origin"
+                )
+            hosts.add(host)
+        if not hosts:
+            raise SafetyViolation(
+                f"No canonical AWS endpoint for {service} in {region}"
+                + (" with FIPS" if use_fips else "")
+            )
+        result = (parents, frozenset(hosts))
+        _CANONICAL_ENDPOINTS[key] = result
+        return result
+
+
+def configured_fips_endpoint(session: Any) -> bool:
+    """Return the selected profile or environment FIPS endpoint choice.
+
+    FIPS selects an approved variant of the canonical origin, never another
+    owner. The choice is pinned in each client's config, so the client and its
+    canonical host set are always derived from the same value.
+    """
+    core = getattr(session, "_session", None)
+    getter = getattr(core, "get_config_variable", None)
+    return bool(callable(getter) and getter("use_fips_endpoint") is True)
+
+
+def endpoint_origin_config(use_fips: bool) -> Any:
+    """Client settings that keep routing on botocore's canonical rules.
+
+    Account-ID-based endpoints are disabled: role, SSO and pinned credentials
+    carry an account ID, and botocore's default ``preferred`` mode would then
+    select account-qualified hosts (for example Kinesis control endpoints)
+    that the canonical host set deliberately does not contain.
+    """
+    return BotocoreConfig(
+        ignore_configured_endpoint_urls=True,
+        use_fips_endpoint=bool(use_fips),
+        use_dualstack_endpoint=False,
+        account_id_endpoint_mode="disabled",
+        s3={"use_accelerate_endpoint": False, "use_dualstack_endpoint": False},
+    )
+
+
+def is_canonical_request_url(service: str, url: Any, hosts: frozenset[str]) -> bool:
+    """Accept only HTTPS on the default port to one canonical AWS host."""
+    parts = urlsplit(str(url))
+    host = parts.hostname or ""
+    if parts.scheme != "https" or parts.netloc.lower() != host:
+        return False
+    if host in hosts:
+        return True
+    # S3 virtual-hosted requests put the bucket in a label below the canonical
+    # S3 host; every name below an AWS service host is AWS-operated.
+    return service == "s3" and any(host.endswith("." + item) for item in hosts)
+
+
+def host_header_matches_url(url: Any, headers: Any) -> bool:
+    """An explicit HTTP Host header must name exactly the request URL authority.
+
+    Botocore normally derives Host from the URL, but endpoint rules and
+    handlers can add one, and SigV4 signs an existing Host header unchanged.
+    """
+    authority = urlsplit(str(url)).netloc.lower()
+    items = headers.items() if callable(getattr(headers, "items", None)) else ()
+    for name, value in items:
+        if str(name).lower() != "host":
+            continue
+        text = value.decode("ascii", "replace") if isinstance(value, bytes) else value
+        if not isinstance(text, str) or text.strip().lower() != authority:
+            return False
+    return True
+
+
+def bind_endpoint_origin(
+    client: Any, service: str, parents: frozenset[str], hosts: frozenset[str]
+) -> None:
+    """Refuse a non-AWS client endpoint now and any non-canonical request later.
+
+    meta.endpoint_url is botocore's descriptive endpoint; with endpoint rulesets
+    the request URL is resolved per call. The descriptive value must stay in
+    the approved parent domains (the partition's dnsSuffix plus any reviewed
+    per-service domain), and every request, including retries, is checked
+    exactly by a ``before-send`` handler: the URL must reach one canonical host
+    and any explicit Host header must name that same authority.
+
+    Scope of the guarantee: the handler is registered first among this client's
+    generic ``before-send`` handlers. Botocore runs service- and
+    operation-specific ``before-send.<service>.<operation>`` handlers before it,
+    so their changes are checked; a handler registered later in the same process
+    could still alter the request after the check. Arbitrary in-process hooks
+    are trusted code and outside this boundary.
+    """
+    meta = getattr(client, "meta", None)
+    endpoint = getattr(meta, "endpoint_url", None)
+    parts = urlsplit(endpoint) if isinstance(endpoint, str) else None
+    host = (parts.hostname or "") if parts is not None else ""
+    if (
+        parts is None
+        or parts.scheme != "https"
+        or parts.netloc.lower() != host
+        or parts.path not in {"", "/"}
+        or parts.query
+        or not is_under_domains(host, parents)
+    ):
+        raise SafetyViolation(
+            f"AWS SDK {service} endpoint is not a canonical AWS origin"
+        )
+    events = getattr(meta, "events", None)
+    if not callable(getattr(events, "register_first", None)):
+        raise SafetyViolation(
+            f"AWS SDK {service} client cannot bind its request origin"
+        )
+
+    def require_canonical_origin(request: Any, **_kwargs: Any) -> None:
+        url = getattr(request, "url", "")
+        if not is_canonical_request_url(service, url, hosts):
+            raise SafetyViolation(
+                f"AWS SDK {service} request was routed to a non-canonical endpoint"
+            )
+        if not host_header_matches_url(url, getattr(request, "headers", None)):
+            raise SafetyViolation(
+                f"AWS SDK {service} request Host header differs from its endpoint"
+            )
+
+    events.register_first("before-send", require_canonical_origin)
+
+
+def origin_bound_client(session: Any, service: str, region: str, config: Any) -> Any:
+    """Create the only kind of SDK client the framework uses.
+
+    Configured endpoint URLs (profile endpoint_url, services sections,
+    AWS_ENDPOINT_URL and AWS_ENDPOINT_URL_<SERVICE>) are ignored, and the
+    client is bound to botocore's canonical host for its partition, service,
+    region and approved FIPS choice. Identity and ownership responses therefore
+    come only from AWS; response-owner checks remain as defence in depth.
+    """
+    use_fips = configured_fips_endpoint(session)
+    parents, hosts = canonical_endpoint_origin(service, region, use_fips)
+    client = session.client(
+        service,
+        region_name=region,
+        config=config.merge(endpoint_origin_config(use_fips)),
+    )
+    bind_endpoint_origin(client, service, parents, hosts)
+    return client
+
+
+# Session-wide settings that keep every nested client on canonical routing.
+SESSION_ORIGIN_SETTINGS = (
+    ("ignore_configured_endpoint_urls", True),
+    ("use_dualstack_endpoint", False),
+    ("account_id_endpoint_mode", "disabled"),
+)
+
+
+def _botocore_core(session: Any) -> Any:
+    core = getattr(session, "_session", None)
+    return core if isinstance(core, BotocoreSession) else None
+
+
+_HARDENED_CORES: weakref.WeakSet[Any] = weakref.WeakSet()
+
+
+def is_origin_hardened(session: Any) -> bool:
+    core = _botocore_core(session)
+    return core is not None and core in _HARDENED_CORES
+
+
+def harden_session_origin(session: Any) -> Any:
+    """Bind every client a botocore session creates, including credential providers.
+
+    Botocore's credential chain creates its own clients from the session that
+    resolves credentials: assume-role and web-identity STS through
+    ``create_nested_client`` (credentials.py ``_get_client_creator``), SSO and
+    login through ``session.create_client`` captured when the lazily built
+    resolver is first used, and SSO-OIDC token refresh through
+    ``create_nested_client`` (tokens.py). Each path calls the session's
+    ``create_client`` attribute, so it is replaced on this session instance
+    before any credential or token is resolved. Every client, nested or not,
+    then gets ``endpoint_origin_config`` and ``bind_endpoint_origin`` for its
+    actual service and region (explicit ``region_name``, else the config's
+    ``region_name``, else the session region, as botocore resolves it), and an
+    explicit ``endpoint_url`` is refused. The same settings are also set
+    session-wide as defence in depth. A session object without a botocore core
+    has no provider chain; its clients are still bound by origin_bound_client.
+    """
+    core = _botocore_core(session)
+    if core is None or is_origin_hardened(session):
+        return session
+    use_fips = configured_fips_endpoint(session)
+    for name, value in (*SESSION_ORIGIN_SETTINGS, ("use_fips_endpoint", use_fips)):
+        core.set_config_variable(name, value)
+    original = core.create_client
+
+    def create_client(service_name: str, *args: Any, **kwargs: Any) -> Any:
+        if args:
+            raise SafetyViolation("AWS SDK clients require keyword creation options")
+        if kwargs.get("endpoint_url") is not None:
+            raise SafetyViolation("AWS SDK clients must not set an explicit endpoint")
+        config = kwargs.get("config")
+        region = (
+            kwargs.get("region_name")
+            or getattr(config, "region_name", None)
+            or core.get_config_variable("region")
+        )
+        parents, hosts = canonical_endpoint_origin(service_name, region, use_fips)
+        origin = endpoint_origin_config(use_fips)
+        kwargs["region_name"] = region
+        kwargs["config"] = origin if config is None else config.merge(origin)
+        client = original(service_name, **kwargs)
+        bind_endpoint_origin(client, service_name, parents, hosts)
+        return client
+
+    core.create_client = create_client
+    _HARDENED_CORES.add(core)
+    return session
+
+
+# Credential transports outside the AWS SDK client stack. Only botocore's
+# default IMDS addresses and the documented ECS/EKS container credential
+# addresses (or loopback, which botocore itself admits for plain HTTP) are used.
+DEFAULT_IMDS_ENDPOINTS = frozenset({"http://169.254.169.254", "http://[fd00:ec2::254]"})
+CONTAINER_CREDENTIAL_HOSTS = frozenset(
+    {"169.254.170.2", "169.254.170.23", "fd00:ec2::23"}
+)
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def require_credential_transport_policy(session: Any) -> None:
+    """Refuse configured IMDS or container credential addresses in live mode.
+
+    These providers use their own plain HTTP transports, not SDK clients, so
+    they cannot be canonical-origin bound. A configured IMDS endpoint
+    (``AWS_EC2_METADATA_SERVICE_ENDPOINT`` or the profile setting) must be the
+    default IPv4 or IPv6 address, and the container credential URL (the
+    relative URI joined to 169.254.170.2, or the full URI) must use HTTP(S)
+    without userinfo to 169.254.170.2, 169.254.170.23, fd00:ec2::23 or a
+    loopback address. Botocore itself admits any HTTPS host for a full URI.
+    """
+    core = _botocore_core(session)
+    endpoint = (
+        core.get_config_variable("ec2_metadata_service_endpoint") if core else None
+    )
+    if endpoint is not None and str(endpoint).rstrip("/") not in DEFAULT_IMDS_ENDPOINTS:
+        raise SafetyViolation(
+            "Live runs refuse a non-default EC2 instance metadata endpoint"
+        )
+    relative = os.environ.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+    full = os.environ.get("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+    if relative is None and full is None:
+        return
+    url = "http://169.254.170.2" + relative if relative is not None else str(full)
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    try:
+        valid_port = parts.port is None or parts.port > 0
+    except ValueError:
+        valid_port = False
+    if (
+        not valid_port
+        or parts.scheme not in {"http", "https"}
+        or parts.username is not None
+        or parts.password is not None
+        or not (host in CONTAINER_CREDENTIAL_HOSTS or _is_loopback_host(host))
+    ):
+        raise SafetyViolation(
+            "Live runs refuse a container credential URL outside the documented "
+            "link-local and loopback addresses"
+        )
 
 
 def canonical_caller_principal(caller_arn: str | None) -> str | None:
@@ -1871,6 +2306,8 @@ class AwsClientProxy:
                 )
             # Direct library calls receive the same account/region boundary as
             # the CLI, including recovery requests. Nested request ARNs are data.
+            # Endpoint origin is bound when the raw client is built: every
+            # request it sends must reach a canonical AWS host.
             client_region = getattr(
                 getattr(self._client, "meta", None), "region_name", None
             )
@@ -2049,15 +2486,13 @@ class SafetyController:
         owner: ChaosExperiment | None = None,
         region_name: str | None = None,
     ) -> AwsClientProxy:
-        """Return a cached SDK client wrapped with mutation tracking."""
+        """Return a cached, origin-bound SDK client wrapped with mutation tracking."""
         client_region = region_name or self.region
         key = (service, client_region)
         with self._client_lock:
             if key not in self._clients:
-                self._clients[key] = self.session.client(
-                    service,
-                    region_name=client_region,
-                    config=self._sdk_config,
+                self._clients[key] = origin_bound_client(
+                    self.session, service, client_region, self._sdk_config
                 )
                 if service == "s3":
                     bind_s3_signing_region(self._clients[key])
@@ -10211,7 +10646,14 @@ class ChaosOrchestrator:
                 raise ConfigurationError(
                     "Role assumption requires a configured account ID"
                 )
-        session = boto3.Session(profile_name=profile, region_name=self.region)
+        # Harden before anything can resolve credentials or tokens: the profile's
+        # provider chain (assume-role, web identity, SSO, SSO-OIDC) creates its
+        # own SDK clients from this session.
+        session = harden_session_origin(
+            boto3.Session(profile_name=profile, region_name=self.region)
+        )
+        if self.live:
+            require_credential_transport_policy(session)
         self.approval_scope = {
             "profile": profile,
             "role_arn": requested_role,
@@ -10219,10 +10661,13 @@ class ChaosOrchestrator:
             "seed": seed,
         }
         if requested_role:
-            sts = session.client(
+            # The pre-role STS client is origin-bound like every later client:
+            # neither the role request nor its ExternalId leaves canonical AWS.
+            sts = origin_bound_client(
+                session,
                 "sts",
-                region_name=self.region,
-                config=BotocoreConfig(
+                self.region,
+                BotocoreConfig(
                     retries={"max_attempts": 3, "mode": "standard"},
                     user_agent_extra=f"aws-chaos-framework/{__version__}",
                 ),
@@ -10235,11 +10680,13 @@ class ChaosOrchestrator:
             if external_id:
                 assume_args["ExternalId"] = str(external_id)
             assumed = sts.assume_role(**assume_args)["Credentials"]
-            session = boto3.Session(
-                aws_access_key_id=assumed["AccessKeyId"],
-                aws_secret_access_key=assumed["SecretAccessKey"],
-                aws_session_token=assumed["SessionToken"],
-                region_name=self.region,
+            session = harden_session_origin(
+                boto3.Session(
+                    aws_access_key_id=assumed["AccessKeyId"],
+                    aws_secret_access_key=assumed["SecretAccessKey"],
+                    aws_session_token=assumed["SessionToken"],
+                    region_name=self.region,
+                )
             )
         if self.live:
             # Pin before the STS check, so every live client signs with exactly

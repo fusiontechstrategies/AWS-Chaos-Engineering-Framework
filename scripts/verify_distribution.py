@@ -88,6 +88,7 @@ APPROVED_SOURCE_PATHS = frozenset(
         "tests/test_archive_security.py",
         "tests/test_aws_chaos_framework.py",
         "tests/test_final_cloud_c11_planning_only.py",
+        "tests/test_final_cloud_c13_regressions.py",
         "tests/test_final_cloud_eight_recovery_controls.py",
         "tests/test_final_cloud_eight_scope_controls.py",
         "tests/test_final_cloud_six_controls.py",
@@ -211,6 +212,86 @@ def _normal_text(value: bytes) -> str:
     return value.decode("utf-8").replace("\r\n", "\n").replace("\r", "")
 
 
+def _pinned_backend_version(name: str) -> str:
+    """Return the exact version of a build requirement the verifier pins."""
+    for requirement in APPROVED_BUILD_SYSTEM["requires"]:
+        package, separator, version = requirement.partition("==")
+        if package == name and separator and re.fullmatch(r"[0-9.]+", version):
+            return version
+    raise ValueError(f"trusted build policy does not pin {name}")
+
+
+def _expected_package_metadata(project: dict, repository_root: Path) -> str:
+    """Derive the exact core metadata the pinned setuptools backend writes.
+
+    One routine serves the sdist PKG-INFO files and the wheel METADATA, so no
+    candidate-authored header, ordering or description byte is admitted.
+    """
+    fields = [
+        ("Metadata-Version", "2.4"),
+        ("Name", PROJECT_NAME),
+        ("Version", project["version"]),
+        ("Summary", project["description"]),
+        ("Author", ", ".join(author["name"] for author in project["authors"])),
+        ("License-Expression", project["license"]),
+        *(("Project-URL", f"{key}, {url}") for key, url in project["urls"].items()),
+        *(("Classifier", classifier) for classifier in project["classifiers"]),
+        ("Requires-Python", "<3.15,>=3.10"),
+        ("Description-Content-Type", "text/markdown"),
+        ("License-File", "LICENSE"),
+        *(("Requires-Dist", requirement) for requirement in project["dependencies"]),
+        ("Dynamic", "license-file"),
+    ]
+    readme = _normal_text(source_files.read_bytes(repository_root, "README.md"))
+    if not readme.endswith("\n"):
+        readme += "\n"
+    return "".join(f"{name}: {value}\n" for name, value in fields) + "\n" + readme
+
+
+def _expected_entry_points(project: dict) -> str:
+    return "[console_scripts]\n" + "".join(
+        f"{name} = {target}\n" for name, target in project["scripts"].items()
+    )
+
+
+def _expected_wheel_metadata(project: dict, repository_root: Path) -> dict[str, bytes]:
+    """Every wheel metadata member, derived from source and the pinned backend.
+
+    The candidate RECORD proves only self-consistency, never origin, so each
+    admitted dist-info member is compared byte for byte with these values.
+    """
+    return {
+        "METADATA": _expected_package_metadata(project, repository_root).encode(
+            "utf-8"
+        ),
+        "WHEEL": (
+            "Wheel-Version: 1.0\n"
+            f"Generator: setuptools ({_pinned_backend_version('setuptools')})\n"
+            "Root-Is-Purelib: true\n"
+            "Tag: py3-none-any\n\n"
+        ).encode("ascii"),
+        "entry_points.txt": _expected_entry_points(project).encode("utf-8"),
+        "top_level.txt": (MODULE_NAME.removesuffix(".py") + "\n").encode("ascii"),
+        "licenses/LICENSE": source_files.read_bytes(repository_root, "LICENSE"),
+    }
+
+
+def _expected_record(values: dict[str, bytes], record_name: str) -> bytes:
+    """The canonical sorted RECORD that normalize_wheel writes for these bytes."""
+    lines = []
+    for name in sorted(values):
+        if name == record_name:
+            lines.append(f"{name},,\n")
+            continue
+        digest = (
+            base64.urlsafe_b64encode(hashlib.sha256(values[name]).digest())
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+        lines.append(f"{name},sha256={digest},{len(values[name])}\n")
+    return "".join(lines).encode("utf-8")
+
+
 def _verify_package_metadata(
     value: bytes, project: dict, repository_root: Path
 ) -> None:
@@ -238,6 +319,10 @@ def _verify_package_metadata(
     readme = _normal_text(source_files.read_bytes(repository_root, "README.md"))
     if message.get_payload().rstrip("\n") != readme.rstrip("\n"):
         raise ValueError("generated package description differs from static README")
+    if _normal_text(value) != _expected_package_metadata(project, repository_root):
+        raise ValueError(
+            "generated package metadata is not the exact source-derived metadata"
+        )
     if set(project["dependencies"]) != _runtime_requirements(
         repository_root / "requirements.txt"
     ):
@@ -330,7 +415,7 @@ def validate_entry_points(entry_points: str, repository_root: Path) -> None:
 
 
 def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None:
-    _approved_project(repository_root)
+    project = _approved_project(repository_root)
     with archive_budget.open_zip(wheel_path) as archive:
         names = archive.namelist()
         _assert_safe_names(names)
@@ -410,6 +495,20 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
         entry_points = values[entry_point_names[0]].decode("utf-8")
         validate_entry_points(entry_points, repository_root)
 
+        # Protected promotion attests this wheel unchanged, so every admitted
+        # member must be source-bound here: the runtime module above, and each
+        # metadata member and the RECORD below, byte for byte.
+        _verify_package_metadata(values[info + "METADATA"], project, repository_root)
+        for name, expected in _expected_wheel_metadata(
+            project, repository_root
+        ).items():
+            if values[info + name] != expected:
+                raise ValueError(
+                    f"wheel {name} differs from the source-derived trusted value"
+                )
+        if values[info + "RECORD"] != _expected_record(values, info + "RECORD"):
+            raise ValueError("wheel RECORD is not the canonical source-derived RECORD")
+
 
 def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
     project = _approved_project(repository_root)
@@ -475,13 +574,19 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
     _assert_safe_names(names)
     if set(values) != expected_files:
         raise ValueError("source distribution is missing canonical source or metadata")
+    # Protected preparation copies the sdist unchanged, so generated members
+    # are compared as raw bytes; line-ending variants are never equivalent.
+    expected_metadata = _expected_package_metadata(project, repository_root).encode(
+        "utf-8"
+    )
     for name in ("PKG-INFO", EGG_INFO + "PKG-INFO"):
         _verify_package_metadata(values[name], project, repository_root)
+        if values[name] != expected_metadata:
+            raise ValueError(f"generated package metadata bytes are not exact: {name}")
     expected_generated = {
         "setup.cfg": "[egg_info]\ntag_build = \ntag_date = 0\n\n",
         EGG_INFO + "dependency_links.txt": "\n",
-        EGG_INFO
-        + "entry_points.txt": "[console_scripts]\naws-chaos-framework = aws_chaos_framework:main\n",
+        EGG_INFO + "entry_points.txt": _expected_entry_points(project),
         EGG_INFO + "requires.txt": "".join(
             requirement + "\n" for requirement in project["dependencies"]
         ),
@@ -494,7 +599,7 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
         sorted(listed, key=lambda item: ("/" in item, item))
     )
     for name, expected in expected_generated.items():
-        if _normal_text(values[name]) != expected:
+        if values[name] != expected.encode("utf-8"):
             raise ValueError(f"unreviewed generated source metadata: {name}")
 
 

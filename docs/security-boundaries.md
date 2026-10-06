@@ -448,6 +448,27 @@ RECORD leaves its own hash/size empty. Unknown, duplicate, unsafe or missing row
 and missing metadata fail closed. Expanded wheel members also have per-member
 and aggregate byte budgets before their contents are retained.
 
+A self-consistent RECORD proves only that the candidate agrees with itself, not
+that its bytes came from reviewed source. Because protected promotion copies and
+attests the candidate wheel unchanged, the verifier source-binds every admitted
+member byte for byte before `prepare_release.py` accepts it: the runtime module
+must equal the repository file; `METADATA` must equal the core metadata derived
+from static `pyproject.toml` and `README.md` (the field-level comparison still
+runs, and the same routine derives the sdist `PKG-INFO` files); `WHEEL` must name
+exactly the setuptools version pinned by the trusted build policy, a purelib
+root and the single `py3-none-any` tag; `top_level.txt`, `entry_points.txt` and
+`licenses/LICENSE` must equal their source-derived values or the repository
+`LICENSE` bytes; and RECORD must be the canonical sorted manifest that
+`normalize_wheel.py` writes for those bytes. Any other header, field, ordering or
+license byte fails closed even when RECORD was recomputed. Changing the pinned
+backend or the metadata layout therefore requires a trusted verifier review.
+
+The sdist is also copied unchanged, so its generated members (both `PKG-INFO`
+files, `setup.cfg`, `SOURCES.txt`, `requires.txt`, `entry_points.txt`,
+`top_level.txt` and `dependency_links.txt`) are compared as raw bytes with their
+source-derived values, not after line-ending normalization. A carriage-return
+variant that a parser might read differently is refused.
+
 
 ## Live credential and response identity
 
@@ -456,7 +477,8 @@ before the STS identity check, so every later client signs as the verified
 account, partition and principal. The pinned session keeps the selected
 `--profile` (or ambient profile), so its non-credential shared configuration,
 such as `ca_bundle` and `use_fips_endpoint`, still applies; only the credential
-source is replaced by the explicit static snapshot. A refreshable profile cannot rotate to
+source is replaced by the explicit static snapshot. Endpoint routing is not
+inherited: see the next section. A refreshable profile cannot rotate to
 another identity mid-run; the snapshot can only expire, which fails closed, so
 temporary credentials must outlive the run. Name-only Kinesis reads must also
 return a `StreamARN` with the reviewed partition, region, account and resource
@@ -464,6 +486,123 @@ name before a live stream retention decrease. The equivalent `DBInstanceArn` and
 `DBClusterArn` checks remain in the live branches of the planning-only RDS
 reboot, failover and retention handlers; dry-run plans skip them, so a plan does
 not establish them.
+
+## Canonical AWS endpoint origin
+
+The STS answer is the account decision, so it is trusted only from AWS. Every
+SDK client involved in a run, in live and plan mode, is origin-bound:
+
+- Framework clients come from one factory (`origin_bound_client`): the pre-role
+  STS client used for `AssumeRole` and its ExternalId, the pinned STS client
+  used for live admission, and every service client, including ones first
+  created after admission.
+- Credential-provider clients are bound too. Botocore's credential chain
+  creates its own clients from the session that resolves credentials:
+  assume-role and web-identity STS, the SSO `GetRoleCredentials` client that
+  carries the bearer token, the SSO-OIDC token-refresh client and the login
+  client. All of them call that session's `create_client`, so the framework
+  replaces it on each session instance (`harden_session_origin`) immediately
+  after constructing the session and before any credential or token is
+  resolved. Each nested client then receives the same settings and request
+  check for its actual service and region (explicit `region_name`, else its
+  config's `region_name`, else the session region, as botocore resolves it);
+  an explicit `endpoint_url` is refused. The settings below are also set
+  session-wide. Credentials are frozen only from a hardened session.
+- Configured endpoint URLs are ignored (`ignore_configured_endpoint_urls`):
+  profile `endpoint_url`, `services` sections, `AWS_ENDPOINT_URL` and
+  `AWS_ENDPOINT_URL_<SERVICE>`. Dual-stack, S3 accelerate and S3 dual-stack are
+  pinned off. Account-ID-based endpoints are disabled
+  (`account_id_endpoint_mode = disabled`): role, SSO and pinned credentials
+  carry an account ID, and botocore's default `preferred` mode would otherwise
+  send, for example, Kinesis control calls to account-qualified hosts. The
+  profile or environment `use_fips_endpoint` choice is read once per session
+  and pinned in each client's configuration.
+- Canonical hosts are derived, not hand-listed. The framework reads only
+  botocore's packaged data (never `~/.aws/models` or `AWS_DATA_PATH`, which can
+  replace endpoint rules without any `endpoint_url`). The region must be listed
+  explicitly by a bundled partition (`aws`, `aws-us-gov` and `aws-cn` are the
+  partitions the region syntax admits), and the service's bundled endpoint
+  ruleset is evaluated with that region, no custom endpoint, no dual-stack,
+  account endpoints disabled and exactly the approved FIPS choice. Both answers
+  of the legacy global-endpoint switches for STS and S3 are admitted. Every host
+  must lie under an approved parent domain: the partition's packaged
+  `dnsSuffix`, plus a reviewed per-service, per-partition domain where the
+  packaged rules use one. An unknown region, partition or service, or a FIPS
+  request a ruleset cannot satisfy, fails closed when the client is built.
+- Reviewed parent domains (`REVIEWED_SERVICE_DOMAINS`). An enumeration of the
+  packaged rules for all 434 services with endpoint rules, every packaged region
+  and both FIPS choices (dual-stack off, account endpoints disabled) found 396
+  service/partition families with hosts outside the partition `dnsSuffix`,
+  mostly `api.aws` names. Among the services the framework or a credential
+  provider can create, only AWS Sign-In, the login provider's token-refresh
+  client, is one of them. Its exact parent domains are admitted for Sign-In
+  only: `signin.aws.amazon.com` (`aws`), `signin.amazonaws.cn` (`aws-cn`) and
+  `signin.amazonaws-us-gov.com` and `signin-fips.amazonaws-us-gov.com`
+  (`aws-us-gov`). Sign-In parents for partitions whose regions the framework
+  refuses are not admitted, and no broad Amazon or dual-stack suffix is. The
+  request check stays exact, so for example only
+  `us-east-1.signin.aws.amazon.com` is reachable from `us-east-1`. A regression
+  test re-enumerates the packaged rules for every reachable service and requires
+  the table to equal exactly what they emit; the other families belong to
+  services the framework never creates and fail closed if one ever were.
+- FIPS is an approved variant, not a different owner: with FIPS selected only
+  the canonical FIPS hosts are accepted (for example
+  `sts-fips.us-east-1.amazonaws.com`, or the GovCloud regional hosts the
+  ruleset designates), and without it a FIPS host is refused.
+- The client's descriptive `meta.endpoint_url` must be HTTPS on the default
+  port, without credentials or path, under the same approved parent domains
+  for that service and partition. With
+  endpoint rulesets the request URL is resolved per call, so the binding check
+  is a `before-send` handler: every request, including retries, must be HTTPS
+  on the default port to exactly one canonical host (S3 also admits a bucket
+  label below its canonical host), and any explicit `Host` header must name
+  that same authority. An AWS-domain host that customers control, such as an
+  API Gateway `execute-api` name, is refused. A refused request is never sent,
+  so a forged identity or ownership answer can never be received.
+- Scope of the request check: the handler is registered first among the
+  client's generic `before-send` handlers, and botocore runs service- and
+  operation-specific `before-send.<service>.<operation>` handlers before it, so
+  their changes are checked. A handler registered later in the same Python
+  process could still change a request after the check. Arbitrary in-process
+  hooks are trusted code and outside this boundary; the framework registers
+  none that alter requests.
+
+### Credential transports outside the SDK client stack
+
+The EC2 instance metadata (IMDS) and container credential providers use their
+own plain HTTP transports, so they cannot be canonical-origin bound. Live runs
+apply an explicit address policy before any credential is resolved:
+
+- A configured IMDS endpoint (`AWS_EC2_METADATA_SERVICE_ENDPOINT` or the
+  profile `ec2_metadata_service_endpoint`) is admitted only when it is
+  botocore's default, `http://169.254.169.254` or `http://[fd00:ec2::254]`
+  (a trailing slash is tolerated; no port, path or other host is).
+  Selecting IPv6 with `ec2_metadata_service_endpoint_mode` remains allowed.
+- The container credential URL (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` joined
+  to `169.254.170.2`, or `AWS_CONTAINER_CREDENTIALS_FULL_URI`) must use HTTP or
+  HTTPS without user information, a valid port, and one of the documented
+  ECS/EKS link-local hosts `169.254.170.2`, `169.254.170.23` and
+  `fd00:ec2::23`, or a loopback address. Botocore itself admits loopback for
+  plain HTTP and any host for HTTPS; the framework refuses the latter.
+- Any other value fails live initialization before a credential request. Plan
+  mode does not apply this policy; it neither mutates nor trusts the identity.
+
+These transports are unauthenticated plain HTTP on the instance or task. An
+environment that can intercept link-local traffic can still supply arbitrary
+credentials; the canonical STS check then reports the account those
+credentials actually belong to, so they cannot claim the reviewed account.
+
+Response-owner checks (STS account and partition, `StreamARN`, S3
+`ExpectedBucketOwner` and the rest) remain as defence in depth. This control does
+not defend against a host that is already compromised enough to trust a hostile
+CA bundle and redirect DNS for genuine AWS names: TLS to the canonical name is
+the remaining authentication. A profile `credential_process` runs a local
+command by design and is outside this boundary. Plan mode uses the same
+clients, so a plan's identity warning also comes only from canonical STS. China
+(`aws-cn`) clients bind to their canonical `amazonaws.com.cn` hosts, but this
+change does not add China live support: live ARN and identity checks still
+expect `aws` or `aws-us-gov`, so an `aws-cn` identity is refused at admission
+as before.
 
 ## Denied-target policy migration
 

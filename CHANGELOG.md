@@ -2,6 +2,70 @@
 
 ## Unreleased security follow-ups
 
+### Canonical AWS endpoint origin and source-bound wheel metadata
+
+- Bind every SDK client to a canonical AWS origin. Live admission trusted
+  `GetCallerIdentity` from a client whose endpoint could come from the selected
+  profile or the environment, so a host-trusted responder could claim the
+  configured account while the pinned credentials authorized another one.
+  Framework clients (the pre-role STS client, the pinned STS client and every
+  service client, in live and plan mode) come from one factory, and each
+  session is hardened before any credential is resolved, so botocore's own
+  credential-provider clients (assume-role and web-identity STS, SSO
+  `GetRoleCredentials`, SSO-OIDC token refresh and login) are bound the same
+  way for their actual service and region. Every client sets
+  `ignore_configured_endpoint_urls`, pins dual-stack, S3 accelerate and
+  account-ID-based endpoints off, and pins the profile or environment
+  `use_fips_endpoint` choice. Each request is checked before it is sent: its
+  host must be exactly one canonical host that botocore's packaged partition
+  data and endpoint ruleset designate for the partition, service, region and
+  FIPS choice, and any explicit `Host` header must name that same host. Hosts
+  must lie under the partition's packaged `dnsSuffix` or a reviewed
+  per-service domain; the only reachable service whose packaged rules need one
+  is AWS Sign-In (login token refresh), admitted exactly as
+  `signin.aws.amazon.com`, `signin.amazonaws.cn`,
+  `signin.amazonaws-us-gov.com` and `signin-fips.amazonaws-us-gov.com`.
+  Customer data paths (`AWS_DATA_PATH`, `~/.aws/models`) are never consulted
+  for that decision. Unknown regions, partitions or services, and FIPS
+  requests a ruleset cannot satisfy, fail closed. Response-owner checks are
+  unchanged. The check runs at the client's generic `before-send` stage;
+  in-process hooks registered later are trusted code outside this boundary.
+- Live runs apply an explicit address policy to the IMDS and container
+  credential transports, which are plain HTTP outside the SDK client stack: a
+  configured IMDS endpoint must be botocore's default (`169.254.169.254` or
+  `[fd00:ec2::254]`), and a container credential URL must target
+  `169.254.170.2`, `169.254.170.23`, `fd00:ec2::23` or loopback, without user
+  information. Other values fail live initialization before any credential
+  request.
+- Compatibility: profile `endpoint_url`, `services` sections and
+  `AWS_ENDPOINT_URL[_<SERVICE>]` are now ignored rather than honored, for
+  credential providers as well as service calls, so this tool can no longer be
+  pointed at local emulators or endpoint-specific `vpce-...` DNS names
+  (interface endpoints with private DNS keep the canonical names and still
+  work). Dual-stack, accelerate and account-ID endpoint settings no longer
+  apply. A customer endpoint ruleset that redirects a service makes that
+  service fail closed. Live runs refuse a custom IMDS endpoint and HTTPS
+  container credential URLs on arbitrary hosts, which botocore itself would
+  accept. A session must be hardened before credentials are resolved from it;
+  library callers that pass their own boto3 session to `pin_session_credentials`
+  must call `harden_session_origin` first. China endpoints are bound
+  canonically, but live China admission remains refused by the existing
+  partition checks.
+- Source-bind every admitted wheel member before protected promotion. The
+  verifier previously checked RECORD self-consistency, the runtime module and
+  selected metadata fields, so a candidate could change other `METADATA`
+  fields, `WHEEL`, `top_level.txt` or the bundled license, recompute RECORD and
+  obtain protected provenance. The exact source-derived metadata check now
+  applies to the wheel `METADATA`; `WHEEL` must name the pinned setuptools
+  backend, purelib root and `py3-none-any` tag; `top_level.txt`,
+  `entry_points.txt` and `licenses/LICENSE` must equal source-derived bytes; and
+  RECORD must be the canonical normalized manifest. Generated sdist members
+  (both `PKG-INFO` files, `setup.cfg` and the egg-info files) are now compared
+  as raw bytes with their source-derived values, so carriage-return or other
+  line-ending variants are refused rather than normalized away. Workflows are
+  unchanged; `prepare_release.py` and the protected handoff already run this
+  verifier.
+
 ### Planning-only SQS purge and RDS reboot, failover and retention
 
 - Withdraw live support for `sqs_queue_purge`. `PurgeQueue` deletes whatever the

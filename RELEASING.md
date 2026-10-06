@@ -63,6 +63,19 @@ never a policy input. Normalized source files must use mode 0644 and directories
 mode 0755. Changes to this policy require review of the trusted verifier before
 a candidate can pass the protected verification jobs.
 
+Wheel RECORD consistency is never treated as proof of origin. Before protected
+preparation copies and attests a wheel, the verifier compares every admitted
+member with a trusted value: the runtime module with the repository source,
+`METADATA` with core metadata derived from `pyproject.toml` and `README.md`,
+`WHEEL` with the exact setuptools version pinned in the trusted build policy,
+`top_level.txt` and `entry_points.txt` with their source-derived text, the
+bundled license with the repository `LICENSE` bytes, and RECORD with the
+canonical normalized manifest. Build and normalize the wheel with the hashed
+build lock exactly as the candidate gate does; a wheel from another backend
+version, an unnormalized wheel or any edited metadata member is refused.
+Generated sdist metadata (`PKG-INFO`, `setup.cfg` and the egg-info files) is
+likewise compared as raw bytes, so normalize the sdist before verification.
+
 ## Draft and publication review
 
 A `vX.Y.Z` tag must point to the approved GitHub-verified commit on protected `main`. The tag workflow rebuilds and compares every byte with read-only permissions. The default-branch `release-promotion.yml` controller authenticates the producer run, signed source commit, protected-main verifier, immutable artifact ID, and exact six-asset digest map. It reconstructs the release with trusted-main helpers and reads tagged files only as data. Both privileged jobs repeat this verification after `release` environment approval; the draft job downloads and compares the remote asset bytes too. All Python verification runs in isolated mode from the trusted checkout, including the final draft state check.
