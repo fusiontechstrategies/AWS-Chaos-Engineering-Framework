@@ -633,14 +633,46 @@ class FakeAWS:
         return responses.get((service, operation), {})
 
 
+class FakeEvents:
+    """Botocore-shaped event registry. Fake clients never send HTTP requests."""
+
+    def __init__(self) -> None:
+        self.first: list[tuple[str, Any]] = []
+
+    def register_first(self, event_name: str, handler: Any, **_kwargs: Any) -> None:
+        self.first.append((event_name, handler))
+
+
+def fake_client_meta(
+    service: str, region: str = REGION, region_name: str | None = None
+) -> SimpleNamespace:
+    """Metadata of an offline client created at its canonical AWS endpoint.
+
+    The production client factory binds every client to botocore's canonical
+    origin, so offline fakes carry the same endpoint and event surface as a
+    real client of that service and region.
+    """
+    _parents, hosts = framework.canonical_endpoint_origin(service, region, False)
+    return SimpleNamespace(
+        region_name=region_name or region,
+        endpoint_url="https://" + min(hosts),
+        events=FakeEvents(),
+        method_to_api_mapping={
+            name: "".join(part.capitalize() for part in name.split("_"))
+            for name in framework.S3_OWNER_BOUND_OPERATIONS
+        },
+    )
+
+
 class FakeClient:
     """Dynamic fake SDK client backed by FakeAWS."""
 
     def __init__(self, aws: FakeAWS, service: str):
         self.aws = aws
         self.service = service
-        self.meta = SimpleNamespace(
-            region_name="aws-us-gov-global" if service == "iam" else REGION
+        self.meta = fake_client_meta(
+            service,
+            region_name="aws-us-gov-global" if service == "iam" else REGION,
         )
         self.exceptions = SimpleNamespace(
             ClientError=FakeClientError,
@@ -1022,7 +1054,8 @@ def make_orchestrator(
         token="ordinary-synthetic-session",
     )
     identity = SimpleNamespace(
-        get_caller_identity=lambda: {"Account": ACCOUNT_ID, "Arn": principal}
+        get_caller_identity=lambda: {"Account": ACCOUNT_ID, "Arn": principal},
+        meta=fake_client_meta("sts"),
     )
     session = SimpleNamespace(
         client=lambda service, **kwargs: (

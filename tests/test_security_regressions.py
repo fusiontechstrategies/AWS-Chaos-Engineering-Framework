@@ -11,6 +11,7 @@ from test_aws_chaos_framework import (
     FakeAWS,
     FakeSafetyController,
     action_configs,
+    fake_client_meta,
     make_experiment,
     planning_only_experiment,
     prepare_lambda_memory,
@@ -613,7 +614,8 @@ def test_constructor_live_token_matches_offline_token_without_config_mutation(
         get_caller_identity=lambda: {
             "Account": ACCOUNT_ID,
             "Arn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ChaosOperator",
-        }
+        },
+        meta=fake_client_meta("sts"),
     )
     frozen = SimpleNamespace(
         access_key="ASIA" + "Z" * 16, secret_key="synthetic", token="synthetic"

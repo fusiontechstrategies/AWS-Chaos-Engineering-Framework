@@ -92,6 +92,20 @@ for the bucket's actual region. A signing-time hook on each framework S3 client
 refuses any S3 write signed for a region other than the client's reviewed
 region, so such a redirect cannot reach another region.
 `ExpectedBucketOwner` remains a separate control.
+Every SDK client, including the STS clients that decide live account binding
+and the clients botocore's credential providers create (assume-role, web
+identity, SSO and SSO-OIDC refresh), ignores configured endpoint URLs from the
+profile or environment and
+refuses, before sending, any request whose host is not botocore's bundled
+canonical host for the client's partition, service, region and approved FIPS
+choice. A profile that sets `endpoint_url` therefore still talks to canonical
+AWS, and a customer endpoint-rules override (`AWS_DATA_PATH` or
+`~/.aws/models`) that redirects a service makes that service's calls fail
+closed. Account-ID-based endpoints are disabled, so account-bearing role or
+SSO credentials keep Kinesis and other services on their regional hosts. Live
+runs also refuse a non-default IMDS endpoint or a container credential URL
+outside the documented link-local and loopback addresses. See
+[Canonical AWS endpoint origin](security-boundaries.md#canonical-aws-endpoint-origin).
 Controller-only clients without an experiment owner support safety and identity
 reads; they refuse all mutations and account-bound S3 bucket reads. They cannot
 claim the recovery exception or bypass the process stop through an ownerless
