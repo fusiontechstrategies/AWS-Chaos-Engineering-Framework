@@ -456,9 +456,92 @@ def release_fixture(root):
             }
         )
     (root / "release-evidence.json").write_text(
-        json.dumps({"tag": "v2.0.4", "source_commit": "a" * 40, "artifacts": records}),
+        json.dumps(
+            {
+                "schema_version": 1,
+                "tag": "v2.0.4",
+                "version": "2.0.4",
+                "source_commit": "a" * 40,
+                "artifacts": records,
+            }
+        ),
         "utf-8",
     )
+
+
+REPOSITORY = "owner/repo"
+PROTECTED_SIGNER = (
+    "https://github.com/owner/repo/.github/workflows/release-promotion.yml"
+    "@refs/heads/main"
+)
+
+
+def attestation_result(subjects, **certificate_overrides):
+    """Model `gh attestation verify --format json` output for one statement."""
+    certificate = {
+        "subjectAlternativeName": PROTECTED_SIGNER,
+        "issuer": "https://token.actions.githubusercontent.com",
+        "sourceRepositoryURI": "https://github.com/owner/repo",
+        "sourceRepositoryRef": "refs/heads/main",
+        "runnerEnvironment": "github-hosted",
+        **certificate_overrides,
+    }
+    return {
+        "verificationResult": {
+            "signature": {"certificate": certificate},
+            "statement": {
+                "_type": "https://in-toto.io/Statement/v1",
+                "predicateType": "https://slsa.dev/provenance/v1",
+                "subject": [
+                    {"name": name, "digest": {"sha256": value}}
+                    for name, value in sorted(subjects.items())
+                ],
+            },
+        }
+    }
+
+
+def protected_release(tmp_path, release, **certificate_overrides):
+    """Model the public release evidence and protected-job attestation results."""
+    trusted = tmp_path / "trusted-release"
+    trusted.mkdir()
+    evidence = trusted / "release-evidence.json"
+    evidence.write_bytes((release / "release-evidence.json").read_bytes())
+    subjects = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in release.iterdir()
+    }
+    attestations = tmp_path / "trusted-attestations"
+    attestations.mkdir()
+    result = [attestation_result(subjects, **certificate_overrides)]
+    for name in ["release-evidence.json", *publish_payload.expected_names("v2.0.4")]:
+        (attestations / f"{name}.json").write_text(json.dumps(result), "utf-8")
+    return evidence, attestations
+
+
+def forge_payload(payload, version="v2.0.4", commit="a" * 40):
+    """Replace both packages and the bundled manifest with a consistent forgery.
+
+    Forged bytes keep the genuine size so only digest binding can detect them.
+    """
+    files = {}
+    for name in publish_payload.expected_names(version):
+        path = payload / "packages" / name
+        data = bytes(255 - value for value in path.read_bytes())
+        path.write_bytes(data)
+        files[name] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    (payload / "publish-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "tag": version,
+                "source_commit": commit,
+                "files": files,
+            }
+        ),
+        "utf-8",
+    )
+    return files
 
 
 def test_actual_tag_verifier_replacement_cannot_survive_publish_digest_check(tmp_path):
@@ -485,27 +568,39 @@ def test_publish_checker_is_isolated_from_tag_imports_and_binds_source_identity(
     payload = tmp_path / "payload"
     release_fixture(release)
     publish_payload.capture(release, payload, "v2.0.4", "a" * 40)
+    evidence, attestations = protected_release(tmp_path, release)
     # Exercise the current isolated CLI only from an ordinary empty directory.
     # Launch isolation is also asserted against the reviewed workflow below.
     cli_directory = tmp_path / "clean-cli"
     cli_directory.mkdir()
+    command = [
+        sys.executable,
+        "-I",
+        str(ROOT / "scripts/publish_payload.py"),
+        "verify",
+        str(payload),
+        "--tag",
+        "v2.0.4",
+        "--source-commit",
+        "a" * 40,
+    ]
+    trusted = [
+        "--trusted-evidence",
+        str(evidence),
+        "--attestations",
+        str(attestations),
+        "--repository",
+        REPOSITORY,
+    ]
     result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            str(ROOT / "scripts/publish_payload.py"),
-            "verify",
-            str(payload),
-            "--tag",
-            "v2.0.4",
-            "--source-commit",
-            "a" * 40,
-        ],
-        cwd=cli_directory,
-        capture_output=True,
-        text=True,
+        command + trusted, cwd=cli_directory, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+    assert list(cli_directory.iterdir()) == []
+    # The bundled manifest alone can never satisfy the CLI verify mode.
+    result = subprocess.run(command, cwd=cli_directory, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "requires --trusted-evidence" in result.stderr
     assert list(cli_directory.iterdir()) == []
     workflow = framework.yaml.safe_load(
         (ROOT / ".github/workflows/publish.yml").read_text("utf-8")
@@ -519,6 +614,39 @@ def test_publish_checker_is_isolated_from_tag_imports_and_binds_source_identity(
     (payload / "packages" / "extra.whl").write_bytes(b"injected")
     with pytest.raises(ValueError, match="distribution set"):
         publish_payload.verify(payload, "v2.0.4", "a" * 40)
+
+
+def test_publish_cli_verify_rejects_forged_self_consistent_handoff(tmp_path):
+    release = tmp_path / "release-assets"
+    payload = tmp_path / "payload"
+    release_fixture(release)
+    publish_payload.capture(release, payload, "v2.0.4", "a" * 40)
+    evidence, attestations = protected_release(tmp_path, release)
+    forge_payload(payload)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(ROOT / "scripts/publish_payload.py"),
+            "verify",
+            str(payload),
+            "--tag",
+            "v2.0.4",
+            "--source-commit",
+            "a" * 40,
+            "--trusted-evidence",
+            str(evidence),
+            "--attestations",
+            str(attestations),
+            "--repository",
+            REPOSITORY,
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "does not match protected release evidence" in result.stderr
 
 
 def test_publish_workflow_never_executes_tag_verifier_or_publishes_unbound_bytes():
@@ -542,3 +670,249 @@ def test_publish_workflow_never_executes_tag_verifier_or_publishes_unbound_bytes
     publish = workflow["jobs"]["publish"]["steps"]
     assert "publish_payload.py verify" in publish[-2]["run"]
     assert publish[-1]["with"]["packages-dir"] == "verified-payload/packages"
+
+
+def test_protected_job_accepts_independently_attested_release_subjects(tmp_path):
+    release = tmp_path / "release-assets"
+    payload = tmp_path / "payload"
+    release_fixture(release)
+    publish_payload.capture(release, payload, "v2.0.4", "a" * 40)
+    evidence, attestations = protected_release(tmp_path, release)
+    publish_payload.authenticate(
+        payload, "v2.0.4", "a" * 40, evidence, attestations, REPOSITORY
+    )
+    assert publish_payload.signer_identity(REPOSITORY) == PROTECTED_SIGNER
+
+
+def test_forged_self_consistent_payload_is_rejected_by_independent_digests(
+    tmp_path,
+):
+    release = tmp_path / "release-assets"
+    payload = tmp_path / "payload"
+    release_fixture(release)
+    publish_payload.capture(release, payload, "v2.0.4", "a" * 40)
+    evidence, attestations = protected_release(tmp_path, release)
+    forge_payload(payload)
+    # A compromised producer controls both the bytes and the bundled manifest,
+    # so bundle-internal consistency alone accepts the forgery.
+    publish_payload.verify(payload, "v2.0.4", "a" * 40)
+    with pytest.raises(ValueError, match="protected release evidence"):
+        publish_payload.authenticate(
+            payload, "v2.0.4", "a" * 40, evidence, attestations, REPOSITORY
+        )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {
+            "subjectAlternativeName": "https://github.com/owner/repo/"
+            ".github/workflows/publish.yml@refs/heads/main"
+        },
+        {
+            "subjectAlternativeName": "https://github.com/owner/repo/"
+            ".github/workflows/release.yml@refs/tags/v2.0.4"
+        },
+        {
+            "subjectAlternativeName": "https://github.com/owner/repo/"
+            ".github/workflows/release-promotion.yml@refs/heads/feature"
+        },
+        {
+            "subjectAlternativeName": "https://github.com/other/repo/"
+            ".github/workflows/release-promotion.yml@refs/heads/main"
+        },
+        {"issuer": "https://issuer.example"},
+        {"sourceRepositoryURI": "https://github.com/other/repo"},
+        {"sourceRepositoryRef": "refs/tags/v2.0.4"},
+        {"runnerEnvironment": "self-hosted"},
+    ],
+)
+@pytest.mark.parametrize(
+    "subject",
+    [
+        "release-evidence.json",
+        "aws_chaos_engineering_framework-2.0.4-py3-none-any.whl",
+        "aws_chaos_engineering_framework-2.0.4.tar.gz",
+    ],
+)
+def test_forged_release_subjects_need_the_protected_signer_identity(
+    tmp_path, override, subject
+):
+    release = tmp_path / "release-assets"
+    payload = tmp_path / "payload"
+    release_fixture(release)
+    publish_payload.capture(release, payload, "v2.0.4", "a" * 40)
+    evidence, attestations = protected_release(tmp_path, release)
+    subjects = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in release.iterdir()
+    }
+    (attestations / f"{subject}.json").write_text(
+        json.dumps([attestation_result(subjects, **override)]), "utf-8"
+    )
+    with pytest.raises(ValueError, match="No protected release attestation"):
+        publish_payload.authenticate(
+            payload, "v2.0.4", "a" * 40, evidence, attestations, REPOSITORY
+        )
+
+
+def test_forged_evidence_and_packages_cannot_borrow_protected_attestations(
+    tmp_path,
+):
+    release = tmp_path / "release-assets"
+    payload = tmp_path / "payload"
+    release_fixture(release)
+    publish_payload.capture(release, payload, "v2.0.4", "a" * 40)
+    evidence, attestations = protected_release(tmp_path, release)
+    forged = forge_payload(payload)
+    # The forger also rewrites the release evidence to match the forged bytes,
+    # but the protected signer never attested that evidence digest.
+    records = [{"name": name, **value} for name, value in forged.items()]
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "tag": "v2.0.4",
+                "version": "2.0.4",
+                "source_commit": "a" * 40,
+                "artifacts": records,
+            }
+        ),
+        "utf-8",
+    )
+    with pytest.raises(ValueError, match="No protected release attestation"):
+        publish_payload.authenticate(
+            payload, "v2.0.4", "a" * 40, evidence, attestations, REPOSITORY
+        )
+    # Even with a protected statement for that forged evidence, the forged
+    # packages themselves carry no protected-signer provenance.
+    forged_evidence_digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    (attestations / "release-evidence.json.json").write_text(
+        json.dumps(
+            [attestation_result({"release-evidence.json": forged_evidence_digest})]
+        ),
+        "utf-8",
+    )
+    with pytest.raises(ValueError, match="No protected release attestation"):
+        publish_payload.authenticate(
+            payload, "v2.0.4", "a" * 40, evidence, attestations, REPOSITORY
+        )
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"tag": "v2.0.3"},
+        {"version": "2.0.3"},
+        {"source_commit": "b" * 40},
+        {"schema_version": 2},
+    ],
+)
+def test_tag_and_commit_strings_cannot_authenticate_substituted_bytes(
+    tmp_path, identity
+):
+    release = tmp_path / "release-assets"
+    payload = tmp_path / "payload"
+    release_fixture(release)
+    publish_payload.capture(release, payload, "v2.0.4", "a" * 40)
+    evidence, attestations = protected_release(tmp_path, release)
+    # Substituted bytes keep the exact trusted tag and source-commit strings.
+    forge_payload(payload, "v2.0.4", "a" * 40)
+    manifest = json.loads((payload / "publish-manifest.json").read_text("utf-8"))
+    assert (manifest["tag"], manifest["source_commit"]) == ("v2.0.4", "a" * 40)
+    with pytest.raises(ValueError, match="protected release evidence"):
+        publish_payload.authenticate(
+            payload, "v2.0.4", "a" * 40, evidence, attestations, REPOSITORY
+        )
+    # Genuine bytes are still refused when attested evidence names another
+    # release identity, even though the payload strings match the dispatch.
+    genuine = tmp_path / "payload-genuine"
+    publish_payload.capture(release, genuine, "v2.0.4", "a" * 40)
+    original = json.loads(evidence.read_text("utf-8"))
+    evidence.write_text(json.dumps({**original, **identity}), "utf-8")
+    subjects = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in release.iterdir()
+    }
+    subjects["release-evidence.json"] = hashlib.sha256(
+        evidence.read_bytes()
+    ).hexdigest()
+    for name in ["release-evidence.json", *publish_payload.expected_names("v2.0.4")]:
+        (attestations / f"{name}.json").write_text(
+            json.dumps([attestation_result(subjects)]), "utf-8"
+        )
+    with pytest.raises(ValueError, match="evidence identity mismatch"):
+        publish_payload.authenticate(
+            genuine, "v2.0.4", "a" * 40, evidence, attestations, REPOSITORY
+        )
+
+
+def test_protected_publish_job_verifies_exact_subjects_before_pypi_action():
+    workflow = framework.yaml.safe_load(
+        (ROOT / ".github/workflows/publish.yml").read_text("utf-8")
+    )
+    producer = workflow["jobs"]["verify"]
+    assert "environment" not in producer
+    assert "id-token" not in producer.get("permissions", {})
+    job = workflow["jobs"]["publish"]
+    assert job["environment"]["name"] == "pypi"
+    assert job["permissions"] == {
+        "id-token": "write",
+        "contents": "read",
+        "actions": "read",
+        "attestations": "read",
+    }
+    steps = job["steps"]
+    download = next(
+        i
+        for i, step in enumerate(steps)
+        if step.get("uses", "").startswith("actions/download-artifact@")
+    )
+    trusted = next(i for i, step in enumerate(steps) if step.get("id") == "trusted")
+    final = len(steps) - 2
+    assert download < trusted < final
+    publish = steps[-1]
+    assert publish["uses"].startswith("pypa/gh-action-pypi-publish@")
+    pin = publish["uses"].split("@", 1)[1]
+    assert len(pin) == 40 and all(c in "0123456789abcdef" for c in pin)
+    assert publish["with"]["packages-dir"] == "verified-payload/packages"
+
+    run = steps[trusted]["run"]
+    assert "refs/tags/$RELEASE_TAG^{commit}" in run
+    assert 'test "$commit" = "$SOURCE_COMMIT"' in run
+    assert 'gh release download "$RELEASE_TAG" --pattern release-evidence.json' in run
+    assert (
+        'signer="https://github.com/$GH_REPO/.github/workflows/'
+        'release-promotion.yml@refs/heads/main"'
+    ) in run
+    # The exact files later passed to the PyPI action are attested here.
+    for subject in (
+        "trusted-release/release-evidence.json",
+        '"verified-payload/packages/aws_chaos_engineering_framework-'
+        '${version}-py3-none-any.whl"',
+        '"verified-payload/packages/aws_chaos_engineering_framework-${version}.tar.gz"',
+    ):
+        assert subject in run
+    for flag in (
+        'gh attestation verify "$subject" --repo "$GH_REPO"',
+        '--cert-identity "$signer"',
+        "--cert-oidc-issuer https://token.actions.githubusercontent.com",
+        "--source-ref refs/heads/main --deny-self-hosted-runners",
+        "--predicate-type https://slsa.dev/provenance/v1",
+        '--format json > "trusted-attestations/${subject##*/}.json"',
+    ):
+        assert flag in run
+
+    verify = steps[final]
+    assert (
+        verify["env"]["TRUSTED_SOURCE_COMMIT"]
+        == "${{ steps.trusted.outputs.source-commit }}"
+    )
+    for argument in (
+        "python -I trusted-verifier/scripts/publish_payload.py verify verified-payload",
+        '--source-commit "$TRUSTED_SOURCE_COMMIT"',
+        "--trusted-evidence trusted-release/release-evidence.json",
+        '--attestations trusted-attestations --repository "$GH_REPO"',
+    ):
+        assert argument in verify["run"]
+    assert '--source-commit "$SOURCE_COMMIT"' not in verify["run"]

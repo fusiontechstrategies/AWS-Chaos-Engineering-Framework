@@ -25,6 +25,10 @@
   identity filtering independent of resource disclosure.
 - Verify distributions with trusted workflow-source tools and bind the final
   publish payload to a digest manifest rechecked in the protected publish job.
+- Authenticate PyPI uploads inside the protected `pypi` job against public
+  release evidence and GitHub provenance from the protected
+  `release-promotion.yml` signer, so the lower-privilege verify job can no
+  longer forge a self-consistent package and manifest handoff.
 - Require live targets under `--vpc-id` to belong to the discovered, exactly
   tagged inventory of that VPC, verify each pre-mutation response, and refuse
   VPC-addressable types whose membership cannot be verified.

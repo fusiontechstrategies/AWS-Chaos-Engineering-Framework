@@ -320,9 +320,16 @@ in diagnostics, without task ARNs.
 The publish workflow executes verification tools from the immutable workflow
 commit with Python isolated mode, never from the release tag. Verified public
 distribution bytes are copied into a fresh payload with a tag, source commit,
-size, and SHA-256 manifest. The protected publish job independently checks that
-manifest and the exact distribution set immediately before publishing. No
-tag-controlled code executes after the verified payload is captured.
+size, and SHA-256 manifest. That manifest comes from the same lower-privilege job
+as the bytes, so it is integrity metadata, not authentication. Before publishing,
+the protected `pypi` job independently resolves the tag commit, downloads the
+public release evidence and verifies GitHub provenance for that evidence and for
+the exact handed-off wheel and source distribution. Only the protected
+`release-promotion.yml@refs/heads/main` signer on a GitHub-hosted runner is
+accepted. The attested evidence must name the dispatched tag, version and commit
+and match both package digests and sizes. Tag and commit strings alone never
+authenticate package bytes. No tag-controlled code executes after the verified
+payload is captured.
 
 ## Destructive-call and transition evidence
 

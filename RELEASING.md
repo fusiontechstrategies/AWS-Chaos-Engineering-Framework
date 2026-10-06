@@ -73,6 +73,8 @@ Before publication, download the draft assets into a clean directory, recompute 
 
 The manually dispatched `.github/workflows/publish.yml` workflow accepts an existing public, stable GitHub release tag. It checks the tagged commit and exact six-asset set, release hashes and evidence, distribution contents, and GitHub provenance before uploading only the verified wheel and source distribution. The upload job uses the protected `pypi` environment and a short-lived OpenID Connect credential. No PyPI API token is stored in the repository.
 
+The verification job's handoff and its bundled manifest are integrity metadata only; they never authenticate themselves. Inside the `pypi` environment, the upload job independently resolves the tag to its signed protected-main commit, rechecks that the release is public and stable, downloads `release-evidence.json` from that release, and runs `gh attestation verify` on the evidence and on the exact handed-off wheel and source distribution. Each must carry provenance whose certificate identity is exactly `https://github.com/<repository>/.github/workflows/release-promotion.yml@refs/heads/main`, from the GitHub Actions issuer, source ref `refs/heads/main` and a GitHub-hosted runner. The isolated `publish_payload.py verify` then requires the attested evidence to name the dispatched tag, version and independently resolved commit, and requires both package digests and sizes to match it, before the same files go to the PyPI Action. A release that lacks this protected `release-promotion.yml` attestation cannot be published to PyPI.
+
 Before the first PyPI publication, recheck that the normalized project name is available, secure the PyPI maintainer account with two-factor authentication, register the exact GitHub repository, `publish.yml`, and `pypi` environment as a pending trusted publisher, require maintainer approval on the environment, and allowlist the pinned PyPA publishing Action. A pending publisher does not reserve a project name.
 
 After separately deciding to publish the reviewed GitHub release on PyPI, dispatch `publish.yml` from protected `main` with the exact public release tag. Review the verification job before approving the `pypi` deployment. Confirm PyPI lists the same version and file hashes, install the exact version in a clean environment, and run offline smoke commands before announcing the registry package.
@@ -111,7 +113,8 @@ non-main dispatches. Verification tools come from the exact workflow commit,
 whose GitHub signature and protected-main ancestry are checked. Each job reads
 and validates the current environment policy, owner reviewer, protected-main CI
 status policy and workflow signature before its work. Read permissions are
-limited to contents and Actions; no administration token is added to the workflow.
+limited to contents and Actions, plus attestation reads in the upload job; no
+administration token is added to the workflow.
 Full signature enforcement, CI, no-force-push and no-deletion branch settings
 also require maintainer audit because the job token cannot read administrative
 branch-protection details. Settings-changing administrators remain trusted.
