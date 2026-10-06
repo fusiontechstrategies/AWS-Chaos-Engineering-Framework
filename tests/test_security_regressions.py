@@ -143,6 +143,8 @@ def test_waf_recovery_preserves_concurrent_unrelated_change():
     changed = copy.deepcopy(before)
     changed["WebACL"]["Rules"][0]["Action"] = {"Count": {}}
     changed["WebACL"]["Description"] = "New operator description"
+    # The forward generation (lock-2) carries the description recovery must keep.
+    changed["LockToken"] = "lock-2"
     aws.read_overrides[("wafv2", "get_web_acl")] = [before, changed, changed]
     item, values = experiment(framework.ChaosType.WAF_RULE_MODIFY, aws)
     assert item.modify_rule(**values).status == "completed"
@@ -412,36 +414,35 @@ def test_efs_rollback_refuses_concurrent_operator_throughput():
     assert not item.rollback_verified
 
 
-def test_lambda_recovery_merges_unrelated_variables_and_uses_revision():
+def test_lambda_recovery_refuses_later_revision_and_preserves_unrelated_variables():
     aws = FakeAWS(reject_writes=False)
     initial = aws.respond("lambda", "get_function_configuration", {})
     initial["RevisionId"] = "rev-original"
     owned = copy.deepcopy(initial)
+    owned["RevisionId"] = "rev-owned"
     owned["Environment"]["Variables"]["MODE"] = "chaos"
     current = copy.deepcopy(owned)
     current["RevisionId"] = "rev-current"
     current["Environment"]["Variables"]["UNRELATED"] = "operator-added"
-    restored = copy.deepcopy(current)
-    restored["Environment"]["Variables"]["MODE"] = "normal"
     aws.read_overrides[("lambda", "get_function_configuration")] = [
         initial,
         owned,
         current,
-        restored,
-        restored,
+    ]
+    aws.write_responses[("lambda", "update_function_configuration")] = [
+        {"RevisionId": "rev-owned"}
     ]
     item, values = experiment(framework.ChaosType.LAMBDA_ENVIRONMENT_CORRUPT, aws)
     assert item.corrupt_environment(**values).status == "completed"
-    item.run_rollback()
+    assert item.lambda_confirmed_revision == "rev-owned"
+    # The owned chaos value is still present, but in a later generation.
+    with pytest.raises(framework.SafetyViolation, match="revision changed"):
+        item.run_rollback()
     writes = [
         args for _, op, args in aws.calls if op == "update_function_configuration"
     ]
-    assert writes[-1]["RevisionId"] == "rev-current"
-    assert writes[-1]["Environment"]["Variables"] == {
-        "MODE": "normal",
-        "UNRELATED": "operator-added",
-    }
-    assert item.rollback_verified
+    assert [write["RevisionId"] for write in writes] == ["rev-original"]
+    assert not item.rollback_attempts and not item.rollback_verified
 
 
 def test_owned_policy_removal_preserves_concurrent_unrelated_statement():
@@ -542,7 +543,16 @@ def test_extension_recovery_requires_original_post_state(action):
             owned["WebACL"]["Rules"][0]["Statement"]["RateBasedStatement"]["Limit"] = (
                 action_configs()[kind]["limit"]
             )
-        aws.read_overrides[("wafv2", "get_web_acl")] = [before, owned, owned, before]
+        owned["LockToken"] = "lock-2"
+        restored = {**copy.deepcopy(before), "LockToken": "lock-3"}
+        aws.read_overrides[("wafv2", "get_web_acl")] = [before, owned, owned, restored]
+    if action == "waf_ip_set_modify":
+        before = aws.respond("wafv2", "get_ip_set", {})
+        owned = copy.deepcopy(before)
+        owned["LockToken"] = "lock-2"
+        owned["IPSet"]["Addresses"] += action_configs()[kind]["addresses_to_add"]
+        restored = {**copy.deepcopy(before), "LockToken": "lock-3"}
+        aws.read_overrides[("wafv2", "get_ip_set")] = [before, owned, restored]
     item, values = experiment(kind, aws)
     orchestrator = object.__new__(framework.ChaosOrchestrator)
     if kind in framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS:
@@ -728,9 +738,7 @@ def test_waf_ip_set_recovery_preserves_concurrent_addresses_and_description():
     concurrent["IPSet"]["Addresses"] += ["198.51.100.0/24", "203.0.113.0/24"]
     concurrent["IPSet"]["Description"] = "operator update"
     concurrent["LockToken"] = "operator-lock"
-    restored = copy.deepcopy(concurrent)
-    restored["IPSet"]["Addresses"].remove("198.51.100.0/24")
-    aws.read_overrides[("wafv2", "get_ip_set")] = [original, concurrent, restored]
+    aws.read_overrides[("wafv2", "get_ip_set")] = [original, concurrent]
     item, values = experiment(
         framework.ChaosType.WAF_IP_SET_MODIFY,
         aws,
@@ -745,14 +753,14 @@ def test_waf_ip_set_recovery_preserves_concurrent_addresses_and_description():
         max_blast_radius=3,
     )
     assert item.modify_ip_set(**values).status == "completed"
-    item.run_rollback()
+    # A later operator generation is never adopted with its fresh LockToken.
+    with pytest.raises(framework.SafetyViolation, match="generation advanced"):
+        item.run_rollback()
     writes = [
         request for _, operation, request in aws.calls if operation == "update_ip_set"
     ]
-    assert writes[-1]["Addresses"] == ["192.0.2.0/24", "203.0.113.0/24"]
-    assert writes[-1]["Description"] == "operator update"
-    assert writes[-1]["LockToken"] == "operator-lock"
-    assert item.rollback_verified
+    assert [write["LockToken"] for write in writes] == ["lock-1"]
+    assert not item.rollback_attempts and not item.rollback_verified
 
 
 @pytest.mark.parametrize("ipv4", [["192.0.2.10"], []])
@@ -1661,12 +1669,13 @@ def test_lambda_recovery_preserves_opaque_arn_values():
     initial["RevisionId"] = "rev-original"
     initial["Environment"]["Variables"]["OPAQUE"] = "arn:foreign:application:data"
     owned = copy.deepcopy(initial)
+    owned["RevisionId"] = "rev-owned"
     owned["Environment"]["Variables"]["MODE"] = (
         "arn:aws:sns:us-east-1:999900001111:application-text"
     )
     current = copy.deepcopy(owned)
-    current["RevisionId"] = "rev-current"
     restored = copy.deepcopy(current)
+    restored["RevisionId"] = "rev-restored"
     restored["Environment"]["Variables"]["MODE"] = "normal"
     aws.read_overrides[("lambda", "get_function_configuration")] = [
         initial,
@@ -1674,6 +1683,9 @@ def test_lambda_recovery_preserves_opaque_arn_values():
         current,
         restored,
         restored,
+    ]
+    aws.write_responses[("lambda", "update_function_configuration")] = [
+        {"RevisionId": "rev-owned"}
     ]
     item, values = experiment(
         framework.ChaosType.LAMBDA_ENVIRONMENT_CORRUPT,

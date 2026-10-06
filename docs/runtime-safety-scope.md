@@ -196,6 +196,22 @@ Conditional configuration updates retain `RevisionId`; concurrency operations
 remain planning only. This deliberately narrows AWS's broader identifier syntax.
 See [GetFunctionConfiguration](https://docs.aws.amazon.com/lambda/latest/api/API_GetFunctionConfiguration.html).
 
+A configuration fault owns only the `RevisionId` returned by its own successful
+conditional update. A missing, empty or unchanged response revision establishes
+no ownership. Confirmation must then read that same revision, settled and
+carrying the requested values. The API model gives no lineage from the update to
+any other revision. A settled read reporting another revision is therefore never
+adopted, even with identical values: the forward fails, ownership is withheld,
+the reason is recorded and manual reconciliation is required. If an emergency
+stop interrupts the settle wait, the update's own revision remains the only
+owner. A recovery write requires the current revision to equal the owned one. A
+later revision is refused even when it carries the identical chaos value, and an
+ambiguous forward with no owned revision cannot write. Recovery that needs no write only reads back the original
+values. Live WAF and Lambda recovery is single use: the first `run_rollback`
+consumes it under the lifecycle lock. Verified or failed, that attempt clears
+owned markers and revokes the execution grant, so a later call cannot mint
+another write. Failed recovery requires operator reconciliation.
+
 The retained read-only route predicate checks exactly one selected route table
 and destination, the captured target, and `State: active`. A matching `blackhole`
 route fails; missing or nonterminal state reaches a bounded timeout. The former
@@ -249,8 +265,15 @@ WAF rule/rate updates retain the service's required
 Recovery additionally requires a successful forward return and a unique matching
 post-state. An exception or unconfirmed post-state requires manual reconciliation;
 an absent/changed value is never used to infer that this execution owned a write.
-The marker resets before each new attempt. Recovery reads current settings,
-preserves unrelated fields, refuses conflicting selected values and supplies that
-read's LockToken. An optimistic-lock failure remains a failure, not permission to
-retry an unconditional overwrite. This does not infer the intent of a later
-principal deliberately writing the identical selected value.
+The marker resets before each new attempt. The forward write's `NextLockToken` is
+the confirmed generation. For rules, the confirmation read must report it too.
+Recovery proceeds only while the Web ACL or IP set is still at that scope, name,
+ID and LockToken. Any later generation is refused for manual reconciliation, even
+one carrying the identical action, limit or a re-added address. Recovery preserves
+unrelated fields and refuses conflicting selected values. An optimistic-lock
+failure remains a failure, not permission to retry an unconditional overwrite.
+
+A WAF request that is already satisfied is refused before dispatch as a failed
+result, with no write, ownership marker or recovery claim. This covers the
+current rule action type, the current rate limit, or an IP-set request without a
+CIDR that is canonically new. One canonically new address is required.

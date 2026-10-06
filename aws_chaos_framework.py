@@ -2780,6 +2780,9 @@ def _guard_live_handler(method):
 class ChaosExperiment:
     """Base class for chaos experiments"""
 
+    # Generation-bound handlers consume live recovery authority exactly once.
+    SINGLE_USE_RECOVERY = False
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         handlers = {value[0] for value in AUTHORIZED_HANDLER_CALLS.values()}
@@ -2805,6 +2808,7 @@ class ChaosExperiment:
         self._execution_lock = threading.Lock()
         self._execution_used = False
         self._forward_finished = False
+        self._recovery_consumed = False
         self.config = copy.deepcopy(config)
         self.safety_controller = safety_controller
         # Capture the account authenticated by the orchestrator, rather than
@@ -2995,8 +2999,13 @@ class ChaosExperiment:
         if not self._execution_lock.acquire(blocking=False):
             raise SafetyViolation("Another experiment lifecycle is active")
         recovery_grant = None
+        single_use = False
         try:
             if not self.dry_run:
+                if self._recovery_consumed:
+                    raise SafetyViolation(
+                        "Recovery authority was already consumed; reconcile manually"
+                    )
                 grant = self._require_execution_grant()
                 if not self._execution_used or not self._forward_finished:
                     raise SafetyViolation(
@@ -3006,6 +3015,9 @@ class ChaosExperiment:
                     recovery_grant = grant
             if getattr(self._sdk_request_authority, "phase", None) is not None:
                 raise SafetyViolation("Nested recovery dispatch is refused")
+            if not self.dry_run and self.SINGLE_USE_RECOVERY:
+                # Consumed under the lifecycle lock before any recovery read/write.
+                self._recovery_consumed = single_use = True
             self._sdk_request_authority.phase = "recovery"
             if recovery_grant is not None:
                 self._sdk_request_authority.recovery = recovery_grant
@@ -3023,8 +3035,18 @@ class ChaosExperiment:
                 del self._sdk_request_authority.phase
                 if recovery_grant is not None:
                     del self._sdk_request_authority.recovery
+                if single_use:
+                    self._end_recovery_authority()
         finally:
             self._execution_lock.release()
+
+    def _end_recovery_authority(self) -> None:
+        """Verified or failed recovery is terminal: clear ownership, revoke grant."""
+        self._clear_recovery_ownership()
+        self._execution_grant = None
+
+    def _clear_recovery_ownership(self) -> None:
+        """Subclasses drop markers that could authorize another recovery write."""
 
     def _verify_additional_recovery(self) -> None:
         """Read back extension recovery state independently of successful writes."""
@@ -5370,11 +5392,67 @@ class RDSChaosExperiment(ChaosExperiment):
 class LambdaChaosExperiment(ChaosExperiment):
     """Lambda-based chaos experiments"""
 
+    SINGLE_USE_RECOVERY = True
+
     def __init__(self, config: dict[str, Any], safety_controller: SafetyController):
         super().__init__(config, safety_controller)
         self.lambda_client = self.client("lambda")
+        # Only the revision issued by this execution's own write can own recovery.
+        self.lambda_confirmed_revision: str | None = None
+        self.lambda_ownership_refusal: str | None = None
 
-    def _wait_for_configuration(self, function_name: str, interruptible: bool) -> None:
+    def _clear_recovery_ownership(self) -> None:
+        self.lambda_confirmed_revision = None
+
+    @staticmethod
+    def _configuration_value(current: dict[str, Any], property_name: str) -> Any:
+        if property_name == "Environment":
+            return current.get("Environment", {}).get("Variables", {})
+        return current.get(property_name)
+
+    def _confirm_configuration_write(
+        self,
+        function_name: str,
+        prior_revision: Any,
+        written: Any,
+        expected: dict[str, Any],
+    ) -> None:
+        """Own only the RevisionId issued by this write, observed carrying its values."""
+        issued = written.get("RevisionId") if isinstance(written, dict) else None
+        if not isinstance(issued, str) or not issued or issued == prior_revision:
+            self.lambda_ownership_refusal = "the update returned no new RevisionId"
+            raise SafetyViolation(
+                "Lambda forward revision was not confirmed: "
+                f"{self.lambda_ownership_refusal}; reconcile manually"
+            )
+        # A successful conditional write returns its own generation. A stop that
+        # interrupts the state wait below leaves recovery bound to that revision.
+        self.lambda_confirmed_revision = issued
+        current = self._wait_for_configuration(function_name, True)
+        # Equal values under any other revision may be another principal's write;
+        # no settle-time revision lineage exists to attribute it to this one.
+        if current.get("RevisionId") != issued:
+            self.lambda_ownership_refusal = (
+                "the settled revision differs from the update's RevisionId"
+            )
+        elif any(
+            self._configuration_value(current, name) != value
+            for name, value in expected.items()
+        ):
+            self.lambda_ownership_refusal = (
+                "the update's revision does not carry the requested values"
+            )
+        else:
+            return
+        self.lambda_confirmed_revision = None
+        raise SafetyViolation(
+            "Lambda forward revision was not confirmed: "
+            f"{self.lambda_ownership_refusal}; reconcile manually"
+        )
+
+    def _wait_for_configuration(
+        self, function_name: str, interruptible: bool
+    ) -> dict[str, Any]:
         """Wait for a Lambda configuration update to reach a successful terminal state."""
         deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
         while time.monotonic() < deadline:
@@ -5385,7 +5463,7 @@ class LambdaChaosExperiment(ChaosExperiment):
             )
             status = current.get("LastUpdateStatus", "Successful")
             if status == "Successful":
-                return
+                return current
             if status == "Failed":
                 raise RuntimeError("Lambda configuration update failed")
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
@@ -5479,12 +5557,17 @@ class LambdaChaosExperiment(ChaosExperiment):
             self.owned_env = copy.deepcopy(new_env)
 
             if not self.dry_run:
-                self.lambda_client.update_function_configuration(
+                written = self.lambda_client.update_function_configuration(
                     FunctionName=function_name,
                     Environment={"Variables": new_env},
                     RevisionId=response["RevisionId"],
                 )
-                self._wait_for_configuration(function_name, True)
+                self._confirm_configuration_write(
+                    function_name,
+                    response["RevisionId"],
+                    written,
+                    {"Environment": new_env},
+                )
                 result.affected_resources = [function_name]
                 logger.info(
                     f"Injected error rate {error_rate} for Lambda: {function_name}"
@@ -5526,12 +5609,17 @@ class LambdaChaosExperiment(ChaosExperiment):
             self.function_name = function_name
 
             if not self.dry_run:
-                self.lambda_client.update_function_configuration(
+                written = self.lambda_client.update_function_configuration(
                     FunctionName=function_name,
                     Timeout=timeout_seconds,
                     RevisionId=response["RevisionId"],
                 )
-                self._wait_for_configuration(function_name, True)
+                self._confirm_configuration_write(
+                    function_name,
+                    response["RevisionId"],
+                    written,
+                    {"Timeout": timeout_seconds},
+                )
                 result.affected_resources = [function_name]
                 logger.info(
                     f"Set timeout to {timeout_seconds}s for Lambda: {function_name}"
@@ -5575,12 +5663,17 @@ class LambdaChaosExperiment(ChaosExperiment):
             self.function_name = function_name
 
             if not self.dry_run:
-                self.lambda_client.update_function_configuration(
+                written = self.lambda_client.update_function_configuration(
                     FunctionName=function_name,
                     MemorySize=memory_mb,
                     RevisionId=response["RevisionId"],
                 )
-                self._wait_for_configuration(function_name, True)
+                self._confirm_configuration_write(
+                    function_name,
+                    response["RevisionId"],
+                    written,
+                    {"MemorySize": memory_mb},
+                )
                 result.affected_resources = [function_name]
                 logger.info(f"Set memory to {memory_mb}MB for Lambda: {function_name}")
             else:
@@ -5624,12 +5717,17 @@ class LambdaChaosExperiment(ChaosExperiment):
             self.owned_env = copy.deepcopy(new_env)
 
             if not self.dry_run:
-                self.lambda_client.update_function_configuration(
+                written = self.lambda_client.update_function_configuration(
                     FunctionName=function_name,
                     Environment={"Variables": new_env},
                     RevisionId=response["RevisionId"],
                 )
-                self._wait_for_configuration(function_name, True)
+                self._confirm_configuration_write(
+                    function_name,
+                    response["RevisionId"],
+                    written,
+                    {"Environment": new_env},
+                )
                 result.affected_resources = [function_name]
                 logger.info(
                     f"Corrupted environment variables for Lambda: {function_name}"
@@ -5685,7 +5783,8 @@ class LambdaChaosExperiment(ChaosExperiment):
                         environment[key] = self.original_env[key]
                     else:
                         environment.pop(key, None)
-            update["Environment"] = {"Variables": environment}
+            if environment != current.get("Environment", {}).get("Variables", {}):
+                update["Environment"] = {"Variables": environment}
         for attribute, property_name in (
             ("timeout", "Timeout"),
             ("memory", "MemorySize"),
@@ -5703,6 +5802,17 @@ class LambdaChaosExperiment(ChaosExperiment):
             if not revision:
                 raise SafetyViolation(
                     "Lambda recovery requires a configuration revision"
+                )
+            # Owned-looking values under another revision may be a later write.
+            if not self.lambda_confirmed_revision:
+                reason = self.lambda_ownership_refusal or "no successful update"
+                raise SafetyViolation(
+                    f"Lambda forward revision was not confirmed ({reason}); "
+                    "no cleanup is authorized, reconcile manually"
+                )
+            if revision != self.lambda_confirmed_revision:
+                raise SafetyViolation(
+                    "Lambda revision changed after the confirmed forward write; reconcile manually"
                 )
             self.lambda_client.update_function_configuration(
                 FunctionName=self.function_name, RevisionId=revision, **update
@@ -7771,15 +7881,35 @@ class WAFChaosExperiment(ChaosExperiment):
         "CHALLENGE": "Challenge",
     }
 
+    SINGLE_USE_RECOVERY = True
+
     def __init__(self, config: dict[str, Any], safety_controller: SafetyController):
         super().__init__(config, safety_controller)
         self.wafv2 = self.client("wafv2")
+
+    def _clear_recovery_ownership(self) -> None:
+        # Original-state records remain for read-only verification evidence.
+        self.rule_write_confirmed = False
+        self.ip_set_write_confirmed = False
+        self.rule_confirmed_generation = None
+        self.ip_set_confirmed_generation = None
+        self.owned_address_additions = set()
+
+    @staticmethod
+    def _next_lock_token(response: Any) -> str:
+        """Return the generation created by this execution's successful write."""
+        token = response.get("NextLockToken") if isinstance(response, dict) else None
+        if not isinstance(token, str) or not token:
+            raise SafetyViolation(
+                "WAF forward generation was not confirmed; reconcile manually"
+            )
+        return token
 
     def _web_acl_update(
         self,
         web_acl: dict[str, Any],
         lock_token: str,
-    ) -> None:
+    ) -> Any:
         """Submit all mutable Web ACL fields so unrelated settings are preserved."""
         request: dict[str, Any] = {
             "Scope": self.web_acl_scope,
@@ -7793,12 +7923,17 @@ class WAFChaosExperiment(ChaosExperiment):
         for field_name in self.UPDATE_FIELDS:
             if field_name in web_acl:
                 request[field_name] = web_acl[field_name]
-        self.wafv2.update_web_acl(**request)
+        return self.wafv2.update_web_acl(**request)
 
-    def _confirm_rule_write(self) -> None:
+    def _confirm_rule_write(self, update_response: Any) -> None:
+        generation = self._next_lock_token(update_response)
         response = self.wafv2.get_web_acl(
             Scope=self.web_acl_scope, Name=self.web_acl_name, Id=self.web_acl_id
         )
+        if response.get("LockToken") != generation:
+            raise SafetyViolation(
+                "WAF generation advanced before forward confirmation; reconcile manually"
+            )
         rules = [
             rule
             for rule in response["WebACL"].get("Rules", [])
@@ -7820,6 +7955,12 @@ class WAFChaosExperiment(ChaosExperiment):
             raise SafetyViolation(
                 "WAF forward post-state was not verified; reconcile manually"
             )
+        self.rule_confirmed_generation = (
+            self.web_acl_scope,
+            self.web_acl_name,
+            self.web_acl_id,
+            generation,
+        )
         self.rule_write_confirmed = True
 
     def _load_web_acl(
@@ -7876,14 +8017,19 @@ class WAFChaosExperiment(ChaosExperiment):
                 raise ConfigurationError(
                     "The selected WAF rule uses OverrideAction and cannot use this experiment"
                 )
+            current_action = matching_rule["Action"]
+            if isinstance(current_action, dict) and set(current_action) == {action_key}:
+                raise ConfigurationError(
+                    "The selected WAF rule already uses the requested action; "
+                    "no fault would be injected"
+                )
             if not self.dry_run:
                 self.changed_rule_name = rule_name
                 self.changed_rule_field = "Action"
                 self.original_rule_value = copy.deepcopy(matching_rule["Action"])
                 self.changed_rule_value = {action_key: {}}
                 matching_rule["Action"] = {action_key: {}}
-                self._web_acl_update(web_acl, lock_token)
-                self._confirm_rule_write()
+                self._confirm_rule_write(self._web_acl_update(web_acl, lock_token))
                 result.affected_resources = [web_acl_id]
                 logger.info(f"Modified rule {rule_name} to {action}")
             else:
@@ -7936,14 +8082,18 @@ class WAFChaosExperiment(ChaosExperiment):
             )
             if not isinstance(rate_statement, dict):
                 raise ConfigurationError("The selected WAF rule is not rate based")
+            if rate_statement.get("Limit") == limit:
+                raise ConfigurationError(
+                    "The selected WAF rule already uses the requested rate limit; "
+                    "no fault would be injected"
+                )
             if not self.dry_run:
                 self.changed_rule_name = rule_name
                 self.changed_rule_field = "RateBasedStatement.Limit"
                 self.original_rule_value = rate_statement["Limit"]
                 self.changed_rule_value = limit
                 rate_statement["Limit"] = limit
-                self._web_acl_update(web_acl, lock_token)
-                self._confirm_rule_write()
+                self._confirm_rule_write(self._web_acl_update(web_acl, lock_token))
             result.affected_resources = [web_acl_id]
             result.status = "completed"
 
@@ -7993,6 +8143,17 @@ class WAFChaosExperiment(ChaosExperiment):
                 Id=ip_set_id,
             )
             ip_set = response["IPSet"]
+            existing = set()
+            for address in ip_set["Addresses"]:
+                try:
+                    existing.add(str(ipaddress.ip_network(address, strict=False)))
+                except ValueError:
+                    existing.add(address)
+            if not set(addresses_to_add) - existing:
+                raise ConfigurationError(
+                    "WAF IP-set request adds no new approved address; "
+                    "no fault would be injected"
+                )
             self.original_addresses = list(ip_set["Addresses"])
             self.ip_set_write_confirmed = False
             self.owned_address_additions = set(addresses_to_add) - set(
@@ -8024,7 +8185,13 @@ class WAFChaosExperiment(ChaosExperiment):
                 with self._approved_sdk_request(
                     "wafv2", "update_ip_set", request, selectors
                 ) as admitted:
-                    self.wafv2.update_ip_set(**admitted)
+                    forward = self.wafv2.update_ip_set(**admitted)
+                self.ip_set_confirmed_generation = (
+                    scope,
+                    ip_set_name,
+                    ip_set_id,
+                    self._next_lock_token(forward),
+                )
                 self.ip_set_write_confirmed = True
                 result.affected_resources = sorted(approved)
                 logger.info(f"Added {len(addresses_to_add)} addresses to IP set")
@@ -8057,6 +8224,16 @@ class WAFChaosExperiment(ChaosExperiment):
                     Name=self.web_acl_name,
                     Id=self.web_acl_id,
                 )
+                # Equal values in a later generation may be another principal's.
+                if getattr(self, "rule_confirmed_generation", None) != (
+                    self.web_acl_scope,
+                    self.web_acl_name,
+                    self.web_acl_id,
+                    response.get("LockToken"),
+                ):
+                    raise SafetyViolation(
+                        "WAF generation advanced after the confirmed forward change; reconcile manually"
+                    )
                 current_acl = copy.deepcopy(response["WebACL"])
                 matches = [
                     rule
@@ -8095,6 +8272,16 @@ class WAFChaosExperiment(ChaosExperiment):
                     Name=self.ip_set_name,
                     Id=self.ip_set_id,
                 )
+                # A removed and re-added address in a later generation is not owned.
+                if getattr(self, "ip_set_confirmed_generation", None) != (
+                    self.ip_set_scope,
+                    self.ip_set_name,
+                    self.ip_set_id,
+                    response.get("LockToken"),
+                ):
+                    raise SafetyViolation(
+                        "WAF IP-set generation advanced after the confirmed forward change; reconcile manually"
+                    )
                 request = {
                     "Scope": self.ip_set_scope,
                     "Name": self.ip_set_name,

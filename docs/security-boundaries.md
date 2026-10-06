@@ -59,8 +59,8 @@ updates additionally require a one-use dispatch context created by their public
 experiment handlers. It binds a detached canonical request to the exact reviewed targets
 and selectors before the proxy records or sends it. Raw calls to those four SDK
 operations are refused, even with an allowlisted parent or during recovery.
-WAF recovery can remove only confirmed owned additions and preserves unrelated
-current addresses. These internal controls protect the supported APIs; they are
+WAF recovery can remove only confirmed owned additions, and only while the IP set
+remains at the generation its forward update created. These internal controls protect the supported APIs; they are
 not a Python sandbox against code that changes private framework objects.
 
 Live KMS grant revocation requires the complete immutable key ARN in both the
@@ -117,7 +117,10 @@ deployment. Failed recovery remains a failed result.
 Supported rollback restores verified pre-state rather than supplied YAML. WAF
 rule/rate rollback requires a successful forward return and uniquely verified
 post-state, patches only the selected field, refuses conflicting changes and
-uses the fresh service LockToken. Ambiguous writes require manual reconciliation.
+writes only under the confirmed post-forward LockToken. A later generation, even
+with the identical value, is refused. Ambiguous writes require manual
+reconciliation. Requests already satisfied by current WAF state fail before any
+write and claim no ownership or recovery.
 ELB recovery retains port and availability-zone identity. NACL recovery resolves
 the subnet's current association ID. Security-group ingress removal and recovery
 are planning only because their APIs cannot prove conditional write ownership.
@@ -197,6 +200,10 @@ and Lambda fields checks current state against original or
 experiment-owned state before restoring. Conflicting operator state observed by
 those checks is refused. These reads alone do not prevent later external writes.
 Lambda writes also use RevisionId and preserve unrelated environment variables.
+Lambda ownership is the `RevisionId` returned by the update itself; a settled read
+of any other revision is not adopted. Recovery writes require the current
+revision to equal it; WAF and Lambda recovery is single use and revokes the
+execution grant after verification or failure.
 S3/SNS whole-policy changes, EBS IOPS changes, OpenSearch node-count changes and
 security-group ingress changes retain planning and dry runs only. Live tokens,
 direct SDK dispatch and legacy recovery refuse these operations. Matching values,
@@ -254,7 +261,7 @@ manual reconciliation. The exact standalone smoke runtime comes from a new
 virtual environment populated only from the reviewed, hashed runtime lock.
 
 
-WAF IP-set recovery removes only addresses introduced by a confirmed successful experiment update. A rejected or transport-ambiguous forward update does not establish ownership; automatic cleanup is refused and recovery remains unverified until operator reconciliation. This conservative behavior can leave an experiment addition in place after a lost success response, but never authorizes deleting an operator-owned address based on an attempted write.
+WAF IP-set recovery removes only addresses introduced by a confirmed successful experiment update. A rejected or transport-ambiguous forward update does not establish ownership; automatic cleanup is refused and recovery remains unverified until operator reconciliation. This conservative behavior can leave an experiment addition in place after a lost success response, but never authorizes deleting an operator-owned address based on an attempted write. Ownership is bound to the update's `NextLockToken`; an address removed and re-added in any later generation is preserved and recovery is refused. A request whose addresses are all canonically present is refused before dispatch.
 
 ## Console privacy and publish payloads
 

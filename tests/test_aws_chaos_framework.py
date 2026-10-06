@@ -53,6 +53,7 @@ class FakeAWS:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
         self.clients: dict[str, FakeClient] = {}
         self.read_overrides: dict[tuple[str, str], list[Any]] = {}
+        self.write_responses: dict[tuple[str, str], list[Any]] = {}
 
     def client(self, service: str) -> FakeClient:
         return self.clients.setdefault(service, FakeClient(self, service))
@@ -67,6 +68,8 @@ class FakeAWS:
         override_key = (service, operation)
         if is_read and self.read_overrides.get(override_key):
             return self.read_overrides[override_key].pop(0)
+        if not is_read and self.write_responses.get(override_key):
+            return self.write_responses[override_key].pop(0)
 
         policy = json.dumps(
             {
@@ -484,6 +487,10 @@ class FakeAWS:
                     "Addresses": ["192.0.2.0/32"],
                 },
             },
+            # WAF returns the token of the new generation created by an update;
+            # the default reads above describe the earlier "lock-1" generation.
+            ("wafv2", "update_web_acl"): {"NextLockToken": "lock-2"},
+            ("wafv2", "update_ip_set"): {"NextLockToken": "lock-2"},
             ("kms", "describe_key"): {
                 "KeyMetadata": {"KeyId": "alias/chaos-test", "Enabled": True}
             },
@@ -1043,6 +1050,10 @@ def prepare_lambda_memory(aws, *, forward_failure=False):
         restored,
         restored,
     ]
+    # A successful conditional update returns the revision it created.
+    aws.write_responses[("lambda", "update_function_configuration")] = [
+        {"RevisionId": changed["RevisionId"]}
+    ]
     return values
 
 
@@ -1434,7 +1445,15 @@ def test_live_waf_rule_change_uses_lock_token_and_restores() -> None:
     original = fake_aws.respond("wafv2", "get_web_acl", {})
     changed = copy.deepcopy(original)
     changed["WebACL"]["Rules"][0]["Action"] = {"Count": {}}
-    fake_aws.read_overrides[("wafv2", "get_web_acl")] = [original, changed, changed]
+    # The forward update creates generation lock-2; recovery creates lock-3.
+    changed["LockToken"] = "lock-2"
+    restored = {**copy.deepcopy(original), "LockToken": "lock-3"}
+    fake_aws.read_overrides[("wafv2", "get_web_acl")] = [
+        original,
+        changed,
+        changed,
+        restored,
+    ]
     action_config = action_configs()[framework.ChaosType.WAF_RULE_MODIFY]
     experiment = make_experiment(
         framework.ChaosType.WAF_RULE_MODIFY,
@@ -1451,7 +1470,9 @@ def test_live_waf_rule_change_uses_lock_token_and_restores() -> None:
     assert len(updates) == 2
     assert updates[0][2]["LockToken"] == "lock-1"
     assert updates[0][2]["Rules"][0]["Action"] == {"Count": {}}
+    assert updates[1][2]["LockToken"] == "lock-2"
     assert updates[1][2]["Rules"][0]["Action"] == {"Block": {}}
+    assert experiment.rollback_verified
 
 
 def test_iam_self_protection_blocks_active_role_and_access_key() -> None:

@@ -212,7 +212,8 @@ def test_failed_recovery_blocks_continue_policy_and_separate_orchestrators():
                 raise RuntimeError("Synthetic recovery failed before restoration")
             state["MemorySize"] = value
             state["RevisionId"] = "updated-revision"
-            return {}
+            # Like the service, the update returns the revision it created.
+            return {"RevisionId": state["RevisionId"]}
         return original(service, operation, request)
 
     aws.respond = model

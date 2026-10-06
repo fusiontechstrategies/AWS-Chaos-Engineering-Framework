@@ -137,11 +137,12 @@ def test_waf_rollback_needs_confirmed_forward_write(kind, method, outcome):
         changed["WebACL"]["Rules"][0]["Statement"]["RateBasedStatement"]["Limit"] = (
             values["limit"]
         )
+    # Forward creates generation lock-2, recovery lock-3; a mismatch keeps lock-2.
     aws.read_overrides[("wafv2", "get_web_acl")] = [
         before,
-        changed if outcome == "confirmed" else before,
-        changed,
-        before,
+        {**(changed if outcome == "confirmed" else before), "LockToken": "lock-2"},
+        {**changed, "LockToken": "lock-2"},
+        {**before, "LockToken": "lock-3"},
     ]
     respond = aws.respond
 
@@ -161,6 +162,10 @@ def test_waf_rollback_needs_confirmed_forward_write(kind, method, outcome):
         item.run_rollback()
         assert len([c for c in aws.calls if c[1] == "update_web_acl"]) == 2
         assert all(c[2]["LockToken"] for c in aws.calls if c[1] == "update_web_acl")
+        assert [c[2]["LockToken"] for c in aws.calls if c[1] == "update_web_acl"] == [
+            "lock-1",
+            "lock-2",
+        ]
     else:
         assert result.status == "failed"
         before_calls = len(aws.calls)
