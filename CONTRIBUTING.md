@@ -17,8 +17,8 @@ Thank you for helping improve the AWS Chaos Engineering Framework.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes --only-binary :all: -r requirements-pip-lock.txt
+python -m pip install --require-hashes --only-binary :all: -r requirements-dev-lock.txt -r requirements-build-lock.txt
 ```
 
 Run the release checks:

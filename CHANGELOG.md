@@ -12,8 +12,10 @@
   `rds_backup_retention_modify`. AWS offers no conditional generation or
   exclusive lease for these requests, so a write could activate changes queued
   after admission, and failover could restart cluster members outside the
-  approved target count. The queued-change, cluster-member and ARN checks
-  remain in place and still run in plan mode.
+  approved target count. The queued-change and cluster-member checks still run
+  in plan mode. The response-ARN and transition-completion checks are retained
+  but apply only to live dispatch, which is now refused, so a successful plan
+  does not establish them.
 - All four types now report `live_supported: false` (`LIVE no` in
   `--list-experiments`). Live tokens, live suites, execution grants, historical
   recovery and the `PurgeQueue`, `RebootDBInstance`, `FailoverDBCluster` and
@@ -82,6 +84,19 @@
   implementation, deny their S3 encryption, Kinesis, ECS and CloudFront writes
   at the SDK proxy, and delete a Directory Service trust only when exactly the approved
   `TrustId` is returned.
+- Install routine CI tooling only from reviewed hash locks with
+  `--require-hashes --only-binary :all:`. A hashed `requirements-pip-lock.txt`
+  replaces the runtime `pip install --upgrade pip`; the new complete,
+  cross-platform `requirements-dev-lock.txt` is installed with the release
+  `requirements-build-lock.txt`. Smoke environments install the hashed runtime
+  or build lock before adding the local wheel or sdist with `--no-deps`, and
+  `pip-audit` audits the hashed locks with `--disable-pip` instead of resolving
+  unhashed requirements. The sandboxed candidate runtime also installs its
+  hashed runtime lock wheel-only, as do the three hash-locked installs in the
+  tag-triggered release workflow. The workflow regression tests enforce this
+  contract for every lock install, reject unreviewed installer lines and pin
+  the exact bytes of both workflow files to a reviewed digest, so any workflow
+  change (including action bumps) must be reviewed and the digest updated.
 
 All notable changes to this project are documented here.
 

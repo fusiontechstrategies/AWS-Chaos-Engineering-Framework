@@ -194,8 +194,10 @@ encryption restoration is also refused at SDK dispatch. These paths cannot be
 used to recover old executions automatically.
 SQS queue purge and RDS reboot, cluster failover and backup-retention changes
 are likewise planning only. Their plans still read the reviewed queue or DB
-resources and apply the queue-owner, queued-change and cluster-member checks,
-which remain in place as defence in depth. Live tokens, live suites, execution
+resources and apply the RDS queued-change and cluster-member checks. The
+resolved queue-owner comparison, RDS response-ARN checks and transition
+completion checks are retained as defence in depth but run only on live
+dispatch, which is refused, so a successful plan does not establish them. Live tokens, live suites, execution
 grants (including recovery of a historical execution) and the `PurgeQueue`,
 `RebootDBInstance`, `FailoverDBCluster` and `ModifyDBInstance` SDK requests are
 refused, and `--list-experiments` reports `LIVE no` for all four types. A larger
