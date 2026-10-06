@@ -470,10 +470,12 @@ def test_rds_retention_cannot_claim_data_recovery_even_without_concurrent_change
     operator["DBInstances"][0]["BackupRetentionPeriod"] = 14
     aws.read_overrides[("rds", "describe_db_instances")] = [original, owned, operator]
     item, values = experiment(framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY, aws)
+    # Live retention is planning only: the helper proved live refusal first.
+    assert item.dry_run
     assert item.modify_backup_retention(**values).status == "completed"
     with pytest.raises(framework.SafetyViolation, match="irreversible"):
         item.run_rollback()
-    assert len([call for call in aws.calls if call[1] == "modify_db_instance"]) == 1
+    assert not [call for call in aws.calls if call[1] == "modify_db_instance"]
     assert not item.rollback_verified
 
 
@@ -486,10 +488,11 @@ def test_rds_original_retention_with_pending_change_is_not_verified():
     current["DBInstances"][0]["PendingModifiedValues"] = {"BackupRetentionPeriod": 0}
     aws.read_overrides[("rds", "describe_db_instances")] = [original, owned, current]
     item, values = experiment(framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY, aws)
+    assert item.dry_run
     assert item.modify_backup_retention(**values).status == "completed"
     with pytest.raises(framework.SafetyViolation, match="irreversible"):
         item.run_rollback()
-    assert item.mutation_attempts == ["rds.modify_db_instance"]
+    assert item.mutation_attempts == []
     assert not item.rollback_verified
 
 

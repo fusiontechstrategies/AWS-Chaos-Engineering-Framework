@@ -560,6 +560,17 @@ CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
         ChaosType.IAM_USER_ACCESS_KEY_DEACTIVATE,
         ChaosType.ECR_REPOSITORY_POLICY_RESTRICT,
         ChaosType.CODECOMMIT_TRIGGER_DELETE,
+        # PurgeQueue deletes whatever the queue holds when AWS processes it; it
+        # cannot be conditioned on an exact, immutable message set, so no
+        # approved blast radius bounds the destroyed messages.
+        ChaosType.SQS_QUEUE_PURGE,
+        # RDS offers no conditional generation or exclusive lease. A reboot,
+        # failover or ApplyImmediately retention write can activate changes
+        # another principal queues after admission, and failover can restart
+        # members outside the approved target count.
+        ChaosType.RDS_FAILOVER,
+        ChaosType.RDS_REBOOT,
+        ChaosType.RDS_BACKUP_RETENTION_MODIFY,
     }
 )
 # These APIs have no conditional ownership/revision argument. A local lock or
@@ -624,6 +635,11 @@ CONCURRENCY_UNSAFE_MUTATIONS = frozenset(
         "ecr.set_repository_policy",
         "ecr.delete_repository_policy",
         "codecommit.put_repository_triggers",
+        # Unconditioned destroyed set / activation of changes queued by others.
+        "sqs.purge_queue",
+        "rds.failover_db_cluster",
+        "rds.reboot_db_instance",
+        "rds.modify_db_instance",
         # Writes reachable only from experiment types without a reviewed live
         # implementation; refused here as well as at the execution grant.
         "s3.delete_bucket_encryption",

@@ -33,11 +33,10 @@ def worker(aws, kind=framework.ChaosType.LAMBDA_MEMORY_LIMIT, values=None):
     return make_orchestrator(kind, values, aws, dry_run=False)
 
 
-# S3 lifecycle expiration is planning only (no conditional lifecycle revision);
-# Kinesis retention is the other irreversible retention change with live support.
-@pytest.mark.parametrize(
-    "kind", ["rds_backup_retention_modify", "kinesis_retention_modify"]
-)
+# S3 lifecycle expiration is planning only (no conditional lifecycle revision),
+# as is RDS backup retention (ApplyImmediately can activate changes queued by
+# others). Kinesis retention is the irreversible retention change with live support.
+@pytest.mark.parametrize("kind", ["kinesis_retention_modify"])
 @pytest.mark.parametrize(
     "cli,configuration", [(False, False), (True, False), (False, True), (True, True)]
 )
@@ -100,6 +99,32 @@ def test_destructive_retention_requires_both_approvals_and_stronger_token(
         with pytest.raises(framework.SafetyViolation, match="both"):
             item.run_experiment_suite(suite)
         assert not ran
+
+
+@pytest.mark.parametrize("configuration", [False, True])
+def test_rds_retention_receives_no_live_token_even_with_both_approvals(configuration):
+    kind = framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY
+    config = framework.yaml.safe_load(framework.SAMPLE_CONFIG)
+    config["global"]["account_id"] = ACCOUNT_ID
+    config["safety"]["allow_irreversible"] = configuration
+    config["safety"]["safety_alarms"] = ["synthetic-alarm"]
+    suite = next(iter(config["experiment_suites"]))
+    values = {"type": kind.value, **action_configs()[kind]}
+    config["experiment_suites"][suite]["experiments"] = [values]
+    config["safety"]["target_allowlist"] = sorted(
+        framework.ChaosOrchestrator._target_values(values)
+    )
+    assert not framework.experiment_metadata(kind).live_supported
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        framework.confirmation_token(config, suite)
+    aws = FakeAWS(reject_writes=True)
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_orchestrator(kind, action_configs()[kind], aws, dry_run=False)
+    assert not aws.calls
 
 
 def test_s3_expiration_never_claims_recovery_of_deleted_objects():

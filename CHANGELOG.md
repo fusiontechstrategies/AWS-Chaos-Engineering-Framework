@@ -2,6 +2,25 @@
 
 ## Unreleased security follow-ups
 
+### Planning-only SQS purge and RDS reboot, failover and retention
+
+- Withdraw live support for `sqs_queue_purge`. `PurgeQueue` deletes whatever the
+  queue holds when AWS processes it and cannot be conditioned on an exact,
+  immutable message set, so the approved blast radius could not bound the
+  messages destroyed.
+- Withdraw live support for `rds_failover`, `rds_reboot` and
+  `rds_backup_retention_modify`. AWS offers no conditional generation or
+  exclusive lease for these requests, so a write could activate changes queued
+  after admission, and failover could restart cluster members outside the
+  approved target count. The queued-change, cluster-member and ARN checks
+  remain in place and still run in plan mode.
+- All four types now report `live_supported: false` (`LIVE no` in
+  `--list-experiments`). Live tokens, live suites, execution grants, historical
+  recovery and the `PurgeQueue`, `RebootDBInstance`, `FailoverDBCluster` and
+  `ModifyDBInstance` SDK requests are refused; dry-run plans are unchanged. This
+  is a compatibility change: existing live configurations for these types can
+  still produce plans but can no longer obtain a live token.
+
 - Pin live sessions to one verified credential snapshot, keeping the selected
   profile's non-credential configuration, so a refreshable profile cannot later
   sign as another account, and require name-only RDS and Kinesis

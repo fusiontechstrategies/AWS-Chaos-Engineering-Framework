@@ -224,9 +224,10 @@ process. Live automatic recovery cannot be disabled, and the configured delay
 between live experiments starts after the preceding experiment finishes recovery.
 
 RDS backup-retention changes and S3 lifecycle expiration are irreversible actions.
-Live retention changes require both irreversible approvals and the
-LIVE-IRREVERSIBLE confirmation, and cannot claim automatic recovery. S3 lifecycle
-expiration is planning only; its plan is prefix scoped and never whole-bucket.
+Both are planning only: no approval combination issues a live token for them, and
+their plans cannot claim automatic recovery. The S3 lifecycle plan is prefix
+scoped and never whole-bucket. Kinesis retention decreases remain live supported
+and require both irreversible approvals and the LIVE-IRREVERSIBLE confirmation.
 Restoring settings cannot recover backups or objects already deleted. EC2 termination and EBS detach create no implicit
 snapshots. Arrange and approve any required backups separately before approving
 these actions; neither action creates persistent data copies.
@@ -337,9 +338,15 @@ VPC deletion requires an explicitly successful service result, followed by exact
 target absence (including the matching not-found error) or the authoritative
 `deleted` peering tombstone. EC2 may retain deleted peering records temporarily.
 A rejection, unknown result or bounded read-back timeout is a failed result.
-RDS failover requires a different exact writer and available cluster state.
-RDS reboot requires an observed rebooting state followed by available. An API
-acceptance or an unchanged available response alone does not prove completion.
+RDS failover, RDS reboot and RDS backup-retention changes are planning only.
+AWS offers no conditional generation or exclusive lease for these requests, so a
+change queued after admission could be activated by the write, and a failover
+can restart cluster members outside the approved target count. The checks below
+are retained as defence in depth and are evaluated by plans: RDS failover
+completion requires a different exact writer and available cluster state, and
+RDS reboot completion requires an observed rebooting state followed by
+available. An API acceptance or an unchanged available response alone does not
+prove completion.
 
 `ApplyImmediately` also applies every pending modification. A reboot applies
 `pending-reboot` DB parameter-group changes and, for a cluster member, static
@@ -360,7 +367,8 @@ every member instance (at most 16, each read once) passing the same instance
 checks as a reboot. The checks use reads taken immediately before the write and
 apply in plan mode too. Every refusal from these checks, including an
 unavailable instance or cluster, records `queued_change_refusal`. They are not
-conditional writes: a change queued after those reads is outside this boundary.
+conditional writes: a change queued after those reads is outside this boundary,
+which is why live reboot, failover and retention changes are withdrawn.
 
 Lambda environment handlers read variables only when `Environment.Variables` is
 present and `Environment.Error` is absent; a missing `Environment` means no
@@ -374,13 +382,15 @@ denied at the SDK proxy. Directory
 Service trust deletion requires exactly one returned trust with the approved
 `TrustId`.
 
-SQS purge configuration requires `queue_arn` as well as `queue_url`. The reviewed
-ARN must exactly match the configured partition, region and account, and the
-native HTTPS queue URL must name the same account and queue. Operators obtain
-QueueArn through a read-only lookup before reviewing the configuration. The
-offline token binds that explicit owner identity; live code resolves and compares
-it again through the final SDK dispatch. Foreign, missing or changed owners fail
-closed before PurgeQueue. No token generator performs an AWS lookup.
+SQS queue purge is planning only. `PurgeQueue` cannot be conditioned on an exact,
+immutable message set, so neither the approved blast radius nor an owner check
+bounds the messages it deletes. Live tokens and execution grants are refused and
+the SDK proxy rejects `PurgeQueue`. Purge configuration still requires
+`queue_arn` as well as `queue_url`. The reviewed ARN must exactly match the
+configured partition, region and account, and the native HTTPS queue URL must
+name the same account and queue; foreign or missing owners are rejected during
+token generation before the planning-only refusal. No token generator performs
+an AWS lookup.
 
 Enabled GuardDuty checks consider all non-archived high/critical findings across
 all detectors, without a last-update cutoff. Enabled Security Hub checks block
@@ -410,10 +420,11 @@ account, partition and principal. The pinned session keeps the selected
 such as `ca_bundle` and `use_fips_endpoint`, still applies; only the credential
 source is replaced by the explicit static snapshot. A refreshable profile cannot rotate to
 another identity mid-run; the snapshot can only expire, which fails closed, so
-temporary credentials must outlive the run. Name-only RDS and Kinesis reads must
-also return a `DBInstanceArn`, `DBClusterArn` or `StreamARN` with the reviewed
-partition, region, account and resource name before a reboot, failover,
-retention change or stream retention decrease.
+temporary credentials must outlive the run. Name-only Kinesis reads must also
+return a `StreamARN` with the reviewed partition, region, account and resource
+name before a live stream retention decrease. The equivalent `DBInstanceArn` and
+`DBClusterArn` checks remain on the planning-only RDS reboot, failover and
+retention handlers.
 
 ## Denied-target policy migration
 

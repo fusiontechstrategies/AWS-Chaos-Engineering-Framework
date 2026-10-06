@@ -231,36 +231,25 @@ def test_sqs_foreign_owner_cannot_receive_token_or_purge(foreign):
     assert not aws.calls
 
 
-@pytest.mark.parametrize("changed_at", [0, 1, 2])
-def test_sqs_checks_resolved_owner_through_final_dispatch(changed_at):
-    aws = FakeAWS(reject_writes=False)
-    reads = [{"Attributes": {"QueueArn": QUEUE_ARN}} for _ in range(3)]
-    reads[changed_at]["Attributes"]["QueueArn"] = QUEUE_ARN.replace(
-        ACCOUNT_ID, "999988887777"
-    )
-    aws.read_overrides[("sqs", "get_queue_attributes")] = reads
-    item = live_experiment(f.ChaosType.SQS_QUEUE_PURGE, aws, queue_arn=QUEUE_ARN)
-    assert item.purge_queue(QUEUE_URL).status == "failed"
-    assert not any(call[1] == "purge_queue" for call in aws.calls)
-
-
-def test_sqs_owner_bound_token_and_final_dispatch_success():
+# PurgeQueue cannot be conditioned on an exact message set, so SQS purge is
+# planning only. A correctly owned queue still receives no live token or grant.
+def test_sqs_owner_bound_purge_receives_no_live_token_or_dispatch():
     cfg = config_for(
         f.ChaosType.SQS_QUEUE_PURGE, queue_url=QUEUE_URL, queue_arn=QUEUE_ARN
     )
-    token = f.confirmation_token(cfg, "test")
-    other = copy.deepcopy(cfg)
-    other["experiment_suites"]["test"]["experiments"][0]["queue_arn"] = (
-        QUEUE_ARN.replace("chaos-test-queue", "different-queue")
-    )
-    other["experiment_suites"]["test"]["experiments"][0]["queue_url"] = (
-        QUEUE_URL.replace("chaos-test-queue", "different-queue")
-    )
-    assert f.confirmation_token(other, "test") != token
-    aws = FakeAWS(reject_writes=False)
-    item = live_experiment(f.ChaosType.SQS_QUEUE_PURGE, aws, queue_arn=QUEUE_ARN)
+    with pytest.raises(f.ConfigurationError, match="Live approval is unavailable"):
+        f.confirmation_token(cfg, "test")
+    aws = FakeAWS(reject_writes=True)
+    with pytest.raises(f.ConfigurationError, match="Live approval is unavailable"):
+        live_experiment(f.ChaosType.SQS_QUEUE_PURGE, aws, queue_arn=QUEUE_ARN)
+    assert not aws.calls
+    values = {**action_configs()[f.ChaosType.SQS_QUEUE_PURGE], "queue_arn": QUEUE_ARN}
+    item = make_experiment(f.ChaosType.SQS_QUEUE_PURGE, values, aws, dry_run=True)
     assert item.purge_queue(QUEUE_URL).status == "completed"
-    assert sum(call[1] == "get_queue_attributes" for call in aws.calls) == 3
+    with pytest.raises(f.SafetyViolation):
+        item.sqs.purge_queue(QueueUrl=QUEUE_URL)
+    assert not any(call[1] == "purge_queue" for call in aws.calls)
+    assert item.mutation_attempts == []
 
 
 def test_guardduty_active_old_finding_in_later_detector_and_page_blocks():
@@ -379,39 +368,72 @@ def test_cli_role_override_fails_before_session_or_sts(tmp_path, monkeypatch, ro
         f.confirmation_token(cfg, "test", {"role_arn": role})
 
 
+def planned_rds(kind, aws):
+    """RDS failover/reboot are planning only: refuse live, return the plan."""
+    with pytest.raises(f.ConfigurationError, match="Live approval is unavailable"):
+        live_experiment(kind, aws)
+    assert not aws.calls
+    return make_experiment(
+        kind,
+        {**action_configs()[kind], "state_timeout_seconds": 12},
+        aws,
+        dry_run=True,
+    )
+
+
 @pytest.mark.parametrize("changed", [True, False])
 def test_rds_failover_requires_writer_change_not_unchanged_available(
     changed, monkeypatch
 ):
-    aws = FakeAWS(reject_writes=False)
+    aws = FakeAWS(reject_writes=True)
     before = aws.respond("rds", "describe_db_clusters", {})
+    aws.calls.clear()
     after = copy.deepcopy(before)
     for member in after["DBClusters"][0]["DBClusterMembers"]:
         member["IsClusterWriter"] = not member["IsClusterWriter"]
-    aws.read_overrides[("rds", "describe_db_clusters")] = [
-        copy.deepcopy(before)
-    ] * 3 + ([after, after] if changed else [copy.deepcopy(before)] * 10)
-    item = live_experiment(f.ChaosType.RDS_FAILOVER, aws)
+    aws.read_overrides[("rds", "describe_db_clusters")] = [copy.deepcopy(before)] + (
+        [after, after] if changed else [copy.deepcopy(before)] * 10
+    )
+    item = planned_rds(f.ChaosType.RDS_FAILOVER, aws)
     fast_poll(item, monkeypatch)
-    result = item.failover_db_cluster("chaos-test-cluster")
-    assert result.status == ("completed" if changed else "failed")
-    assert sum(call[1] == "describe_db_clusters" for call in aws.calls) >= 4
+    # The retained transition evidence check never accepts an unchanged writer.
+    if changed:
+        metrics = item._wait_for_cluster_available(
+            "chaos-test-cluster", original_writer="chaos-test-db"
+        )
+        assert metrics["status"] == "available"
+    else:
+        with pytest.raises(TimeoutError):
+            item._wait_for_cluster_available(
+                "chaos-test-cluster", original_writer="chaos-test-db"
+            )
+    assert sum(call[1] == "describe_db_clusters" for call in aws.calls) >= 2
+    assert not any(call[1] == "failover_db_cluster" for call in aws.calls)
 
 
 @pytest.mark.parametrize("transition", [True, False])
 def test_rds_reboot_requires_observed_reboot_then_available(transition, monkeypatch):
-    aws = FakeAWS(reject_writes=False)
+    aws = FakeAWS(reject_writes=True)
     before = aws.respond("rds", "describe_db_instances", {})
+    aws.calls.clear()
     reboot = copy.deepcopy(before)
     reboot["DBInstances"][0]["DBInstanceStatus"] = "rebooting"
-    aws.read_overrides[("rds", "describe_db_instances")] = [
-        copy.deepcopy(before)
-    ] * 2 + ([reboot, before] if transition else [copy.deepcopy(before)] * 10)
-    item = live_experiment(f.ChaosType.RDS_REBOOT, aws)
-    fast_poll(item, monkeypatch)
-    assert item.reboot_db_instance("chaos-test-db").status == (
-        "completed" if transition else "failed"
+    aws.read_overrides[("rds", "describe_db_instances")] = (
+        [reboot, before] if transition else [copy.deepcopy(before)] * 10
     )
+    item = planned_rds(f.ChaosType.RDS_REBOOT, aws)
+    fast_poll(item, monkeypatch)
+    # The retained transition evidence check never accepts "available" alone.
+    if transition:
+        item._wait_for_db_instance_available(
+            "chaos-test-db", True, require_transition=True
+        )
+    else:
+        with pytest.raises(TimeoutError):
+            item._wait_for_db_instance_available(
+                "chaos-test-db", True, require_transition=True
+            )
+    assert not any(call[1] == "reboot_db_instance" for call in aws.calls)
 
 
 @pytest.mark.parametrize(
@@ -565,28 +587,9 @@ def test_live_preflight_and_duration_failure_latch_every_controller(path, raises
     assert earlier.rollback_operations == ["lambda.update_function_configuration"]
 
 
-def test_stop_during_final_sqs_owner_read_blocks_dispatch_and_attempt():
-    aws = FakeAWS(reject_writes=False)
-    original = aws.respond
-    reads = [0]
-
-    def respond(service, operation, request):
-        if operation == "get_queue_attributes":
-            reads[0] += 1
-            if reads[0] == 3:
-                f._PROCESS_EMERGENCY_STOP.set()
-        return original(service, operation, request)
-
-    aws.respond = respond
-    item = live_experiment(f.ChaosType.SQS_QUEUE_PURGE, aws, queue_arn=QUEUE_ARN)
-    assert item.purge_queue(QUEUE_URL).status == "failed"
-    assert item.mutation_attempts == []
-    assert not any(call[1] == "purge_queue" for call in aws.calls)
-
-
-@pytest.mark.parametrize(
-    "method", ["vpc", "peering_deleted", "peering_not_found", "cluster", "reboot"]
-)
+# Live SQS purge and RDS failover/reboot are planning only, so no forward wait
+# for them can be reached live; see test_final_cloud_c11_planning_only.py.
+@pytest.mark.parametrize("method", ["vpc", "peering_deleted", "peering_not_found"])
 def test_stop_during_terminal_read_cannot_complete_forward_wait(method):
     aws = FakeAWS(reject_writes=False)
     session = SimpleNamespace(client=lambda service, **kwargs: aws.client(service))
@@ -604,7 +607,7 @@ def test_stop_during_terminal_read_cannot_complete_forward_wait(method):
 
         def call():
             return item._wait_for_vpc_deletion("vpce-0123456789abcdef0", peering=False)
-    elif method in {"peering_deleted", "peering_not_found"}:
+    else:
         item = live_experiment(
             f.ChaosType.VPC_ENDPOINT_DELETE
             if method == "vpc"
@@ -623,45 +626,11 @@ def test_stop_during_terminal_read_cannot_complete_forward_wait(method):
 
         def call():
             return item._wait_for_vpc_deletion("pcx-0123456789abcdef0", peering=True)
-    elif method == "cluster":
-        item = live_experiment(
-            f.ChaosType.RDS_FAILOVER if method == "cluster" else f.ChaosType.RDS_REBOOT,
-            aws,
-        )
-        operation = "describe_db_clusters"
-        result = aws.respond("rds", operation, {})
-        for member in result["DBClusters"][0]["DBClusterMembers"]:
-            member["IsClusterWriter"] = not member["IsClusterWriter"]
 
-        def call():
-            return item._wait_for_cluster_available(
-                "chaos-test-cluster", original_writer="chaos-test-db"
-            )
-    else:
-        item = live_experiment(
-            f.ChaosType.RDS_FAILOVER if method == "cluster" else f.ChaosType.RDS_REBOOT,
-            aws,
-        )
-        operation = "describe_db_instances"
-        result = aws.respond("rds", operation, {})
-
-        def call():
-            return item._wait_for_db_instance_available(
-                "chaos-test-db", True, require_transition=True
-            )
-
-        item._wait_forward = lambda seconds: None
-
-    reboot_seen = [False]
     original = aws.respond
 
     def respond(service, op, request):
         if op == operation:
-            if method == "reboot" and not reboot_seen[0]:
-                reboot_seen[0] = True
-                rebooting = copy.deepcopy(result)
-                rebooting["DBInstances"][0]["DBInstanceStatus"] = "rebooting"
-                return rebooting
             f._PROCESS_EMERGENCY_STOP.set()
             if method == "peering_not_found":
                 raise f.ClientError(
@@ -674,9 +643,3 @@ def test_stop_during_terminal_read_cannot_complete_forward_wait(method):
     aws.respond = respond
     with pytest.raises(f.EmergencyStop):
         call()
-    if method in {"cluster", "reboot"}:
-        item._in_rollback = True
-        if method == "cluster":
-            item._wait_for_cluster_available("chaos-test-cluster", False)
-        else:
-            item._wait_for_db_instance_available("chaos-test-db", False)

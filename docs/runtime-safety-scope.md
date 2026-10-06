@@ -129,6 +129,9 @@ The following types support dry-run planning and advertise `live_supported: fals
 - `ecs_service_update`, `ecs_container_instance_drain`
 - `appstream_fleet_stop`, `appstream_stack_disassociate`
 - `ds_conditional_forwarder_delete`
+- `sqs_queue_purge` (the destroyed message set cannot be bounded)
+- `rds_failover`, `rds_reboot`, `rds_backup_retention_modify` (no conditional
+  generation or exclusive lease against changes queued after admission)
 
 These APIs cannot atomically prove that the state being reversed still belongs
 to this execution. A local lock, successful forward response, unchanged scalar,
@@ -161,12 +164,16 @@ all refuse the affected operations; a previous grant does not restore support.
 | ECS service count and container instance state | Current update requests do not condition restoration on an owned revision. A matching desired count is insufficient. |
 | AppStream fleet state and association | Current start/stop and associate/disassociate requests have no caller-owned revision. A service concurrent-modification error is not such a condition. |
 | Directory Service conditional forwarder | Name-based deletion cannot bind the selected forwarder's generation. Recreating a saved address list does not establish that the name still belongs to this execution. |
+| SQS queue purge | `PurgeQueue` deletes whatever the queue holds when AWS processes the request. It cannot be conditioned on an exact, immutable message set, so no approved blast radius or owner check bounds the messages destroyed. `PurgeQueue` is refused at the SDK proxy. |
+| RDS reboot, cluster failover and backup retention | `RebootDBInstance`, `FailoverDBCluster` and `ModifyDBInstance` with `ApplyImmediately` accept no conditional generation or exclusive lease. A reboot, failover or immediate modification can also activate parameter, option-group or instance changes another principal queues after the plan's reads, and a failover can restart cluster members that are not counted as approved targets. All three requests are refused at the SDK proxy. |
 
 The SDK operation inventory is evaluated against the pinned Botocore model;
 unconditional retries or additional reads do not supply absent service conditions.
 See the request contracts for
 [EFS](https://docs.aws.amazon.com/efs/latest/APIReference/API_UpdateFileSystem.html),
 [RDS](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_ModifyDBParameterGroup.html),
+[RDS reboot](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_RebootDBInstance.html),
+[SQS purge](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_PurgeQueue.html),
 [Lambda concurrency](https://docs.aws.amazon.com/lambda/latest/api/API_PutFunctionConcurrency.html),
 [S3 deletion](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html),
 [ECS](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_UpdateService.html),
@@ -185,6 +192,14 @@ SES configuration-set deletion likewise keeps its declared irreversible scope;
 legacy configuration-set recreation is refused. Previously unsupported S3
 encryption restoration is also refused at SDK dispatch. These paths cannot be
 used to recover old executions automatically.
+SQS queue purge and RDS reboot, cluster failover and backup-retention changes
+are likewise planning only. Their plans still read the reviewed queue or DB
+resources and apply the queue-owner, queued-change and cluster-member checks,
+which remain in place as defence in depth. Live tokens, live suites, execution
+grants (including recovery of a historical execution) and the `PurgeQueue`,
+`RebootDBInstance`, `FailoverDBCluster` and `ModifyDBInstance` SDK requests are
+refused, and `--list-experiments` reports `LIVE no` for all four types. A larger
+`max_blast_radius` or irreversible approval does not restore live support.
 
 ### Exact Lambda identity and terminal recovery state
 

@@ -30,6 +30,7 @@ from botocore.credentials import (
 )
 from test_aws_chaos_framework import (
     ACCOUNT_ID,
+    INSTANCE_ID,
     REGION,
     FakeAWS,
     FakeClientError,
@@ -140,34 +141,25 @@ def live_config(
 # pinning. FIPS endpoints differ from regional ones in the commercial region.
 PROFILE = "chaos-pinned"
 PROFILE_REGION = "us-east-1"
-PROFILE_DB_ARN = f"arn:aws:rds:{PROFILE_REGION}:{ACCOUNT_ID}:db:chaos-test-db"
 
 
-def rds_instances_xml(status: str) -> bytes:
+def ec2_instances_xml(state: str) -> bytes:
     return (
-        '<DescribeDBInstancesResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">'
-        "<DescribeDBInstancesResult><DBInstances><DBInstance>"
-        "<DBInstanceIdentifier>chaos-test-db</DBInstanceIdentifier>"
-        f"<DBInstanceArn>{PROFILE_DB_ARN}</DBInstanceArn>"
-        f"<DBInstanceStatus>{status}</DBInstanceStatus><MultiAZ>true</MultiAZ>"
-        "<DBParameterGroups><DBParameterGroup>"
-        "<DBParameterGroupName>chaos-test-params</DBParameterGroupName>"
-        "<ParameterApplyStatus>in-sync</ParameterApplyStatus>"
-        "</DBParameterGroup></DBParameterGroups>"
-        "</DBInstance></DBInstances></DescribeDBInstancesResult>"
-        "<ResponseMetadata><RequestId>r</RequestId></ResponseMetadata>"
-        "</DescribeDBInstancesResponse>"
+        '<DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">'
+        "<requestId>r</requestId><reservationSet><item>"
+        "<reservationId>r-0123456789abcdef0</reservationId>"
+        f"<ownerId>{ACCOUNT_ID}</ownerId><instancesSet><item>"
+        f"<instanceId>{INSTANCE_ID}</instanceId>"
+        f"<instanceState><code>16</code><name>{state}</name></instanceState>"
+        "</item></instancesSet></item></reservationSet>"
+        "</DescribeInstancesResponse>"
     ).encode()
 
 
 REBOOT_XML = (
-    b'<RebootDBInstanceResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">'
-    b"<RebootDBInstanceResult><DBInstance>"
-    b"<DBInstanceIdentifier>chaos-test-db</DBInstanceIdentifier>"
-    b"<DBInstanceStatus>rebooting</DBInstanceStatus>"
-    b"</DBInstance></RebootDBInstanceResult>"
-    b"<ResponseMetadata><RequestId>r</RequestId></ResponseMetadata>"
-    b"</RebootDBInstanceResponse>"
+    b'<RebootInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">'
+    b"<requestId>r</requestId><return>true</return>"
+    b"</RebootInstancesResponse>"
 )
 
 
@@ -207,7 +199,6 @@ def offline_profile_aws(monkeypatch, tmp_path, provider=None):
     monkeypatch.setenv("AWS_CONFIG_FILE", str(config_file))
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_file))
     signed: list[tuple[str, str, str]] = []
-    statuses = ["available", "rebooting", "available"]
 
     def offline(request, event_name, **_kwargs):
         operation = event_name.rsplit(".", 1)[-1]
@@ -218,10 +209,9 @@ def offline_profile_aws(monkeypatch, tmp_path, provider=None):
         if operation == "GetCallerIdentity":
             account = ACCOUNT_ID if key == KEY_A else OTHER_ACCOUNT
             body = identity_xml(account, "aws")
-        elif operation == "DescribeDBInstances":
-            status = statuses.pop(0) if len(statuses) > 1 else statuses[0]
-            body = rds_instances_xml(status)
-        elif operation == "RebootDBInstance":
+        elif operation == "DescribeInstances":
+            body = ec2_instances_xml("running")
+        elif operation == "RebootInstances":
             body = REBOOT_XML
         else:
             raise AssertionError(f"Unexpected offline request {operation}")
@@ -244,9 +234,11 @@ def offline_profile_aws(monkeypatch, tmp_path, provider=None):
 
 
 def profile_orchestrator(tmp_path):
-    values = action_configs()[framework.ChaosType.RDS_REBOOT]
+    # RDS reboot is planning only, so the live-supported EC2 reboot carries the
+    # admitted mutation that must sign with the pinned snapshot.
+    values = action_configs()[framework.ChaosType.EC2_REBOOT]
     orchestrator = framework.ChaosOrchestrator(
-        live_config(tmp_path, [{"type": "rds_reboot", **values}], PROFILE_REGION),
+        live_config(tmp_path, [{"type": "ec2_reboot", **values}], PROFILE_REGION),
         live=True,
         profile=PROFILE,
         output_dir=str(tmp_path / "reports"),
@@ -291,20 +283,20 @@ def test_refreshable_profile_cannot_sign_as_another_account_after_admission(
 
     # The provider now rotates to account B. Every later live client, cached or
     # new, must still sign with the snapshot verified at admission, including
-    # an admitted RDS mutation on the profile's FIPS endpoint.
+    # an admitted EC2 mutation on the profile's FIPS endpoint.
     clock.value += timedelta(hours=3)
     controller = orchestrator.safety_controller
     assert controller.client("sts").get_caller_identity()["Account"] == ACCOUNT_ID
     orchestrator.suite_name = "ordinary"
     controller.check_safety_conditions = lambda: (True, [])
     orchestrator.confirmation = orchestrator.expected_confirmation("ordinary", False)
-    kind = framework.ChaosType.RDS_REBOOT
+    kind = framework.ChaosType.EC2_REBOOT
     experiment = orchestrator._create_experiment(kind, copy.deepcopy(values))
     monkeypatch.setattr(experiment, "_wait_forward", lambda seconds: None)
-    result = experiment.reboot_db_instance(values["db_instance_identifier"])
+    result = experiment.reboot_instances(values["instance_ids"])
     assert result.status == "completed", result.errors
-    assert experiment.mutation_operations == ["rds.reboot_db_instance"]
-    assert ("RebootDBInstance", "rds-fips.us-east-1.amazonaws.com", KEY_A) in signed
+    assert experiment.mutation_operations == ["ec2.reboot_instances"]
+    assert ("RebootInstances", "ec2-fips.us-east-1.amazonaws.com", KEY_A) in signed
     assert {key for _operation, _host, key in signed} == {KEY_A}
     assert provider.refreshes == 0
 
@@ -325,30 +317,15 @@ def test_live_admission_without_resolvable_credentials_is_refused(tmp_path):
 
 
 RDS_ARN = f"arn:aws-us-gov:rds:{REGION}:{ACCOUNT_ID}:db:chaos-test-db"
-CLUSTER_ARN = f"arn:aws-us-gov:rds:{REGION}:{ACCOUNT_ID}:cluster:chaos-test-cluster"
 STREAM_ARN = f"arn:aws-us-gov:kinesis:{REGION}:{ACCOUNT_ID}:stream/chaos-test-stream"
+# RDS reboot, retention and failover are planning only: a live attempt is
+# refused before any name-only read. Their ARN checks remain as defence in depth.
+RDS_NAME_ONLY = {
+    framework.ChaosType.RDS_REBOOT: "reboot_db_instance",
+    framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY: "modify_db_instance",
+    framework.ChaosType.RDS_FAILOVER: "failover_db_cluster",
+}
 NAME_ONLY = {
-    framework.ChaosType.RDS_REBOOT: (
-        "rds",
-        "describe_db_instances",
-        ("DBInstances", 0, "DBInstanceArn"),
-        RDS_ARN,
-        "reboot_db_instance",
-    ),
-    framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY: (
-        "rds",
-        "describe_db_instances",
-        ("DBInstances", 0, "DBInstanceArn"),
-        RDS_ARN,
-        "modify_db_instance",
-    ),
-    framework.ChaosType.RDS_FAILOVER: (
-        "rds",
-        "describe_db_clusters",
-        ("DBClusters", 0, "DBClusterArn"),
-        CLUSTER_ARN,
-        "failover_db_cluster",
-    ),
     framework.ChaosType.KINESIS_RETENTION_MODIFY: (
         "kinesis",
         "describe_stream",
@@ -417,6 +394,26 @@ def test_name_only_rds_and_kinesis_reads_bind_the_reviewed_arn_before_mutation(
     assert experiment.mutation_attempts == []
 
 
+@pytest.mark.parametrize("kind", sorted(RDS_NAME_ONLY, key=lambda item: item.value))
+def test_name_only_rds_live_reads_are_never_reached(kind, monkeypatch):
+    aws = FakeAWS(reject_writes=False)
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        run_named(kind, aws, monkeypatch)
+    assert aws.calls == []
+    planned = planning_only_experiment(kind, action_configs()[kind], aws)
+    result = framework.ChaosOrchestrator._execute_experiment(
+        object.__new__(framework.ChaosOrchestrator),
+        planned,
+        kind,
+        action_configs()[kind],
+    )
+    assert result.status == "completed", result.errors
+    assert RDS_NAME_ONLY[kind] not in [operation for _s, operation, _r in aws.calls]
+    assert planned.mutation_attempts == []
+
+
 def test_name_only_arn_binding_accepts_the_exact_reviewed_identity(monkeypatch):
     framework.validate_named_response_arn(
         RDS_ARN.replace("db:chaos-test-db", "db:Chaos-Test-DB"),
@@ -435,17 +432,15 @@ def test_name_only_arn_binding_accepts_the_exact_reviewed_identity(monkeypatch):
             REGION,
         )
     aws = FakeAWS(reject_writes=False)
-    before = aws.respond("rds", "describe_db_instances", {})
-    rebooting = copy.deepcopy(before)
-    rebooting["DBInstances"][0]["DBInstanceStatus"] = "rebooting"
-    aws.read_overrides[("rds", "describe_db_instances")] = [
-        copy.deepcopy(before),
-        rebooting,
-        copy.deepcopy(before),
-    ]
-    experiment, result = run_named(framework.ChaosType.RDS_REBOOT, aws, monkeypatch)
+    before = aws.respond("kinesis", "describe_stream", {})
+    after = copy.deepcopy(before)
+    after["StreamDescription"]["RetentionPeriodHours"] = 24
+    aws.read_overrides[("kinesis", "describe_stream")] = [before, after]
+    experiment, result = run_named(
+        framework.ChaosType.KINESIS_RETENTION_MODIFY, aws, monkeypatch
+    )
     assert result.status == "completed", result.errors
-    assert experiment.mutation_attempts == ["rds.reboot_db_instance"]
+    assert experiment.mutation_attempts == ["kinesis.decrease_stream_retention_period"]
 
 
 # 2. S3 lifecycle expiration carries the reviewed prefix and is planning only.
