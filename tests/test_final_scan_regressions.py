@@ -4,6 +4,8 @@ import copy
 import hashlib
 import json
 import logging
+import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -941,3 +943,362 @@ def test_protected_publish_job_verifies_exact_subjects_before_pypi_action():
     ):
         assert argument in verify["run"]
     assert '--source-commit "$SOURCE_COMMIT"' not in verify["run"]
+
+
+CI_LOCKS = (
+    "requirements-pip-lock.txt",
+    "requirements-dev-lock.txt",
+    "requirements-build-lock.txt",
+    "requirements-runtime-lock.txt",
+)
+
+
+def _lock_entries(name):
+    """Return {(package, marker): (version, hashes)} from a reviewed hash lock."""
+    text = (ROOT / name).read_text("utf-8").replace("\\\n", " ")
+    entries = {}
+    for raw in text.splitlines():
+        line = raw.split(" #", 1)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        assert not line.startswith("-"), f"{name} has an unreviewed option: {line}"
+        requirement, _, options = line.partition(" --hash=")
+        hashes = {
+            token.removeprefix("--hash=sha256:")
+            for token in ("--hash=" + options).split()
+        }
+        assert all(re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes), line
+        pin, _, marker = requirement.partition(";")
+        package, separator, version = pin.strip().partition("==")
+        assert separator and re.fullmatch(r"[a-z0-9][a-z0-9.-]*", package), line
+        assert re.fullmatch(r"[0-9][A-Za-z0-9.+!]*", version), line
+        key = (package, marker.strip())
+        assert key not in entries, f"duplicate {key} in {name}"
+        entries[key] = (version, hashes)
+    return entries
+
+
+def _requirement_inputs(name):
+    result = {}
+    for raw in (ROOT / name).read_text("utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("-r "):
+            result.update(_requirement_inputs(line[3:].strip()))
+        elif line and not line.startswith("#"):
+            package, separator, version = line.partition("==")
+            assert separator, line
+            result[package.lower().replace("_", "-")] = version
+    return result
+
+
+def _ci_workflow():
+    return framework.yaml.safe_load(
+        (ROOT / ".github/workflows/ci.yml").read_text("utf-8")
+    )
+
+
+# Every workflow command line that mentions pip or another Python installer
+# must fully match one reviewed form below; anything else fails closed, so a
+# new install cannot slip past through unusual syntax (global options, a
+# versioned or path-qualified pip, several commands on one line, a variable
+# holding the installer, or a different installer).
+_INSTALLER_MENTION = re.compile(
+    r"pip(?!efail)|\buv\b|easy_install|poetry|\bpdm\b|conda", re.IGNORECASE
+)
+_PYTHON = (
+    r"(?:python|\.wheel-smoke/bin/python|\.sdist-smoke/bin/python"
+    r'|"\$RUNNER_TEMP/chaos-hashed-runtime/bin/python")'
+)
+_LOCK = r"-r requirements-(?:pip|dev|build|runtime)-lock\.txt"
+LOCK_INSTALL = re.compile(
+    _PYTHON + r" -m pip install --disable-pip-version-check --require-hashes"
+    r" --only-binary :all: " + _LOCK + r"(?: " + _LOCK + r")*"
+)
+LOCAL_INSTALL = re.compile(
+    r"\.wheel-smoke/bin/python -m pip install --disable-pip-version-check"
+    r" --no-deps dist/\*\.whl"
+    r"|\.sdist-smoke/bin/python -m pip install --disable-pip-version-check"
+    r" --no-build-isolation --no-deps dist/\*\.tar\.gz"
+)
+PIP_CHECK = re.compile(_PYTHON + r" -m pip check")
+PIP_AUDIT = re.compile(
+    r"python -m pip_audit -r requirements-(?:runtime|dev|build)-lock\.txt"
+    r" --require-hashes --disable-pip --progress-spinner off"
+)
+CI_INSTALLER_FORMS = (LOCK_INSTALL, LOCAL_INSTALL, PIP_CHECK, PIP_AUDIT)
+RELEASE_INSTALLER_FORMS = (LOCK_INSTALL,)
+
+
+def _installer_lines(run, forms):
+    """Yield every installer-mentioning line, requiring a reviewed form.
+
+    Lines are joined and unquoted as bash does (a backslash-newline is
+    removed, quoted fragments concatenate), so a split or quoted installer
+    name is still seen. Unparseable lines fail closed.
+    """
+    for raw in run.replace("\\\n", "").splitlines():
+        line = raw.strip()
+        try:
+            words = " ".join(shlex.split(line))
+        except ValueError:
+            raise AssertionError(line) from None
+        if not (_INSTALLER_MENTION.search(line) or _INSTALLER_MENTION.search(words)):
+            continue
+        assert any(form.fullmatch(line) for form in forms), line
+        yield line
+
+
+def _workflow_pip_installs(name, forms):
+    workflow = framework.yaml.safe_load((ROOT / name).read_text("utf-8"))
+    for job_name, job in workflow["jobs"].items():
+        for step in job["steps"]:
+            for line in _installer_lines(step.get("run", ""), forms):
+                tokens = shlex.split(line)
+                if tokens[tokens.index("-m") + 1 :][:2] == ["pip", "install"]:
+                    yield job_name, line, tokens
+
+
+def test_installer_lines_fail_closed_on_unreviewed_forms():
+    reviewed = (
+        "python -m pip install --disable-pip-version-check --require-hashes"
+        " --only-binary :all: -r requirements-pip-lock.txt"
+    )
+    assert list(_installer_lines(reviewed, RELEASE_INSTALLER_FORMS)) == [reviewed]
+    assert not list(_installer_lines("set -euo pipefail", RELEASE_INSTALLER_FORMS))
+    for line in (
+        "pip install x",
+        "pip3 install x",
+        "pip3.12 install x",
+        "/usr/bin/pip3 install x",
+        '"$RUNNER_TEMP/venv/bin/pip" install x',
+        r"C:\venv\Scripts\pip.exe install x",
+        "python -m pip --disable-pip-version-check install x",
+        "python -m pip --isolated install -r requirements-dev.txt",
+        "python3.12 -m pip3 install x",
+        reviewed + " && pip install x",
+        reviewed + "; pip install x",
+        reviewed + " requests",
+        "python -m pip check && pip install x",
+        "PIP=pip3",
+        "$PIP install x",
+        "uv pip install x",
+        "UV_SYSTEM_PYTHON=1 uv sync",
+        "pipx install x",
+        "easy_install x",
+        "python -m ensurepip",
+        "poetry install",
+        "conda install x",
+        "python -m pip_audit -r requirements-dev.txt --progress-spinner off",
+        "python -m pi''p install x",
+        'python -m p"i"p install x',
+        "python -m pi\\\np install x",
+        "u''v sync",
+        'python -c "unbalanced',
+    ):
+        with pytest.raises(AssertionError):
+            list(_installer_lines(line, CI_INSTALLER_FORMS))
+
+
+# The exact bytes of these workflows are pinned to a reviewed digest, so no
+# change of any kind (a command, its quoting or continuation, an environment
+# value, an action or action revision, a runner, a condition, a permission, or
+# a scalar spelling that a YAML parser might read differently) can pass until
+# it has been reviewed against the hash-lock contract above and the digest
+# updated deliberately. This includes Dependabot action bumps and comment or
+# formatting edits. .gitattributes checks *.yml out with LF on every platform,
+# so the bytes are the same on every runner.
+REVIEWED_WORKFLOW_DIGESTS = {
+    ".github/workflows/ci.yml": "f9d2b5d0160a0737fe41ccb68e88a4f42cd1f450686d488793e306319fe74a89",
+    ".github/workflows/release.yml": "0deb2296fced8e48d30bcf197a9efad8cabc97814e1281fb86fd0d7c949b2fe3",
+}
+
+
+def _workflow_digest(name):
+    return hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+
+
+def test_workflows_match_reviewed_digests():
+    for name, digest in REVIEWED_WORKFLOW_DIGESTS.items():
+        assert _workflow_digest(name) == digest, (
+            f"{name} changed: review every install and action against the "
+            "hash-lock contract, then update REVIEWED_WORKFLOW_DIGESTS"
+        )
+
+
+def _pip_targets(tokens):
+    targets, skip = [], False
+    for token in tokens[tokens.index("install") + 1 :]:
+        if skip:
+            skip = False
+        elif token in {"-r", "--only-binary"}:
+            skip = True
+        elif not token.startswith("-"):
+            targets.append(token)
+    return targets
+
+
+def test_ci_installs_python_tooling_only_from_reviewed_hash_locks():
+    installs = {}
+    audited = set()
+    for job in _ci_workflow()["jobs"].values():
+        for step in job["steps"]:
+            for line in step.get("run", "").replace("\\\n", " ").splitlines():
+                tokens = shlex.split(line)
+                if "pip_audit" in tokens:
+                    # Audits read the hashed locks and never resolve or install.
+                    files = [tokens[i + 1] for i, t in enumerate(tokens) if t == "-r"]
+                    assert files and set(files) <= set(CI_LOCKS), line
+                    assert {"--require-hashes", "--disable-pip"} <= set(tokens)
+                    audited.update(files)
+    for job_name, line, tokens in _workflow_pip_installs(
+        ".github/workflows/ci.yml", CI_INSTALLER_FORMS
+    ):
+        files = [tokens[i + 1] for i, t in enumerate(tokens) if t == "-r"]
+        assert not {
+            "--upgrade",
+            "-U",
+            "--index-url",
+            "-i",
+            "--extra-index-url",
+            "--find-links",
+            "--trusted-host",
+            "--no-index",
+        } & set(tokens), line
+        installs.setdefault(job_name, []).append(tokens)
+        if files:
+            # Every dependency install is a complete reviewed hash lock.
+            assert set(files) <= set(CI_LOCKS), line
+            assert "--require-hashes" in tokens, line
+            # Wheels only: a source fallback would install its build
+            # requirements without hash checking.
+            assert "--only-binary" in tokens, line
+            assert tokens[tokens.index("--only-binary") + 1] == ":all:", line
+            assert not _pip_targets(tokens), line
+            continue
+        # Only the local candidate is installed without a lock, and it
+        # never resolves dependencies from the index.
+        targets = _pip_targets(tokens)
+        assert "--no-deps" in tokens and targets, line
+        assert all(re.fullmatch(r"dist/\*\.(whl|tar\.gz)", t) for t in targets)
+        if any(t.endswith(".tar.gz") for t in targets):
+            # The local sdist builds with the hashed build lock already
+            # installed, never in an isolated unhashed build env.
+            assert "--no-build-isolation" in tokens, line
+    assert audited == {
+        "requirements-runtime-lock.txt",
+        "requirements-dev-lock.txt",
+        "requirements-build-lock.txt",
+    }
+    # Each tooling job first installs the hashed pip pin, then the complete
+    # development (and build) closure, all from wheels.
+    for job_name in ("test", "platform-test", "security", "package-artifact"):
+        bootstrap, tooling = installs[job_name][:2]
+        assert bootstrap[:2] == ["python", "-m"]
+        assert bootstrap[-2:] == ["-r", "requirements-pip-lock.txt"]
+        assert tooling[-2:] == (
+            ["-r", "requirements-dev-lock.txt"]
+            if job_name == "security"
+            else ["-r", "requirements-build-lock.txt"]
+        )
+        assert "requirements-dev-lock.txt" in tooling
+        for tokens in (bootstrap, tooling):
+            assert {"--require-hashes", "--only-binary", ":all:"} <= set(tokens)
+    text = (ROOT / ".github/workflows/ci.yml").read_text("utf-8")
+    assert "--upgrade pip" not in text
+    for unlocked in (
+        "requirements.txt",
+        "requirements-dev.txt",
+        "requirements-build.txt",
+    ):
+        assert f"-r {unlocked}" not in text
+
+
+def test_release_installs_only_hash_locked_wheels():
+    installs = []
+    for _job, line, tokens in _workflow_pip_installs(
+        ".github/workflows/release.yml", RELEASE_INSTALLER_FORMS
+    ):
+        installs.append(line)
+        files = [tokens[i + 1] for i, t in enumerate(tokens) if t == "-r"]
+        # Release dependencies come only from the reviewed hash locks, as
+        # wheels, so no source fallback can install unhashed build requirements
+        # in an isolated build environment.
+        assert files and set(files) <= set(CI_LOCKS), line
+        assert "--require-hashes" in tokens, line
+        assert "--only-binary" in tokens, line
+        assert tokens[tokens.index("--only-binary") + 1] == ":all:", line
+        assert not _pip_targets(tokens), line
+    assert len(installs) == 3
+
+
+def test_ci_hash_locks_pin_inputs_consistently_and_cover_ci_platforms():
+    # Transitive completeness is enforced at install time by pip's
+    # hash-checking mode, which refuses any requirement that is not pinned and
+    # hashed in the lock; this test checks direct pins, shared hashes and
+    # marker coverage.
+    from packaging.markers import Marker
+
+    locks = {name: _lock_entries(name) for name in CI_LOCKS}
+    # A pin shared between locks carries the identical reviewed hash set, so
+    # installing locks together can never narrow or widen accepted artifacts.
+    pins = {}
+    for entries in locks.values():
+        for (package, _marker), (version, hashes) in entries.items():
+            assert pins.setdefault((package, version), hashes) == hashes, package
+    for source, lock in (
+        ("requirements.txt", "requirements-runtime-lock.txt"),
+        ("requirements-dev.txt", "requirements-dev-lock.txt"),
+        ("requirements-build.txt", "requirements-build-lock.txt"),
+        ("requirements-pip.txt", "requirements-pip-lock.txt"),
+    ):
+        header = (ROOT / lock).read_text("utf-8").splitlines()[1]
+        assert header.startswith(f"#    uv pip compile {source} ")
+        assert "--generate-hashes" in header and "--universal" in header
+        for package, version in _requirement_inputs(source).items():
+            versions = {v for (p, _m), (v, _h) in locks[lock].items() if p == package}
+            assert versions == {version}, (lock, package)
+    assert {package for package, _marker in locks["requirements-pip-lock.txt"]} == {
+        "pip"
+    }
+    assert {v for (p, v) in pins if p == "pip"} == {
+        _requirement_inputs("requirements-pip.txt")["pip"]
+    }
+    # Exactly one pin applies per package for every CI interpreter and runner,
+    # across the development and build locks installed in one pip invocation.
+    workflow = _ci_workflow()
+    environments = [
+        ("linux", "posix", "x86_64", "Linux", version)
+        for version in workflow["jobs"]["test"]["strategy"]["matrix"]["python-version"]
+    ]
+    assert len(environments) == 5
+    runners = workflow["jobs"]["platform-test"]["strategy"]["matrix"]["os"]
+    assert set(runners) == {"windows-latest", "macos-latest"}
+    environments += [
+        ("win32", "nt", "AMD64", "Windows", "3.12"),
+        ("darwin", "posix", "arm64", "Darwin", "3.12"),
+    ]
+    groups = (
+        ("requirements-dev-lock.txt", "requirements-build-lock.txt"),
+        ("requirements-runtime-lock.txt",),
+        ("requirements-build-lock.txt", "requirements-runtime-lock.txt"),
+    )
+    for sys_platform, os_name, machine, system, version in environments:
+        environment = {
+            "sys_platform": sys_platform,
+            "os_name": os_name,
+            "platform_machine": machine,
+            "platform_system": system,
+            "python_version": version,
+            "python_full_version": version + ".0",
+            "implementation_name": "cpython",
+            "platform_python_implementation": "CPython",
+        }
+        for group in groups:
+            selected = {}
+            for name in group:
+                for (package, marker), (pin, _hashes) in locks[name].items():
+                    if not marker or Marker(marker).evaluate(environment):
+                        assert selected.setdefault(package, pin) == pin, package
+            for name in group:
+                source = name.replace("-runtime", "").replace("-lock", "")
+                assert set(_requirement_inputs(source)) <= set(selected), name

@@ -96,12 +96,13 @@ Independent hosted Linux, Windows, macOS, CodeQL, Semgrep, Trivy, dependency-rev
 
 ```powershell
 $env:AWS_EC2_METADATA_DISABLED = "true"
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes --only-binary :all: -r requirements-pip-lock.txt
+python -m pip install --require-hashes --only-binary :all: -r requirements-dev-lock.txt -r requirements-build-lock.txt
 python -m ruff format --check .
 python -m ruff check .
 python -m pytest -q --cov=aws_chaos_framework --cov-report=term --cov-fail-under=50
 python -m bandit -q -r aws_chaos_framework.py scripts
-python -m pip_audit -r requirements.txt --progress-spinner off
-python -m pip_audit -r requirements-dev.txt --progress-spinner off
-python -m pip_audit -r requirements-build.txt --progress-spinner off
+python -m pip_audit -r requirements-runtime-lock.txt --require-hashes --disable-pip --progress-spinner off
+python -m pip_audit -r requirements-dev-lock.txt --require-hashes --disable-pip --progress-spinner off
+python -m pip_audit -r requirements-build-lock.txt --require-hashes --disable-pip --progress-spinner off
 ```

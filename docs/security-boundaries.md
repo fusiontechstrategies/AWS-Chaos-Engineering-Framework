@@ -140,6 +140,43 @@ with `--require-hashes` using `requirements-build-lock.txt`. Regenerate this loc
 with `uv pip compile requirements-build.txt --generate-hashes --universal` when
 updating build tools, then review the changes before release.
 
+Routine CI installs Python tooling only from reviewed hash locks with
+`--require-hashes --only-binary :all:`; pip itself is installed only as a
+reviewed hashed pin, never as an unpinned upgrade. The release workflow's
+build and runtime lock installs are likewise wheel-only, so no source fallback
+can install unhashed build requirements. The regression tests pin the
+exact bytes of both workflow files to a reviewed SHA-256 digest
+(`REVIEWED_WORKFLOW_DIGESTS`), so any change, however it is spelled and
+including Dependabot action bumps, comments and formatting, fails until it has
+been reviewed against this contract and the digest is updated deliberately.
+`.gitattributes` checks the workflow files out with LF line endings on every
+platform.
+`requirements-pip-lock.txt` pins the pip bootstrap, `requirements-dev-lock.txt`
+holds the complete test, lint and audit closure (including the runtime pins),
+and it is installed together with `requirements-build-lock.txt`. Smoke
+environments install `requirements-runtime-lock.txt` (and the build lock for the
+source distribution) before adding the local artifact with `--no-deps`.
+`pip-audit` reads the hashed locks with `--require-hashes --disable-pip`. The
+human-readable `requirements-pip.txt`, `requirements.txt`,
+`requirements-dev.txt` and `requirements-build.txt` stay the reviewed inputs;
+after changing any of them, regenerate every affected lock from the repository
+root and review the complete diff:
+
+```text
+uv pip compile requirements.txt --generate-hashes --universal --python-version 3.10 --output-file requirements-runtime-lock.txt
+uv pip compile requirements-build.txt --generate-hashes --universal --output-file requirements-build-lock.txt --python-version 3.10
+uv pip compile requirements-pip.txt --generate-hashes --universal --python-version 3.10 --output-file requirements-pip-lock.txt
+uv pip compile requirements-dev.txt --constraint requirements-runtime-lock.txt --constraint requirements-build-lock.txt --generate-hashes --universal --python-version 3.10 --output-file requirements-dev-lock.txt
+```
+
+Compile the development lock last: its constraints keep shared packages
+identical to the runtime and build locks so both CI locks install in one
+`pip` invocation. Keep the pip pin in `requirements-pip.txt` equal to the pip
+version the development lock resolves for `pip-api`. Before merging, install
+the locks with the exact CI commands on each supported Python version and
+platform, run `python -m pip check`, and let the hosted Linux, Windows and
+macOS jobs confirm the result.
+
 ## Reviewed plan and exact selectors
 
 The live confirmation token includes SHA-256 of the complete reviewed configuration,
@@ -341,9 +378,10 @@ A rejection, unknown result or bounded read-back timeout is a failed result.
 RDS failover, RDS reboot and RDS backup-retention changes are planning only.
 AWS offers no conditional generation or exclusive lease for these requests, so a
 change queued after admission could be activated by the write, and a failover
-can restart cluster members outside the approved target count. The checks below
-are retained as defence in depth and are evaluated by plans: RDS failover
-completion requires a different exact writer and available cluster state, and
+can restart cluster members outside the approved target count. The completion
+checks below are retained as defence in depth but run only after a live
+transition, which is now refused; plans never issue the transition and do not
+evaluate them: RDS failover completion requires a different exact writer and available cluster state, and
 RDS reboot completion requires an observed rebooting state followed by
 available. An API acceptance or an unchanged available response alone does not
 prove completion.
@@ -423,8 +461,9 @@ another identity mid-run; the snapshot can only expire, which fails closed, so
 temporary credentials must outlive the run. Name-only Kinesis reads must also
 return a `StreamARN` with the reviewed partition, region, account and resource
 name before a live stream retention decrease. The equivalent `DBInstanceArn` and
-`DBClusterArn` checks remain on the planning-only RDS reboot, failover and
-retention handlers.
+`DBClusterArn` checks remain in the live branches of the planning-only RDS
+reboot, failover and retention handlers; dry-run plans skip them, so a plan does
+not establish them.
 
 ## Denied-target policy migration
 

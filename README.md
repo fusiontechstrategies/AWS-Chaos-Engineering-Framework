@@ -185,7 +185,8 @@ The release gate is fully offline and never contacts an AWS account. Determinist
 Run the same checks locally:
 
 ```powershell
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes --only-binary :all: -r requirements-pip-lock.txt
+python -m pip install --require-hashes --only-binary :all: -r requirements-dev-lock.txt -r requirements-build-lock.txt
 python -m ruff format --check .
 python -m ruff check .
 python -m pytest -q
