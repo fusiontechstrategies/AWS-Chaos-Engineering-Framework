@@ -116,6 +116,7 @@ The following types support dry-run planning and advertise `live_supported: fals
 - `vpc_route_table_modify`
 - `vpc_security_group_modify`, `vpc_nacl_block_traffic`
 - `ec2_terminate` (immutable child authorization cannot be proven)
+- `s3_lifecycle_modify` (whole-document lifecycle replacement)
 - `sqs_queue_policy_restrict`, `sqs_message_delay`, `sqs_visibility_timeout`
 - `kms_key_disable`, `kms_key_policy_restrict`
 - `iam_policy_detach`, `iam_role_modify`, `iam_user_access_key_deactivate`
@@ -155,6 +156,7 @@ all refuse the affected operations; a previous grant does not restore support.
 | Lambda reserved concurrency | Put/delete concurrency has no `RevisionId`. A reread of the same integer cannot prove ownership of a later write. |
 | S3 object deletion | The current plan and approval bind keys, not immutable object versions or conditional object identity. Key-only deletion cannot be live-approved, including with irreversible approval. AWS's optional version/conditional request fields are not an implemented approval contract here. |
 | S3 bucket versioning | The current `PutBucketVersioning` request has no caller-owned revision for restoration. |
+| S3 lifecycle expiration | `PutBucketLifecycleConfiguration` replaces the whole rule document with no revision condition, so neither a prefix-scoped rule nor preserved unrelated rules can be made exclusive. Plans require a canonical nonempty `prefix` (the exact `Filter.Prefix`), list unrelated rules unchanged, refuse an existing chaos rule ID and reject every key outside `bucket_name`, `prefix`, `expire_days` and common metadata (`type`, `name`, `description`, `duration_seconds`, `auto_rollback`, `state_timeout_seconds`). Diagnostics include `lifecycle_plan`: preserved rules by ordinal, status, action names and SHA-256 of the unchanged rule, plus the chaos rule's prefix and expiration. |
 | ELB targets, attributes, listener actions and health settings | The current registration and modification requests have no caller-owned revision; preserving an earlier list or rereading a scalar does not authorize replacement. |
 | ECS service count and container instance state | Current update requests do not condition restoration on an owned revision. A matching desired count is insufficient. |
 | AppStream fleet state and association | Current start/stop and associate/disassociate requests have no caller-owned revision. A service concurrent-modification error is not such a condition. |
@@ -225,6 +227,11 @@ reconciliation.
 Subnet NACL association changes use the AWS association ID as a conditional
 identity. Recovery requires a confirmed owned replacement ID and matching NACL,
 then passes that exact ID to AWS; changed or unconfirmed associations are refused.
+`vpc_subnet_acl_modify` requires `original_nacl_id`, the NACL that recovery
+re-associates. It is a target key, so it must be in the exact allowlist, and it
+is bound into the token, execution grant and `--vpc-id` inventory check. The
+handler refuses before any write when the subnet's observed NACL differs, and
+recovery refuses a recorded original that is not the granted reviewed value.
 
 ## Honest results and unambiguous configuration
 

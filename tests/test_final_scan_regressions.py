@@ -19,6 +19,7 @@ from test_aws_chaos_framework import (
     action_configs,
     make_experiment,
     make_orchestrator,
+    planning_only_experiment,
 )
 
 import aws_chaos_framework as framework
@@ -32,7 +33,11 @@ def worker(aws, kind=framework.ChaosType.LAMBDA_MEMORY_LIMIT, values=None):
     return make_orchestrator(kind, values, aws, dry_run=False)
 
 
-@pytest.mark.parametrize("kind", ["rds_backup_retention_modify", "s3_lifecycle_modify"])
+# S3 lifecycle expiration is planning only (no conditional lifecycle revision);
+# Kinesis retention is the other irreversible retention change with live support.
+@pytest.mark.parametrize(
+    "kind", ["rds_backup_retention_modify", "kinesis_retention_modify"]
+)
 @pytest.mark.parametrize(
     "cli,configuration", [(False, False), (True, False), (False, True), (True, True)]
 )
@@ -98,19 +103,19 @@ def test_destructive_retention_requires_both_approvals_and_stronger_token(
 
 
 def test_s3_expiration_never_claims_recovery_of_deleted_objects():
-    aws = FakeAWS(reject_writes=False)
+    aws = FakeAWS(reject_writes=True)
     config = action_configs()[framework.ChaosType.S3_LIFECYCLE_MODIFY]
-    item = make_experiment(
-        framework.ChaosType.S3_LIFECYCLE_MODIFY, config, aws, dry_run=False
+    item = planning_only_experiment(
+        framework.ChaosType.S3_LIFECYCLE_MODIFY, config, aws
     )
     result = item.modify_lifecycle(**config)
     assert result.status == "completed"
     assert "deleted data" in result.additional_info["data_loss_warning"]
     before = list(aws.calls)
-    with pytest.raises(framework.SafetyViolation, match="irreversible"):
-        item.run_rollback()
+    item.run_rollback()
     assert aws.calls == before
     assert not item.rollback_verified
+    assert not item.mutation_attempts and not item.rollback_attempts
 
 
 def test_ec2_termination_creates_no_implicit_volume_copies():

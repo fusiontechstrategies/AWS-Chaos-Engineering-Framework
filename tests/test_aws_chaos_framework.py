@@ -252,6 +252,7 @@ class FakeAWS:
                 "DBClusters": [
                     {
                         "DBClusterIdentifier": "chaos-test-cluster",
+                        "DBClusterArn": f"arn:aws-us-gov:rds:{REGION}:{ACCOUNT_ID}:cluster:chaos-test-cluster",
                         "Status": "available",
                         "Endpoint": "writer.test.invalid",
                         "ReaderEndpoint": "reader.test.invalid",
@@ -274,6 +275,7 @@ class FakeAWS:
                 "DBInstances": [
                     {
                         "DBInstanceIdentifier": "chaos-test-db",
+                        "DBInstanceArn": f"arn:aws-us-gov:rds:{REGION}:{ACCOUNT_ID}:db:chaos-test-db",
                         "DBInstanceStatus": "available",
                         "BackupRetentionPeriod": 7,
                         "MultiAZ": True,
@@ -383,6 +385,10 @@ class FakeAWS:
                 ],
                 "failures": [],
             },
+            # StopTask returns the stopped task description.
+            ("ecs", "stop_task"): {
+                "task": {"taskArn": request.get("task"), "desiredStatus": "STOPPED"}
+            },
             ("ecs", "describe_services"): {
                 "services": [{"serviceName": "chaos-test-service", "desiredCount": 1}],
                 "failures": [],
@@ -409,6 +415,7 @@ class FakeAWS:
             },
             ("kinesis", "describe_stream"): {
                 "StreamDescription": {
+                    "StreamARN": f"arn:aws-us-gov:kinesis:{REGION}:{ACCOUNT_ID}:stream/chaos-test-stream",
                     "RetentionPeriodHours": 48,
                     "StreamStatus": "ACTIVE",
                     "Shards": [{"ShardId": "shardId-000000000000"}],
@@ -719,6 +726,7 @@ def action_configs() -> dict[framework.ChaosType, dict[str, Any]]:
         framework.ChaosType.VPC_SUBNET_ACL_MODIFY: {
             "subnet_id": "subnet-0123456789abcdef0",
             "nacl_id": "acl-0fedcba9876543210",
+            "original_nacl_id": "acl-0123456789abcdef0",
         },
         framework.ChaosType.VPC_ROUTE_TABLE_MODIFY: {
             "route_table_id": "rtb-0123456789abcdef0",
@@ -809,6 +817,7 @@ def action_configs() -> dict[framework.ChaosType, dict[str, Any]]:
         },
         framework.ChaosType.S3_LIFECYCLE_MODIFY: {
             "bucket_name": "chaos-test-bucket",
+            "prefix": "chaos-test/",
             "expire_days": 1,
         },
         framework.ChaosType.SQS_QUEUE_PURGE: {
@@ -988,6 +997,7 @@ def make_orchestrator(
         fake_aws.client("cloudfront").meta.region_name = "aws-global"
     frozen = SimpleNamespace(
         access_key=action_config.get("active_access_key_id", OTHER_ACCESS_KEY),
+        secret_key="ordinary-synthetic-secret",
         token="ordinary-synthetic-session",
     )
     identity = SimpleNamespace(

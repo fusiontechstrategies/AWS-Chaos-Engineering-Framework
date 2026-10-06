@@ -224,9 +224,10 @@ process. Live automatic recovery cannot be disabled, and the configured delay
 between live experiments starts after the preceding experiment finishes recovery.
 
 RDS backup-retention changes and S3 lifecycle expiration are irreversible actions.
-They require both irreversible approvals and the LIVE-IRREVERSIBLE confirmation,
-and cannot claim automatic recovery. Restoring settings cannot recover backups
-or objects already deleted. EC2 termination and EBS detach create no implicit
+Live retention changes require both irreversible approvals and the
+LIVE-IRREVERSIBLE confirmation, and cannot claim automatic recovery. S3 lifecycle
+expiration is planning only; its plan is prefix scoped and never whole-bucket.
+Restoring settings cannot recover backups or objects already deleted. EC2 termination and EBS detach create no implicit
 snapshots. Arrange and approve any required backups separately before approving
 these actions; neither action creates persistent data copies.
 
@@ -309,6 +310,13 @@ identity inside resource fields still requires include_identity. Errors and
 diagnostics retain identity and resource filtering under every flag combination;
 credential fields are always redacted.
 
+FIS template target aliases are AWS response keys that no sensitive-value
+registry covers, so guardrail messages name targets only by template ordinal
+(`FIS target #2`) and never echo an invalid selection mode. ECS task stops are
+recorded one task at a time after AWS confirms that task's ARN; a later failure
+keeps the confirmed subset in affected resources and ordinal per-task outcomes
+in diagnostics, without task ARNs.
+
 The publish workflow executes verification tools from the immutable workflow
 commit with Python isolated mode, never from the release tag. Verified public
 distribution bytes are copied into a fresh payload with a tag, source commit,
@@ -353,6 +361,20 @@ and missing metadata fail closed. Expanded wheel members also have per-member
 and aggregate byte budgets before their contents are retained.
 
 
+## Live credential and response identity
+
+Live mode freezes the resolved credentials into a fixed, non-refreshing session
+before the STS identity check, so every later client signs as the verified
+account, partition and principal. The pinned session keeps the selected
+`--profile` (or ambient profile), so its non-credential shared configuration,
+such as `ca_bundle` and `use_fips_endpoint`, still applies; only the credential
+source is replaced by the explicit static snapshot. A refreshable profile cannot rotate to
+another identity mid-run; the snapshot can only expire, which fails closed, so
+temporary credentials must outlive the run. Name-only RDS and Kinesis reads must
+also return a `DBInstanceArn`, `DBClusterArn` or `StreamARN` with the reviewed
+partition, region, account and resource name before a reboot, failover,
+retention change or stream retention decrease.
+
 ## Denied-target policy migration
 
 The legacy regex key `safety.denied_target_patterns` is rejected even when an
@@ -382,8 +404,9 @@ replacement NACLs, and `vpc_endpoint_delete` endpoints must appear in the
 corresponding discovered instance, subnet, NACL or endpoint set. Before
 mutating, each handler checks the exact describe response: the instance
 `VpcId`, the current subnet NACL association's `VpcId`, or the endpoint
-`VpcId`. The subnet's current (original) NACL must also be in the discovered
-NACL set, because recovery re-associates the subnet with it. An
+`VpcId`. The reviewed `original_nacl_id` must also be in the discovered NACL
+set and equal the subnet's current NACL, because recovery re-associates the
+subnet with it. An
 `efs_mount_target_delete` target is admitted only when the exact mount-target
 response reports the selected `VpcId` and a discovered subnet; that relationship
 is only known when the handler reads the mount target, so it is enforced there,
@@ -398,8 +421,9 @@ suite whose configured target contradicts the selected VPC fails with a
 configuration error after discovery and before any experiment starts, except for
 the EFS relationship above. Required tags come from the discovery snapshot taken
 when the suite starts; a tag removed later is not re-read before a write. Without
-`--vpc-id`, admission is unchanged. Separately, every live S3 write now first
-reads the bucket location, so it needs the `s3:GetBucketLocation` permission.
+`--vpc-id`, admission is unchanged. Separately, every live S3 write first reads
+the bucket location, so it needs the `s3:GetBucketLocation` permission; with S3
+lifecycle expiration now planning only, no supported live type issues one.
 
 ## VPC peering endpoint approval
 

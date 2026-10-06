@@ -541,6 +541,9 @@ CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
         ChaosType.APPSTREAM_STACK_DISASSOCIATE,
         ChaosType.DS_CONDITIONAL_FORWARDER_DELETE,
         ChaosType.S3_BUCKET_POLICY_DENY,
+        # Lifecycle replacement is a whole-document write with no revision
+        # condition, so neither a prefix rule nor preserved rules are exclusive.
+        ChaosType.S3_LIFECYCLE_MODIFY,
         ChaosType.SNS_TOPIC_POLICY_RESTRICT,
         ChaosType.EBS_THROTTLE_IOPS,
         ChaosType.OPENSEARCH_CLUSTER_CONFIG_MODIFY,
@@ -583,6 +586,7 @@ CONCURRENCY_UNSAFE_MUTATIONS = frozenset(
         "lambda.delete_function_concurrency",
         "s3.delete_objects",
         "s3.put_bucket_versioning",
+        "s3.put_bucket_lifecycle_configuration",
         "elbv2.deregister_targets",
         "elbv2.register_targets",
         "elbv2.modify_target_group_attributes",
@@ -638,7 +642,7 @@ REQUIRED_PARAMETERS: dict[ChaosType, tuple[str, ...]] = {
     ChaosType.EBS_THROTTLE_IOPS: ("volume_id",),
     ChaosType.EFS_MOUNT_TARGET_DELETE: ("mount_target_id",),
     ChaosType.EFS_THROTTLE_THROUGHPUT: ("file_system_id",),
-    ChaosType.VPC_SUBNET_ACL_MODIFY: ("subnet_id", "nacl_id"),
+    ChaosType.VPC_SUBNET_ACL_MODIFY: ("subnet_id", "nacl_id", "original_nacl_id"),
     ChaosType.VPC_ROUTE_TABLE_MODIFY: ("route_table_id", "destination_cidr"),
     ChaosType.VPC_SECURITY_GROUP_MODIFY: ("group_id", "remove_rule"),
     ChaosType.VPC_NACL_BLOCK_TRAFFIC: ("nacl_id",),
@@ -657,7 +661,7 @@ REQUIRED_PARAMETERS: dict[ChaosType, tuple[str, ...]] = {
     ChaosType.S3_BUCKET_VERSIONING_SUSPEND: ("bucket_name",),
     ChaosType.S3_BUCKET_ENCRYPTION_DISABLE: ("bucket_name",),
     ChaosType.S3_OBJECT_DELETE: ("bucket_name", "prefix"),
-    ChaosType.S3_LIFECYCLE_MODIFY: ("bucket_name",),
+    ChaosType.S3_LIFECYCLE_MODIFY: ("bucket_name", "prefix"),
     ChaosType.SQS_QUEUE_PURGE: ("queue_url", "queue_arn"),
     ChaosType.SQS_QUEUE_POLICY_RESTRICT: ("queue_url", "break_glass_principal_arn"),
     ChaosType.SQS_MESSAGE_DELAY: ("queue_url",),
@@ -749,6 +753,7 @@ TARGET_PARAMETER_KEYS = frozenset(
         "key_id",
         "mount_target_id",
         "nacl_id",
+        "original_nacl_id",
         "parameter_group_name",
         "peering_connection_id",
         "policy_arn",
@@ -895,6 +900,111 @@ def validate_kms_key_arn(value: Any, account: str | None, region: str) -> None:
         value,
     ):
         raise SafetyViolation("Live KMS grant revocation requires an immutable key ARN")
+
+
+def validate_named_response_arn(
+    value: Any,
+    service: str,
+    resource: str,
+    account: str | None,
+    region: str,
+    *,
+    case_insensitive: bool = False,
+) -> None:
+    """Bind a name-addressed read response to the reviewed account and region."""
+    if not isinstance(value, str):
+        raise SafetyViolation("AWS response lacks the reviewed account-bearing ARN")
+    validate_resource_arn(value, service, account, region)
+    actual = value.split(":", 5)[5]
+    if case_insensitive:
+        actual, resource = actual.lower(), resource.lower()
+    if actual != resource:
+        raise SafetyViolation("AWS response ARN differs from the reviewed resource")
+
+
+S3_LIFECYCLE_RULE_ID = "ChaosExpirePrefix"
+# The complete lifecycle schema: its own parameters plus common experiment
+# metadata. Any other key would be approved or ignored without constraining
+# the S3 request, so it is refused.
+S3_LIFECYCLE_ALLOWED_KEYS = frozenset(
+    {
+        "type",
+        "name",
+        "description",
+        "bucket_name",
+        "prefix",
+        "expire_days",
+        "duration_seconds",
+        "auto_rollback",
+        "state_timeout_seconds",
+    }
+)
+
+
+def validate_s3_lifecycle_request(experiment: dict[str, Any]) -> str:
+    """Return the canonical required prefix of one strict lifecycle request."""
+    extraneous = sorted(
+        str(key) for key in experiment if key not in S3_LIFECYCLE_ALLOWED_KEYS
+    )
+    if extraneous:
+        raise ConfigurationError(
+            "S3 lifecycle expiration does not use: " + ", ".join(extraneous)
+        )
+    return canonical_s3_lifecycle_prefix(experiment.get("prefix"))
+
+
+def canonical_s3_lifecycle_prefix(prefix: Any) -> str:
+    """A nonempty literal key prefix; whole-bucket expiration is unsupported."""
+    if (
+        not isinstance(prefix, str)
+        or not prefix
+        or prefix != prefix.strip()
+        or len(prefix.encode("utf-8")) > 1024
+        or any(unicodedata.category(character).startswith("C") for character in prefix)
+    ):
+        raise ConfigurationError(
+            "S3 lifecycle expiration requires a nonempty canonical key prefix"
+        )
+    return prefix
+
+
+def s3_lifecycle_plan_evidence(
+    preserved_rules: list[dict[str, Any]], chaos_rule: dict[str, Any]
+) -> dict[str, Any]:
+    """Structured plan evidence without unrelated rule IDs or filters.
+
+    Preserved rules are shown by ordinal, status, action names and a digest of
+    the unchanged rule document; only the reviewed chaos rule shows its prefix,
+    which is an approved target and stays subject to report redaction.
+    """
+
+    def digest(rule: dict[str, Any]) -> str:
+        encoded = json.dumps(rule, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    return {
+        "rule_count": len(preserved_rules) + 1,
+        "preserved_rules": [
+            {
+                "ordinal": ordinal,
+                "status": str(rule.get("Status", "")),
+                "actions": sorted(
+                    str(key)
+                    for key in rule
+                    if key not in {"ID", "Status", "Filter", "Prefix"}
+                ),
+                "sha256": digest(rule),
+            }
+            for ordinal, rule in enumerate(preserved_rules, start=1)
+        ],
+        "chaos_rule": {
+            "ordinal": len(preserved_rules) + 1,
+            "status": chaos_rule["Status"],
+            "filter_prefix": chaos_rule["Filter"]["Prefix"],
+            "expiration_days": chaos_rule["Expiration"]["Days"],
+            "sha256": digest(chaos_rule),
+        },
+    }
 
 
 def validate_resource_arn(
@@ -1387,6 +1497,35 @@ def redact_runtime_text(
         position = match.end()
     parts.append(source[position:])
     return safe_display("".join(parts))
+
+
+def pin_session_credentials(
+    session: Any, region: str, profile_name: str | None = None
+) -> Any:
+    """Return a session fixed to one non-refreshing credential snapshot.
+
+    A refreshable profile provider could otherwise sign later requests as a
+    different account than the one verified at live admission. Callers verify
+    the identity of the returned session; it can then only expire, not change.
+    The selected shared-config profile is kept, so its non-credential settings
+    (for example ca_bundle and use_fips_endpoint) still apply. Explicit session
+    credentials are static botocore Credentials cached on the session, so the
+    profile's provider chain is never consulted and nothing refreshes them.
+    """
+    credentials = session.get_credentials()
+    frozen = credentials.get_frozen_credentials() if credentials else None
+    if frozen is None or not frozen.access_key or not frozen.secret_key:
+        raise SafetyViolation(
+            "Could not verify the active AWS identity: no credentials resolved"
+        )
+    return boto3.Session(
+        aws_access_key_id=frozen.access_key,
+        aws_secret_access_key=frozen.secret_key,
+        aws_session_token=frozen.token,
+        aws_account_id=getattr(frozen, "account_id", None),
+        region_name=region,
+        profile_name=profile_name,
+    )
 
 
 def canonical_caller_principal(caller_arn: str | None) -> str | None:
@@ -2176,7 +2315,11 @@ AUTHORIZED_HANDLER_CALLS = {
     ),
     ChaosType.VPC_SUBNET_ACL_MODIFY: (
         "modify_subnet_acl",
-        (("subnet_id", False, None), ("nacl_id", False, None)),
+        (
+            ("subnet_id", False, None),
+            ("nacl_id", False, None),
+            ("original_nacl_id", False, None),
+        ),
     ),
     ChaosType.VPC_ROUTE_TABLE_MODIFY: (
         "modify_route_table",
@@ -2261,7 +2404,11 @@ AUTHORIZED_HANDLER_CALLS = {
     ),
     ChaosType.S3_LIFECYCLE_MODIFY: (
         "modify_lifecycle",
-        (("bucket_name", False, None), ("expire_days", True, 1)),
+        (
+            ("bucket_name", False, None),
+            ("expire_days", True, 1),
+            ("prefix", False, None),
+        ),
     ),
     ChaosType.SQS_QUEUE_PURGE: ("purge_queue", (("queue_url", False, None),)),
     ChaosType.SQS_QUEUE_POLICY_RESTRICT: (
@@ -2519,7 +2666,11 @@ def peering_endpoint_scope(config: dict[str, Any]) -> tuple[dict[str, Any], set[
 VPC_SCOPED_TARGET_INVENTORY: dict[ChaosType, tuple[tuple[str, str], ...]] = {
     ChaosType.EC2_REBOOT: (("instance_ids", "instances"),),
     ChaosType.EFS_MOUNT_TARGET_DELETE: (),
-    ChaosType.VPC_SUBNET_ACL_MODIFY: (("subnet_id", "subnets"), ("nacl_id", "nacls")),
+    ChaosType.VPC_SUBNET_ACL_MODIFY: (
+        ("subnet_id", "subnets"),
+        ("nacl_id", "nacls"),
+        ("original_nacl_id", "nacls"),
+    ),
     ChaosType.VPC_ENDPOINT_DELETE: (("endpoint_id", "vpc_endpoints"),),
 }
 # These types address no VPC resource, so --vpc-id does not constrain them. Any
@@ -4353,7 +4504,9 @@ class VPCChaosExperiment(ChaosExperiment):
             time.sleep(min(5.0, max(0.1, deadline - time.monotonic())))
         raise TimeoutError("Timed out waiting for an exact active restored route")
 
-    def modify_subnet_acl(self, subnet_id: str, nacl_id: str) -> ExperimentResult:
+    def modify_subnet_acl(
+        self, subnet_id: str, nacl_id: str, original_nacl_id: str | None = None
+    ) -> ExperimentResult:
         """Modify subnet's network ACL"""
         experiment_id = _experiment_id("vpc-subnet-acl")
         result = ExperimentResult(
@@ -4394,6 +4547,12 @@ class VPCChaosExperiment(ChaosExperiment):
             ):
                 raise SafetyViolation(
                     "Subnet or NACL is outside the selected VPC's tagged inventory"
+                )
+            # Recovery writes the original NACL, so it must be the explicitly
+            # reviewed (token-, allowlist- and grant-bound) original target.
+            if not original_nacl_id or acls[0]["NetworkAclId"] != original_nacl_id:
+                raise SafetyViolation(
+                    "The subnet's current NACL differs from the reviewed original_nacl_id"
                 )
             if acls[0]["NetworkAclId"] == nacl_id:
                 raise ConfigurationError(
@@ -4861,7 +5020,7 @@ class VPCChaosExperiment(ChaosExperiment):
         if self.dry_run:
             # A simulation authorizes no SDK recovery and proves no live restoration.
             return
-        self._require_execution_grant(dispatch=True)
+        grant = self._require_execution_grant(dispatch=True)
         try:
             if hasattr(self, "original_association_id") and hasattr(
                 self, "original_nacl_id"
@@ -4869,6 +5028,17 @@ class VPCChaosExperiment(ChaosExperiment):
                 if not getattr(self, "current_association_id", None):
                     raise SafetyViolation(
                         "An unconfirmed NACL write cannot authorize recovery"
+                    )
+                reviewed_original = json.loads(grant.config_json).get(
+                    "original_nacl_id"
+                )
+                if (
+                    not reviewed_original
+                    or self.original_nacl_id != reviewed_original
+                    or reviewed_original not in grant.targets
+                ):
+                    raise SafetyViolation(
+                        "NACL recovery target is not the reviewed original_nacl_id"
                     )
                 associations = self.ec2.describe_network_acls(
                     Filters=[
@@ -4958,6 +5128,26 @@ class RDSChaosExperiment(ChaosExperiment):
     def __init__(self, config: dict[str, Any], safety_controller: SafetyController):
         super().__init__(config, safety_controller)
         self.rds = self.client("rds")
+
+    def _require_reviewed_rds_arn(
+        self, response_arn: Any, identifier: str, resource_type: str
+    ) -> None:
+        """Live name-only RDS reads must return the reviewed account and region."""
+        if self.dry_run:
+            return
+        resource = (
+            identifier.split(":", 5)[5]
+            if identifier.startswith("arn:")
+            else f"{resource_type}:{identifier}"
+        )
+        validate_named_response_arn(
+            response_arn,
+            "rds",
+            resource,
+            self.expected_account,
+            self.expected_region,
+            case_insensitive=True,
+        )
 
     def _wait_for_parameters(
         self,
@@ -5066,6 +5256,9 @@ class RDSChaosExperiment(ChaosExperiment):
                     f"RDS DB instance not found: {db_instance_identifier}"
                 )
             instance = instance_info[0]
+            self._require_reviewed_rds_arn(
+                instance.get("DBInstanceArn"), db_instance_identifier, "db"
+            )
             if instance.get("DBInstanceStatus") != "available":
                 raise SafetyViolation("The selected RDS DB instance is not available")
             if force_failover and not instance.get("MultiAZ", False):
@@ -5122,6 +5315,9 @@ class RDSChaosExperiment(ChaosExperiment):
             # Get current retention period
             db_info = self.rds.describe_db_instances(DBInstanceIdentifier=db_identifier)
             if db_info["DBInstances"]:
+                self._require_reviewed_rds_arn(
+                    db_info["DBInstances"][0].get("DBInstanceArn"), db_identifier, "db"
+                )
                 self.original_retention = db_info["DBInstances"][0][
                     "BackupRetentionPeriod"
                 ]
@@ -5244,6 +5440,9 @@ class RDSChaosExperiment(ChaosExperiment):
         ):
             raise ConfigurationError(f"RDS cluster not found: {cluster_identifier}")
         cluster = clusters[0]
+        self._require_reviewed_rds_arn(
+            cluster.get("DBClusterArn"), cluster_identifier, "cluster"
+        )
         return {
             "status": cluster.get("Status"),
             "primary_endpoint": cluster.get("Endpoint"),
@@ -6101,9 +6300,9 @@ class S3ChaosExperiment(ChaosExperiment):
         return result
 
     def modify_lifecycle(
-        self, bucket_name: str, expire_days: int = 1
+        self, bucket_name: str, expire_days: int = 1, prefix: str | None = None
     ) -> ExperimentResult:
-        """Apply expiration with an explicit irreversible data-loss classification."""
+        """Plan prefix-scoped expiration that preserves unrelated lifecycle rules."""
         logger.warning(
             "Lifecycle expiration can permanently delete objects; settings restoration cannot recover them"
         )
@@ -6118,12 +6317,16 @@ class S3ChaosExperiment(ChaosExperiment):
         )
 
         try:
+            # The approved prefix is the only rule selector; never the whole bucket.
+            prefix = canonical_s3_lifecycle_prefix(prefix)
+            existing_rules: list[dict[str, Any]] = []
             # Get current lifecycle configuration
             try:
                 response = self.s3.get_bucket_lifecycle_configuration(
                     Bucket=bucket_name
                 )
                 self.original_lifecycle = response["Rules"]
+                existing_rules = copy.deepcopy(response["Rules"])
                 self.had_lifecycle = True
             except self.s3.exceptions.ClientError as e:
                 if e.response["Error"]["Code"] == "NoSuchLifecycleConfiguration":
@@ -6132,20 +6335,25 @@ class S3ChaosExperiment(ChaosExperiment):
                     raise
 
             self.bucket_name = bucket_name
+            if any(rule.get("ID") == S3_LIFECYCLE_RULE_ID for rule in existing_rules):
+                raise SafetyViolation(
+                    "The bucket already has a lifecycle rule with the chaos rule ID"
+                )
 
-            # Create aggressive lifecycle rule
-            lifecycle_config = {
-                "Rules": [
-                    {
-                        "ID": "ChaosExpireAll",
-                        "Status": "Enabled",
-                        "Filter": {"Prefix": ""},
-                        "Expiration": {"Days": expire_days},
-                    }
-                ]
+            # Add one prefix-scoped expiration rule; unrelated rules are kept.
+            chaos_rule = {
+                "ID": S3_LIFECYCLE_RULE_ID,
+                "Status": "Enabled",
+                "Filter": {"Prefix": prefix},
+                "Expiration": {"Days": expire_days},
             }
+            lifecycle_config = {"Rules": [*existing_rules, chaos_rule]}
+            self.planned_lifecycle = copy.deepcopy(lifecycle_config)
+            result.additional_info["lifecycle_plan"] = s3_lifecycle_plan_evidence(
+                existing_rules, chaos_rule
+            )
 
-            self.owned_lifecycle = copy.deepcopy(lifecycle_config["Rules"])
+            self.owned_lifecycle = [copy.deepcopy(chaos_rule)]
             if not self.dry_run:
                 self.s3.put_bucket_lifecycle_configuration(
                     Bucket=bucket_name, LifecycleConfiguration=lifecycle_config
@@ -7088,9 +7296,30 @@ class ECSChaosExperiment(ChaosExperiment):
                 raise SafetyViolation("Every selected ECS task must be active")
 
             if not self.dry_run:
-                for task_arn in task_arns:
-                    self.ecs.stop_task(cluster=cluster, task=task_arn, reason=reason)
-                result.affected_resources = task_arns
+                # Per-task evidence uses ordinals, never task ARNs, so it is safe
+                # in diagnostics; confirmed ARNs are kept after a later failure.
+                outcomes = [
+                    {"ordinal": ordinal, "outcome": "not_attempted"}
+                    for ordinal in range(1, len(task_arns) + 1)
+                ]
+                result.additional_info["task_outcomes"] = outcomes
+                for outcome, task_arn in zip(outcomes, task_arns, strict=True):
+                    outcome["outcome"] = "unconfirmed"
+                    response = self.ecs.stop_task(
+                        cluster=cluster, task=task_arn, reason=reason
+                    )
+                    stopped = (
+                        response.get("task") if isinstance(response, dict) else None
+                    )
+                    if (
+                        not isinstance(stopped, dict)
+                        or stopped.get("taskArn") != task_arn
+                    ):
+                        raise RuntimeError(
+                            f"ECS did not confirm stopping selected task {outcome['ordinal']}"
+                        )
+                    result.affected_resources.append(task_arn)
+                    outcome["outcome"] = "stopped"
                 logger.info(f"Stopped tasks: {task_arns}")
             else:
                 logger.info(f"DRY RUN: Would stop tasks: {task_arns}")
@@ -7459,6 +7688,15 @@ class KinesisChaosExperiment(ChaosExperiment):
             # Get current retention
             stream_info = self.kinesis.describe_stream(StreamName=stream_name)
             stream_description = stream_info.get("StreamDescription", {})
+            if not self.dry_run:
+                # A name-only read must return the reviewed account and region.
+                validate_named_response_arn(
+                    stream_description.get("StreamARN"),
+                    "kinesis",
+                    f"stream/{stream_name}",
+                    self.expected_account,
+                    self.expected_region,
+                )
             if stream_description.get("StreamStatus") != "ACTIVE":
                 raise SafetyViolation("The selected Kinesis stream is not ACTIVE")
             self.original_retention = stream_description["RetentionPeriodHours"]
@@ -9479,7 +9717,11 @@ class FISTemplateExperiment(ChaosExperiment):
         required_tags = safety.get("required_target_tags", {"ChaosReady": "true"})
         allowlist = set(str(item) for item in safety.get("target_allowlist", []))
         total_targets = 0
-        for target_name, target in template.get("targets", {}).items():
+        # Target aliases are AWS response keys that no sensitive-value registry
+        # covers; diagnostics name each target by its stable template ordinal.
+        targets = template.get("targets", {}).values()
+        for target_ordinal, target in enumerate(targets, start=1):
+            target_name = f"#{target_ordinal}"
             selection = str(target.get("selectionMode", ""))
             match = re.fullmatch(r"COUNT\(([0-9]+)\)", selection)
             percent_match = re.fullmatch(r"PERCENT\(([0-9]+)\)", selection)
@@ -9500,7 +9742,7 @@ class FISTemplateExperiment(ChaosExperiment):
             if selection == "ALL" or percent_match:
                 if percent_match and not 1 <= int(percent_match.group(1)) <= 100:
                     violations.append(
-                        f"FIS target {target_name} has invalid selection mode {selection!r}"
+                        f"FIS target {target_name} has an invalid selection mode"
                     )
                 if live and not allow_unbounded and not explicitly_bounded:
                     violations.append(
@@ -9514,7 +9756,7 @@ class FISTemplateExperiment(ChaosExperiment):
                     )
             elif not match:
                 violations.append(
-                    f"FIS target {target_name} has invalid selection mode {selection!r}"
+                    f"FIS target {target_name} has an invalid selection mode"
                 )
 
             if live and resource_arns:
@@ -9750,6 +9992,14 @@ class ChaosOrchestrator:
                 aws_secret_access_key=assumed["SecretAccessKey"],
                 aws_session_token=assumed["SessionToken"],
                 region_name=self.region,
+            )
+        if self.live:
+            # Pin before the STS check, so every live client signs with exactly
+            # the credential snapshot whose identity is verified below. A named
+            # profile keeps its shared configuration; an assumed-role session
+            # keeps its existing profile-less construction.
+            session = pin_session_credentials(
+                session, self.region, None if requested_role else profile
             )
         self.session = session
         safety_config = self.config.setdefault("safety", {})
@@ -10798,7 +11048,9 @@ class ChaosOrchestrator:
 
         # VPC experiments
         elif experiment_type == ChaosType.VPC_SUBNET_ACL_MODIFY:
-            return experiment.modify_subnet_acl(config["subnet_id"], config["nacl_id"])
+            return experiment.modify_subnet_acl(
+                config["subnet_id"], config["nacl_id"], config.get("original_nacl_id")
+            )
         elif experiment_type == ChaosType.VPC_ROUTE_TABLE_MODIFY:
             return experiment.modify_route_table(
                 config["route_table_id"],
@@ -10877,7 +11129,9 @@ class ChaosOrchestrator:
             )
         elif experiment_type == ChaosType.S3_LIFECYCLE_MODIFY:
             return experiment.modify_lifecycle(
-                config["bucket_name"], config.get("expire_days", 1)
+                config["bucket_name"],
+                config.get("expire_days", 1),
+                config.get("prefix"),
             )
 
         # SQS experiments
@@ -11974,6 +12228,11 @@ def validate_config_data(config: dict[str, Any]) -> None:
                 raise ConfigurationError(
                     f"{location} is missing required parameter(s): {', '.join(missing)}"
                 )
+            if experiment_type == ChaosType.S3_LIFECYCLE_MODIFY:
+                try:
+                    validate_s3_lifecycle_request(experiment)
+                except ConfigurationError as error:
+                    raise ConfigurationError(f"{location}: {error}") from None
             if experiment_type == ChaosType.VPC_PEERING_DELETE:
                 try:
                     endpoints, _endpoint_targets = peering_endpoint_scope(experiment)

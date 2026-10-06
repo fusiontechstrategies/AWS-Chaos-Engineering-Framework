@@ -462,19 +462,35 @@ OUT_OF_SCOPE = [
     ),
     (
         framework.ChaosType.VPC_SUBNET_ACL_MODIFY,
-        {"subnet_id": OUTSIDE_SUBNET, "nacl_id": NACL},
+        {
+            "subnet_id": OUTSIDE_SUBNET,
+            "nacl_id": NACL,
+            "original_nacl_id": ORIGINAL_NACL,
+        },
     ),
     (
         framework.ChaosType.VPC_SUBNET_ACL_MODIFY,
-        {"subnet_id": UNTAGGED_SUBNET, "nacl_id": NACL},
+        {
+            "subnet_id": UNTAGGED_SUBNET,
+            "nacl_id": NACL,
+            "original_nacl_id": ORIGINAL_NACL,
+        },
     ),
     (
         framework.ChaosType.VPC_SUBNET_ACL_MODIFY,
-        {"subnet_id": SUBNET, "nacl_id": OUTSIDE_NACL},
+        {
+            "subnet_id": SUBNET,
+            "nacl_id": OUTSIDE_NACL,
+            "original_nacl_id": ORIGINAL_NACL,
+        },
     ),
     (
         framework.ChaosType.VPC_SUBNET_ACL_MODIFY,
-        {"subnet_id": SUBNET, "nacl_id": UNTAGGED_NACL},
+        {
+            "subnet_id": SUBNET,
+            "nacl_id": UNTAGGED_NACL,
+            "original_nacl_id": ORIGINAL_NACL,
+        },
     ),
     (framework.ChaosType.VPC_ENDPOINT_DELETE, {"endpoint_id": OUTSIDE_ENDPOINT}),
     (framework.ChaosType.VPC_ENDPOINT_DELETE, {"endpoint_id": UNTAGGED_ENDPOINT}),
@@ -524,7 +540,8 @@ def test_vpc_scope_refuses_types_whose_membership_is_unverified(kind):
 
 
 def test_vpc_scope_leaves_vpc_independent_types_admitted():
-    kind = framework.ChaosType.S3_LIFECYCLE_MODIFY
+    # S3 lifecycle is now planning only; Kinesis retention is VPC independent.
+    kind = framework.ChaosType.KINESIS_RETENTION_MODIFY
     orchestrator, _aws, values = scoped(kind)
     experiment = orchestrator._create_experiment(kind, copy.deepcopy(values))
     assert experiment._execution_grant.vpc_id == VPC
@@ -727,21 +744,21 @@ def test_peering_rule_requires_both_endpoints_in_the_selected_vpc():
             )
 
 
-# S3 lifecycle region binding.
+# S3 lifecycle region binding. Live lifecycle replacement is planning only: it
+# has no conditional revision, so the owner-bound location read is never reached
+# by a live lifecycle write. The botocore signing-region guard remains in force.
 
 LIFECYCLE = framework.ChaosType.S3_LIFECYCLE_MODIFY
 BUCKET = action_configs()[LIFECYCLE]["bucket_name"]
 
 
-def lifecycle_experiment(region=REGION, aws=None):
+def lifecycle_values(region=REGION, aws=None):
     aws = aws or FakeAWS(reject_writes=False)
     values = dict(action_configs()[LIFECYCLE])
     if region != REGION:
         values["region"] = region
         aws.client("s3").meta.region_name = region
-    experiment = make_experiment(LIFECYCLE, values, aws, dry_run=False)
-    aws.calls.clear()
-    return experiment, aws
+    return values, aws
 
 
 def s3_calls(aws) -> list[tuple[str, dict[str, Any]]]:
@@ -762,27 +779,48 @@ def test_bucket_location_normalizes_legacy_constraints(location, expected):
 
 @pytest.mark.parametrize("location", ["us-gov-east-1", "us-east-1", "EU", None, ""])
 def test_s3_lifecycle_in_another_region_is_refused_before_write(location):
-    experiment, aws = lifecycle_experiment()
+    values, aws = lifecycle_values()
     aws.read_overrides[("s3", "get_bucket_location")] = [
         {"LocationConstraint": location}
     ]
-    result = experiment.modify_lifecycle(BUCKET, 1)
-    assert result.status == "failed"
-    assert "region" in " ".join(result.errors)
-    assert experiment.mutation_attempts == []
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(LIFECYCLE, values, aws, dry_run=False)
+    # Refused before any bucket read, location read or write.
+    assert s3_calls(aws) == []
     assert mutation_calls(aws) == []
-    assert (
-        "get_bucket_location",
-        {"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT_ID},
-    ) in s3_calls(aws)
+
+
+def owner_bound_s3_in_forward_dispatch(aws):
+    """An admitted live owner inside its forward dispatch, with an owned S3 proxy."""
+    owner = make_experiment(
+        framework.ChaosType.EC2_REBOOT,
+        action_configs()[framework.ChaosType.EC2_REBOOT],
+        aws,
+        dry_run=False,
+    )
+    owner._sdk_request_authority.execution = owner._execution_grant
+    owner._sdk_request_authority.phase = "forward"
+    aws.calls.clear()
+    return owner, owner.client("s3")
 
 
 @pytest.mark.parametrize(
     "response",
-    [FakeClientError("AccessDenied"), {"LocationConstraint": "not-a-region"}, []],
+    [
+        FakeClientError("AccessDenied"),
+        {"LocationConstraint": "not-a-region"},
+        [],
+        {"LocationConstraint": "us-gov-east-1"},
+        {"LocationConstraint": None},
+    ],
 )
 def test_s3_lifecycle_location_errors_fail_closed(response):
-    experiment, aws = lifecycle_experiment()
+    # The owner-bound location read still guards every S3 write that is not
+    # retired; an encryption write stands in for any such admitted write.
+    aws = FakeAWS(reject_writes=False)
+    owner, s3 = owner_bound_s3_in_forward_dispatch(aws)
     original = aws.respond
 
     def respond(service, operation, request):
@@ -794,9 +832,12 @@ def test_s3_lifecycle_location_errors_fail_closed(response):
         return original(service, operation, request)
 
     aws.respond = respond
-    result = experiment.modify_lifecycle(BUCKET, 1)
-    assert result.status == "failed"
-    assert experiment.mutation_attempts == []
+    with pytest.raises((framework.SafetyViolation, FakeClientError)):
+        s3.delete_bucket_encryption(Bucket=BUCKET)
+    assert s3_calls(aws) == [
+        ("get_bucket_location", {"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT_ID})
+    ]
+    assert owner.mutation_attempts == []
     assert mutation_calls(aws) == []
 
 
@@ -804,23 +845,23 @@ def test_s3_lifecycle_location_errors_fail_closed(response):
     ("region", "location"),
     [(REGION, REGION), ("us-east-1", None), ("us-east-1", ""), ("eu-west-1", "EU")],
 )
-def test_matching_region_and_owner_permit_the_lifecycle_write(region, location):
-    experiment, aws = lifecycle_experiment(region)
+def test_matching_region_and_owner_plan_the_lifecycle_without_writes(region, location):
+    values, aws = lifecycle_values(region, FakeAWS(reject_writes=True))
     aws.read_overrides[("s3", "get_bucket_location")] = [
         {"LocationConstraint": location}
     ]
-    result = experiment.modify_lifecycle(BUCKET, 1)
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(LIFECYCLE, values, aws, dry_run=False)
+    experiment = make_experiment(LIFECYCLE, values, aws, dry_run=True)
+    aws.calls.clear()
+    result = experiment.modify_lifecycle(BUCKET, 1, values["prefix"])
     assert result.status == "completed", result.errors
-    calls = s3_calls(aws)
     owner = {"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT_ID}
-    assert [operation for operation, _request in calls] == [
-        "get_bucket_lifecycle_configuration",
-        "get_bucket_location",
-        "put_bucket_lifecycle_configuration",
-    ]
-    assert calls[1][1] == owner
-    assert calls[2][1]["ExpectedBucketOwner"] == ACCOUNT_ID
-    assert experiment.mutation_operations == ["s3.put_bucket_lifecycle_configuration"]
+    assert s3_calls(aws) == [("get_bucket_lifecycle_configuration", owner)]
+    assert experiment.mutation_attempts == []
+    assert experiment.mutation_operations == []
 
 
 class OfflineBody:
@@ -831,14 +872,6 @@ class OfflineBody:
         yield self.body
 
 
-LOCATION_XML = (
-    '<?xml version="1.0" encoding="UTF-8"?>'
-    '<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
-    f"{REGION}</LocationConstraint>"
-).encode()
-NO_LIFECYCLE_XML = (
-    b"<Error><Code>NoSuchLifecycleConfiguration</Code><Message>none</Message></Error>"
-)
 REDIRECT_XML = (
     b"<Error><Code>PermanentRedirect</Code><Message>redirect</Message></Error>"
 )
@@ -848,7 +881,6 @@ REDIRECT_XML = (
 def test_botocore_region_redirect_of_lifecycle_write_is_refused(monkeypatch, redirect):
     """A real botocore client, answered locally before any network send."""
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
-    experiment, _aws = lifecycle_experiment()
     session = boto3.Session(
         aws_access_key_id="offline",
         aws_secret_access_key="offline",
@@ -858,16 +890,14 @@ def test_botocore_region_redirect_of_lifecycle_write_is_refused(monkeypatch, red
     controller = framework.SafetyController(
         {}, session, REGION, True, expected_account=ACCOUNT_ID
     )
+    # The signing guard is installed on the cached SDK client itself, so it
+    # also binds S3 writes that do not pass through an experiment owner.
     raw = controller.client("s3")._client
     sent: list[tuple[str, str]] = []
 
     def offline(request, **_kwargs):
         url = urlsplit(request.url)
         sent.append((request.method, url.netloc))
-        if request.method == "GET" and url.query == "location":
-            return AWSResponse(request.url, 200, {}, OfflineBody(LOCATION_XML))
-        if request.method == "GET" and url.query == "lifecycle":
-            return AWSResponse(request.url, 404, {}, OfflineBody(NO_LIFECYCLE_XML))
         if request.method == "PUT" and url.query == "lifecycle":
             if redirect:
                 headers = {"x-amz-bucket-region": "us-gov-east-1"}
@@ -876,17 +906,25 @@ def test_botocore_region_redirect_of_lifecycle_write_is_refused(monkeypatch, red
         raise AssertionError(f"Unexpected offline request {request.method} {url}")
 
     raw.meta.events.register("before-send.s3", offline)
-    experiment.s3 = framework.AwsClientProxy("s3", raw, experiment)
-    result = experiment.modify_lifecycle(BUCKET, 1)
+    request = {
+        "Bucket": BUCKET,
+        "ExpectedBucketOwner": ACCOUNT_ID,
+        "LifecycleConfiguration": {
+            "Rules": [
+                {
+                    "ID": framework.S3_LIFECYCLE_RULE_ID,
+                    "Status": "Enabled",
+                    "Filter": {"Prefix": "chaos-test/"},
+                    "Expiration": {"Days": 1},
+                }
+            ]
+        },
+    }
+    if redirect:
+        with pytest.raises(framework.SafetyViolation, match="redirected"):
+            raw.put_bucket_lifecycle_configuration(**request)
+    else:
+        raw.put_bucket_lifecycle_configuration(**request)
     puts = [host for method, host in sent if method == "PUT"]
     assert all("us-gov-east-1" not in host for _method, host in sent)
     assert len(puts) == 1
-    if redirect:
-        assert result.status == "failed"
-        assert "redirected" in " ".join(result.errors)
-        assert experiment.mutation_operations == []
-    else:
-        assert result.status == "completed", result.errors
-        assert experiment.mutation_operations == [
-            "s3.put_bucket_lifecycle_configuration"
-        ]
