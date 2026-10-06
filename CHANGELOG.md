@@ -17,6 +17,12 @@
   VPC-addressable types whose membership cannot be verified.
 - Bind live S3 lifecycle writes to the reviewed region with an owner-bound
   bucket location check and refuse SDK region redirects for S3 writes.
+- Bind WAF and Lambda recovery to the LockToken or RevisionId issued by the
+  forward update itself. A different or later generation is refused even with
+  identical values. Recovery is single use and revokes the execution grant
+  after it ends.
+- Refuse WAF rule, rate-limit and IP-set requests already satisfied by current
+  state before dispatch, without ownership or a recovery claim.
 
 All notable changes to this project are documented here.
 

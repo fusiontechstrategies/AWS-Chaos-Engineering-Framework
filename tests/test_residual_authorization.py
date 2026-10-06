@@ -133,25 +133,30 @@ def test_public_lifecycle_refuses_reentry_and_preserves_owned_phase_accounting(
     forward_polls = item.safety_controller.check_safety_conditions.call_count
     assert forward_polls > 0
     item.safety_controller.emergency_stop_all()
-    item.run_rollback()
+    if forward_failure:
+        # An ambiguous forward has no confirmed post-write revision to own.
+        with pytest.raises(f.SafetyViolation, match="revision was not confirmed"):
+            item.run_rollback()
+    else:
+        item.run_rollback()
     assert item.safety_controller.check_safety_conditions.call_count == forward_polls
-    assert phases == [
-        ("update_function_configuration", False),
-        ("update_function_configuration", True),
-    ]
+    assert phases == [("update_function_configuration", False)] + (
+        [] if forward_failure else [("update_function_configuration", True)]
+    )
     assert item.mutation_attempts == ["lambda.update_function_configuration"]
     assert item.mutation_operations == (
         [] if forward_failure else ["lambda.update_function_configuration"]
     )
-    assert item.rollback_attempts == ["lambda.update_function_configuration"]
-    assert item.rollback_operations == ["lambda.update_function_configuration"]
-    assert item.rollback_verified and not item.rollback_errors
+    recovered = [] if forward_failure else ["lambda.update_function_configuration"]
+    assert item.rollback_attempts == recovered
+    assert item.rollback_operations == recovered
+    assert item.rollback_verified is not forward_failure
+    assert bool(item.rollback_errors) is forward_failure
     assert not item._is_recovery_dispatch()
     writes = [r for _, op, r in aws.calls if op == "update_function_configuration"]
-    assert [r["RevisionId"] for r in writes] == [
-        "memory-original-revision",
-        "memory-owned-revision",
-    ]
+    assert [r["RevisionId"] for r in writes] == ["memory-original-revision"] + (
+        [] if forward_failure else ["memory-owned-revision"]
+    )
 
 
 def test_confirmed_handler_uses_detached_approved_argument_containers():
