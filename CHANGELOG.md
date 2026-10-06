@@ -41,6 +41,29 @@
 - Refuse WAF rule, rate-limit and IP-set requests already satisfied by current
   state before dispatch, without ownership or a recovery claim.
 
+### Queued-change, unreadable-state and plan-parity follow-ups
+
+- Refuse RDS backup-retention changes (`ApplyImmediately`), reboots and cluster
+  failovers unless the target is available with no pending modifications and
+  every DB parameter group (and option group, or cluster-member parameter
+  group) is `in-sync`; the reason is recorded as `queued_change_refusal`.
+- Check the parent cluster of a clustered-instance reboot (availability,
+  pending modifications and the member's cluster parameter group), and require
+  every failover member instance to pass the instance checks; unreadable
+  clusters or members are refused.
+- Refuse Lambda environment experiments and their recovery when
+  `Environment.Error` is present or `Environment` lacks `Variables`; unreadable
+  variables are never treated as an empty environment, and a restored empty map
+  verifies even when `Environment` is omitted.
+- Compute WAF IP-set ownership against canonical CIDRs, write only canonically
+  new addresses and remove only owned canonical entries during recovery.
+- Apply every structural FIS guardrail in plan mode; only the live alarm-state
+  read is skipped, so a plan reports the violations live checks would raise.
+- Refuse execution grants for experiment types without a reviewed live
+  implementation, deny their S3 encryption, Kinesis, ECS and CloudFront writes
+  at the SDK proxy, and delete a Directory Service trust only when exactly the approved
+  `TrustId` is returned.
+
 All notable changes to this project are documented here.
 
 ## 2.0.4 - 2026-09-29
