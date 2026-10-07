@@ -523,6 +523,7 @@ def test_every_forward_transition_polls_alarm_changes_and_stops_promptly(
         framework.ECSChaosExperiment,
         framework.AppStreamChaosExperiment,
         framework.OpenSearchChaosExperiment,
+        framework.KinesisChaosExperiment,
     }
     if withdrawn:
         # Original service data/args still exercise its read-only planning waiter.
@@ -612,6 +613,7 @@ def test_every_recovery_transition_ignores_stop_event_and_safety_alarm(case):
         framework.ECSChaosExperiment,
         framework.AppStreamChaosExperiment,
         framework.OpenSearchChaosExperiment,
+        framework.KinesisChaosExperiment,
     }
     item = transition_owner(cls, aws, 10, dry_run=withdrawn)
     if withdrawn:

@@ -18,6 +18,8 @@ PROVENANCE_PREDICATE = "https://slsa.dev/provenance/v1"
 EVIDENCE_NAME = "release-evidence.json"
 MAX_EVIDENCE_BYTES = 1_048_576
 MAX_ATTESTATION_BYTES = 4_194_304
+# Matches the per-distribution limit admitted before download.
+MAX_PACKAGE_BYTES = 16 * 1024 * 1024
 
 
 def expected_names(tag: str) -> set[str]:
@@ -30,12 +32,17 @@ def expected_names(tag: str) -> set[str]:
     }
 
 
-def digest(path: Path) -> str:
+def digest(path: Path, limit: int | None = None) -> str:
+    limit = MAX_PACKAGE_BYTES if limit is None else limit
     if path.is_symlink() or not path.is_file():
         raise ValueError("Publish files must be regular files")
     result = hashlib.sha256()
+    total = 0
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1_048_576), b""):
+        while chunk := stream.read(min(1_048_576, limit - total + 1)):
+            total += len(chunk)
+            if total > limit:
+                raise ValueError("Publish file exceeds its byte limit")
             result.update(chunk)
     return result.hexdigest()
 
@@ -46,10 +53,22 @@ def capture(release_dir: Path, output_dir: Path, tag: str, source_commit: str) -
         raise ValueError("Invalid source commit")
     # This evidence has already passed the workflow's release and attestation
     # checks. Bind both actual source bytes and actual copied bytes to it again.
-    evidence = json.loads((release_dir / "release-evidence.json").read_text("utf-8"))
-    if evidence["tag"] != tag or evidence["source_commit"] != source_commit:
+    # The read is bounded before JSON parsing, as in the protected job.
+    evidence = json.loads(
+        _bounded_bytes(release_dir / EVIDENCE_NAME, MAX_EVIDENCE_BYTES)
+    )
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("tag") != tag
+        or evidence.get("source_commit") != source_commit
+        or not isinstance(evidence.get("artifacts"), list)
+    ):
         raise ValueError("Release identity mismatch")
-    records = {item["name"]: item for item in evidence["artifacts"]}
+    records: dict[str, dict] = {}
+    for item in evidence["artifacts"]:
+        if not isinstance(item, dict) or item.get("name") in records:
+            raise ValueError("Invalid release evidence")
+        records[item.get("name")] = item
     output_dir.mkdir(exist_ok=False)
     packages = output_dir / "packages"
     packages.mkdir()
@@ -61,7 +80,9 @@ def capture(release_dir: Path, output_dir: Path, tag: str, source_commit: str) -
     }
     for name in sorted(names):
         source = release_dir / name
-        record = records[name]
+        record = records.get(name)
+        if record is None:
+            raise ValueError("Public distribution does not match verified evidence")
         if (
             digest(source) != record["sha256"]
             or source.stat().st_size != record["bytes"]

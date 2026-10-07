@@ -318,21 +318,14 @@ def test_live_admission_without_resolvable_credentials_is_refused(tmp_path):
 
 RDS_ARN = f"arn:aws-us-gov:rds:{REGION}:{ACCOUNT_ID}:db:chaos-test-db"
 STREAM_ARN = f"arn:aws-us-gov:kinesis:{REGION}:{ACCOUNT_ID}:stream/chaos-test-stream"
-# RDS reboot, retention and failover are planning only: a live attempt is
-# refused before any name-only read. Their ARN checks remain as defence in depth.
+# RDS reboot, retention and failover and Kinesis retention are planning only: a
+# live attempt is refused before any name-only read. Their ARN checks remain as
+# defence in depth and are exercised directly below.
 RDS_NAME_ONLY = {
     framework.ChaosType.RDS_REBOOT: "reboot_db_instance",
     framework.ChaosType.RDS_BACKUP_RETENTION_MODIFY: "modify_db_instance",
     framework.ChaosType.RDS_FAILOVER: "failover_db_cluster",
-}
-NAME_ONLY = {
-    framework.ChaosType.KINESIS_RETENTION_MODIFY: (
-        "kinesis",
-        "describe_stream",
-        ("StreamDescription", "StreamARN"),
-        STREAM_ARN,
-        "decrease_stream_retention_period",
-    ),
+    framework.ChaosType.KINESIS_RETENTION_MODIFY: "decrease_stream_retention_period",
 }
 
 
@@ -367,31 +360,18 @@ def run_named(kind, aws, monkeypatch=None):
     )
 
 
-@pytest.mark.parametrize("kind", sorted(NAME_ONLY, key=lambda item: item.value))
 @pytest.mark.parametrize(
     "case", ["account", "region", "partition", "resource", "missing"]
 )
-def test_name_only_rds_and_kinesis_reads_bind_the_reviewed_arn_before_mutation(
-    kind, case, monkeypatch
-):
-    service, operation, path, arn, mutation = NAME_ONLY[kind]
-    aws = FakeAWS(reject_writes=False)
-    response = aws.respond(service, operation, {})
-    aws.calls.clear()
-    container = response
-    for key in path[:-1]:
-        container = container[key]
-    value = substitute(arn, case)
-    if value is None:
-        container.pop(path[-1], None)
-    else:
-        container[path[-1]] = value
-    aws.read_overrides[(service, operation)] = [response]
-    experiment, result = run_named(kind, aws, monkeypatch)
-    assert result.status == "failed"
-    assert not result.affected_resources
-    assert mutation not in [operation for _s, operation, _r in aws.calls]
-    assert experiment.mutation_attempts == []
+def test_name_only_rds_and_kinesis_reads_bind_the_reviewed_arn_before_mutation(case):
+    # Kinesis retention is planning only, so its handler's name-only ARN check is
+    # defence in depth. The same reviewed-identity binding still refuses every
+    # substituted or missing stream ARN.
+    value = substitute(STREAM_ARN, case)
+    with pytest.raises(framework.SafetyViolation):
+        framework.validate_named_response_arn(
+            value, "kinesis", "stream/chaos-test-stream", ACCOUNT_ID, REGION
+        )
 
 
 @pytest.mark.parametrize("kind", sorted(RDS_NAME_ONLY, key=lambda item: item.value))
@@ -414,7 +394,7 @@ def test_name_only_rds_live_reads_are_never_reached(kind, monkeypatch):
     assert planned.mutation_attempts == []
 
 
-def test_name_only_arn_binding_accepts_the_exact_reviewed_identity(monkeypatch):
+def test_name_only_arn_binding_accepts_the_exact_reviewed_identity():
     framework.validate_named_response_arn(
         RDS_ARN.replace("db:chaos-test-db", "db:Chaos-Test-DB"),
         "rds",
@@ -431,16 +411,14 @@ def test_name_only_arn_binding_accepts_the_exact_reviewed_identity(monkeypatch):
             ACCOUNT_ID,
             REGION,
         )
-    aws = FakeAWS(reject_writes=False)
-    before = aws.respond("kinesis", "describe_stream", {})
-    after = copy.deepcopy(before)
-    after["StreamDescription"]["RetentionPeriodHours"] = 24
-    aws.read_overrides[("kinesis", "describe_stream")] = [before, after]
-    experiment, result = run_named(
-        framework.ChaosType.KINESIS_RETENTION_MODIFY, aws, monkeypatch
+    framework.validate_named_response_arn(
+        STREAM_ARN, "kinesis", "stream/chaos-test-stream", ACCOUNT_ID, REGION
     )
-    assert result.status == "completed", result.errors
-    assert experiment.mutation_attempts == ["kinesis.decrease_stream_retention_period"]
+    aws = FakeAWS(reject_writes=False)
+    assert (
+        aws.respond("kinesis", "describe_stream", {})["StreamDescription"]["StreamARN"]
+        == STREAM_ARN
+    )
 
 
 # 2. S3 lifecycle expiration carries the reviewed prefix and is planning only.

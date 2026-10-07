@@ -36,9 +36,10 @@ def worker(aws, kind=framework.ChaosType.LAMBDA_MEMORY_LIMIT, values=None):
 
 
 # S3 lifecycle expiration is planning only (no conditional lifecycle revision),
-# as is RDS backup retention (ApplyImmediately can activate changes queued by
-# others). Kinesis retention is the irreversible retention change with live support.
-@pytest.mark.parametrize("kind", ["kinesis_retention_modify"])
+# as are RDS backup retention (ApplyImmediately can activate changes queued by
+# others) and Kinesis retention (name-only, no generation). KMS grant revocation
+# is an irreversible change that keeps live support and the same dual approval.
+@pytest.mark.parametrize("kind", ["kms_grant_revoke"])
 @pytest.mark.parametrize(
     "cli,configuration", [(False, False), (True, False), (False, True), (True, True)]
 )

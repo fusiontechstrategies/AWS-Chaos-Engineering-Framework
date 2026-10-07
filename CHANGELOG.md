@@ -2,6 +2,58 @@
 
 ## Unreleased security follow-ups
 
+### Planning-only Kinesis retention and SES deletion, terminal log redaction and release-asset admission
+
+- Withdraw live support for `kinesis_retention_modify` and
+  `ses_configuration_set_delete`. `DecreaseStreamRetentionPeriod` and
+  `DeleteConfigurationSet` address a reusable name and accept no stable
+  generation, provider-enforced condition or exclusive lease, so another
+  same-account principal could change or replace the stream or configuration
+  set after approval and the pre-read and the irreversible write would land on
+  that new state. Both types now report `live_supported: false` (`LIVE no`);
+  live tokens, live suites, execution grants, direct live construction and the
+  `kinesis.decrease_stream_retention_period` and
+  `ses.delete_configuration_set` SDK requests are refused. Dry-run plans are
+  unchanged. The Kinesis `StreamARN` check is retained in the live branch as
+  defence in depth. Compatibility: existing live configurations for these two
+  types can still produce plans but can no longer obtain a live token.
+- Keep exact-value log redaction active until terminal logging finishes. Run,
+  worker and handler scopes now attach an immutable snapshot of their
+  protected values to any exception that escapes them. The CLI logs a
+  propagated error, its debug traceback and chained causes under that snapshot
+  plus the identifiers in the loaded configuration, and the suite loop logs a
+  failed worker under the worker's snapshot, so a missing-alarm violation or an
+  AWS error naming a target no longer reaches the console unredacted.
+- Make privacy-safe logging part of the library contract. Every public handler
+  call, plan or live, direct or orchestrated, and `run_rollback()` install a
+  scope from all targets bound by the experiment configuration and the call
+  arguments. Targets supplied only as handler arguments are kept in the
+  instance's append-only protected-value set, so later recovery, rollback, run
+  and metrics calls on that instance (and their errors) stay redacted; other
+  instances never inherit the set. The `aws_chaos_framework` logger carries a filter that renders and
+  redacts each record (message, traceback and stack information) in the
+  caller's context before any handler runs, so an embedding application with a
+  basic `StreamHandler` receives no raw identifiers and does not need the CLI.
+  Compatibility: framework log records reach handlers with `args` empty and
+  `exc_info` cleared; the redacted traceback is in `exc_text`, with control
+  characters escaped onto one line.
+- Add `scripts/release_asset_admission.py`, a trusted helper for public release
+  assets. `verify` accepts only the six fixed release basenames, never joins a
+  checksum or evidence name to a path, rejects absolute, separated, traversing,
+  control-character, duplicate and unexpected names, admits every file's type
+  and size before opening any, opens only regular non-symlink children (beneath
+  a directory descriptor where the platform supports it), hashes with bounded
+  streaming and refuses files that change while they are read. `download`
+  admits release metadata by per-file and aggregate size before any asset is
+  requested, then streams each asset under its declared size and a deadline
+  into a new private file while hashing it. `publish_payload.py capture` now
+  bounds the evidence read before JSON parsing, refuses duplicate evidence
+  records, and every package digest is size-bounded.
+- Not yet complete: `.github/workflows/publish.yml` is unchanged pending owner
+  approval. Until it is changed to call the helper, the verify job still runs
+  `sha256sum --check` and its inline evidence check on downloaded assets, and
+  both jobs still use `gh release download` without size admission.
+
 ### Canonical AWS endpoint origin and source-bound wheel metadata
 
 - Bind every SDK client to a canonical AWS origin. Live admission trusted

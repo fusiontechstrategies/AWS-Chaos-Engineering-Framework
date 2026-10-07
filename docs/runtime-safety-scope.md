@@ -180,6 +180,7 @@ all refuse the affected operations; a previous grant does not restore support.
 | Directory Service conditional forwarder | Name-based deletion cannot bind the selected forwarder's generation. Recreating a saved address list does not establish that the name still belongs to this execution. |
 | SQS queue purge | `PurgeQueue` deletes whatever the queue holds when AWS processes the request. It cannot be conditioned on an exact, immutable message set, so no approved blast radius or owner check bounds the messages destroyed. `PurgeQueue` is refused at the SDK proxy. |
 | RDS reboot, cluster failover and backup retention | `RebootDBInstance`, `FailoverDBCluster` and `ModifyDBInstance` with `ApplyImmediately` accept no conditional generation or exclusive lease. A reboot, failover or immediate modification can also activate parameter, option-group or instance changes another principal queues after the plan's reads, and a failover can restart cluster members that are not counted as approved targets. All three requests are refused at the SDK proxy. |
+| Kinesis retention decrease and SES configuration-set deletion | `DecreaseStreamRetentionPeriod` and `DeleteConfigurationSet` address a reusable stream or set name and accept no stable generation, provider-enforced condition or exclusive lease. Another principal can change or replace the named resource after approval and the pre-read, and the irreversible write would then apply to that new state. Both requests are refused at the SDK proxy. |
 
 The SDK operation inventory is evaluated against the pinned Botocore model;
 unconditional retries or additional reads do not supply absent service conditions.
@@ -202,8 +203,9 @@ revision, and an irreversible approval does not restore live support. Pure
 account, partition, region and Firehose IAM role validators remain available as
 identity checks; they do not grant execution authority. Operators must reconcile
 historical subscription outcomes separately.
-SES configuration-set deletion likewise keeps its declared irreversible scope;
-legacy configuration-set recreation is refused. Previously unsupported S3
+SES configuration-set deletion likewise keeps its declared irreversible scope
+for planning only; live deletion and legacy configuration-set recreation are
+both refused. Previously unsupported S3
 encryption restoration is also refused at SDK dispatch. These paths cannot be
 used to recover old executions automatically.
 SQS queue purge and RDS reboot, cluster failover and backup-retention changes
@@ -216,6 +218,12 @@ grants (including recovery of a historical execution) and the `PurgeQueue`,
 `RebootDBInstance`, `FailoverDBCluster` and `ModifyDBInstance` SDK requests are
 refused, and `--list-experiments` reports `LIVE no` for all four types. A larger
 `max_blast_radius` or irreversible approval does not restore live support.
+Kinesis retention decreases and SES configuration-set deletion are planning only
+on the same terms. Their plans still read the named stream or set. The Kinesis
+`StreamARN` check runs only on live dispatch, which is refused. Live tokens,
+live suites, execution grants, direct live construction and the
+`DecreaseStreamRetentionPeriod` and `DeleteConfigurationSet` SDK requests are
+refused, and `--list-experiments` reports `LIVE no` for both types.
 
 ### Exact Lambda identity and terminal recovery state
 

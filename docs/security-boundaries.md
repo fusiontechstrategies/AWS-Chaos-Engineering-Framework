@@ -263,8 +263,11 @@ between live experiments starts after the preceding experiment finishes recovery
 RDS backup-retention changes and S3 lifecycle expiration are irreversible actions.
 Both are planning only: no approval combination issues a live token for them, and
 their plans cannot claim automatic recovery. The S3 lifecycle plan is prefix
-scoped and never whole-bucket. Kinesis retention decreases remain live supported
-and require both irreversible approvals and the LIVE-IRREVERSIBLE confirmation.
+scoped and never whole-bucket. Kinesis retention decreases and SES
+configuration-set deletion are planning only as well, because both writes are
+addressed by a reusable name without a generation, condition or lease. The
+remaining irreversible live types, such as KMS grant revocation, require both
+irreversible approvals and the LIVE-IRREVERSIBLE confirmation.
 Restoring settings cannot recover backups or objects already deleted. EC2 termination and EBS detach create no implicit
 snapshots. Arrange and approve any required backups separately before approving
 these actions; neither action creates persistent data copies.
@@ -342,6 +345,18 @@ and include identifiers of every length. Exact identifier boundaries preserve
 unrelated words. CR, LF, tabs, terminal escapes, and Unicode control characters
 are displayed as visible escapes in operator messages.
 
+A scope that an exception leaves attaches an immutable snapshot of its protected
+values to that exception. The CLI logs a propagated error, its debug traceback
+and chained causes under that snapshot and the identifiers of the loaded
+configuration, and the suite loop does the same for a failed worker. Every
+public handler call and `run_rollback()`, including direct imported use, adds the
+targets bound by its configuration and arguments to the active registry. A
+filter on the `aws_chaos_framework` logger renders and redacts every record in
+the caller's context before any handler runs, so a host's own basic handler
+receives only redacted text. Redaction covers registered exact values and the
+generic ARN, account and access-key patterns; other identifiers that appear only
+in AWS responses are not registered.
+
 Report disclosure flags apply to typed fields: include_resource_ids exposes the
 affected-resource list, and include_identity exposes run identity. ARN/account
 identity inside resource fields still requires include_identity. Errors and
@@ -368,6 +383,15 @@ accepted. The attested evidence must name the dispatched tag, version and commit
 and match both package digests and sizes. Tag and commit strings alone never
 authenticate package bytes. No tag-controlled code executes after the verified
 payload is captured.
+
+`scripts/release_asset_admission.py` is the trusted parser for unauthenticated
+release manifests and the bounded downloader for public release assets. It
+accepts only the six fixed basenames and compares checksum and evidence names
+instead of opening them, opens only regular non-symlink files beneath the asset
+directory, and admits per-file and aggregate sizes from release metadata before
+any download. The publish workflow does not call it yet: until that workflow
+change is approved, the verify job still runs `sha256sum --check` and an inline
+evidence check, and both jobs use `gh release download` without size admission.
 
 ## Destructive-call and transition evidence
 
@@ -480,12 +504,11 @@ such as `ca_bundle` and `use_fips_endpoint`, still applies; only the credential
 source is replaced by the explicit static snapshot. Endpoint routing is not
 inherited: see the next section. A refreshable profile cannot rotate to
 another identity mid-run; the snapshot can only expire, which fails closed, so
-temporary credentials must outlive the run. Name-only Kinesis reads must also
-return a `StreamARN` with the reviewed partition, region, account and resource
-name before a live stream retention decrease. The equivalent `DBInstanceArn` and
-`DBClusterArn` checks remain in the live branches of the planning-only RDS
-reboot, failover and retention handlers; dry-run plans skip them, so a plan does
-not establish them.
+temporary credentials must outlive the run. The name-only Kinesis `StreamARN`
+check and the equivalent `DBInstanceArn` and `DBClusterArn` checks remain in the
+live branches of the planning-only Kinesis retention and RDS reboot, failover
+and retention handlers; dry-run plans skip them, so a plan does not establish
+them.
 
 ## Canonical AWS endpoint origin
 
@@ -642,8 +665,8 @@ is only known when the handler reads the mount target, so it is enforced there,
 before the deletion, rather than at suite start.
 `vpc_peering_delete` needs both endpoints in the selected VPC. Reviewed
 endpoints must be distinct VPCs, so peering deletion is always refused under
-`--vpc-id`. Other live types that do not address a VPC resource, such as S3, SQS,
-Kinesis, CloudFront, WAF, KMS, ECR and SES, are unaffected. All remaining live
+`--vpc-id`. Other live types that do not address a VPC resource, such as
+CloudFront, WAF, KMS and ECR, are unaffected. All remaining live
 types are refused under `--vpc-id`, including RDS, Lambda, ECS and Directory
 Service, because this tool does not verify their VPC placement and tags. A live
 suite whose configured target contradicts the selected VPC fails with a

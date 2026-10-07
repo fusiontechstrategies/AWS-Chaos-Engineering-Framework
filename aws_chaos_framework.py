@@ -166,6 +166,8 @@ _SENSITIVE_LOG_VALUES: ContextVar[frozenset[str]] = ContextVar(
     "chaos_sensitive_log_values", default=frozenset()
 )
 MAX_SENSITIVE_LOG_VALUES = 4096
+MAX_EXCEPTION_CHAIN = 64
+_EXCEPTION_LOG_VALUES_ATTRIBUTE = "_chaos_protected_log_values"
 # No live baseline capture may overlap another live mutation or recovery in this
 # process, even when callers use different orchestrators or target aliases.
 _LIVE_EXPERIMENT_LOCK = threading.RLock()
@@ -576,6 +578,13 @@ CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
         ChaosType.RDS_FAILOVER,
         ChaosType.RDS_REBOOT,
         ChaosType.RDS_BACKUP_RETENTION_MODIFY,
+        # Kinesis retention decreases and SES configuration-set deletion are
+        # addressed only by a reusable name. Neither API accepts a stable
+        # generation, provider-enforced condition or exclusive lease, so the
+        # irreversible write can land on a stream or set another principal
+        # changed or replaced after approval and the pre-read.
+        ChaosType.KINESIS_RETENTION_MODIFY,
+        ChaosType.SES_CONFIGURATION_SET_DELETE,
     }
 )
 # These APIs have no conditional ownership/revision argument. A local lock or
@@ -645,6 +654,9 @@ CONCURRENCY_UNSAFE_MUTATIONS = frozenset(
         "rds.failover_db_cluster",
         "rds.reboot_db_instance",
         "rds.modify_db_instance",
+        # Irreversible name-only writes without a generation, condition or lease.
+        "kinesis.decrease_stream_retention_period",
+        "ses.delete_configuration_set",
         # Writes reachable only from experiment types without a reviewed live
         # implementation; refused here as well as at the execution grant.
         "s3.delete_bucket_encryption",
@@ -804,6 +816,23 @@ TARGET_PARAMETER_KEYS = frozenset(
         "user_name",
         "volume_id",
         "web_acl_id",
+    }
+)
+# Identifier-bearing handler and configuration keys that are not themselves
+# approval targets. Direct library calls redact these exact values in logs.
+LOG_TARGET_KEYS = TARGET_PARAMETER_KEYS | frozenset(
+    {
+        "addresses_to_add",
+        "attachment",
+        "break_glass_principal_arn",
+        "delete_on_termination_volumes",
+        "domain_endpoint",
+        "index_name",
+        "peering_endpoints",
+        "queue_arn",
+        "role_arn",
+        "target_descriptors",
+        "vpc_id",
     }
 )
 
@@ -1453,6 +1482,42 @@ def register_sensitive_log_values(values: Iterable[Any]) -> None:
     _SENSITIVE_LOG_VALUES.set(candidates)
 
 
+def _retain_exception_log_values(error: BaseException, values: frozenset[str]) -> None:
+    """Attach an immutable protected-value snapshot to an escaping exception.
+
+    A scope's registry resets while the exception unwinds, but the caller may
+    still render the exception, its chained causes or a traceback. The snapshot
+    travels with the exception so that terminal logging can redact the same
+    exact values the active scope protected.
+    """
+    if not values:
+        return
+    previous = getattr(error, _EXCEPTION_LOG_VALUES_ATTRIBUTE, frozenset())
+    if not isinstance(previous, frozenset):
+        previous = frozenset()
+    try:
+        setattr(error, _EXCEPTION_LOG_VALUES_ATTRIBUTE, previous | values)
+    except (AttributeError, TypeError):
+        logger.debug("Could not retain protected values on an exception")
+
+
+def exception_log_values(error: BaseException | None) -> frozenset[str]:
+    """Collect retained snapshots from an exception and its bounded cause chain."""
+    collected: set[str] = set()
+    seen: set[int] = set()
+    pending = [error]
+    while pending and len(seen) < MAX_EXCEPTION_CHAIN:
+        item = pending.pop()
+        if item is None or id(item) in seen:
+            continue
+        seen.add(id(item))
+        snapshot = getattr(item, _EXCEPTION_LOG_VALUES_ATTRIBUTE, None)
+        if isinstance(snapshot, frozenset):
+            collected.update(value for value in snapshot if isinstance(value, str))
+        pending.extend((item.__cause__, item.__context__))
+    return frozenset(collected)
+
+
 @contextmanager
 def sensitive_log_scope(values: Iterable[Any]):
     """Give one run or worker a fresh registry and restore its caller on exit."""
@@ -1460,6 +1525,112 @@ def sensitive_log_scope(values: Iterable[Any]):
     try:
         register_sensitive_log_values(values)
         yield
+    except BaseException as error:
+        _retain_exception_log_values(error, _SENSITIVE_LOG_VALUES.get())
+        raise
+    finally:
+        _SENSITIVE_LOG_VALUES.reset(token)
+
+
+@contextmanager
+def exception_log_scope(error: BaseException | None, values: Iterable[Any] = ()):
+    """Keep an exception's protected values active while it is rendered or logged."""
+    token = _SENSITIVE_LOG_VALUES.set(
+        _SENSITIVE_LOG_VALUES.get()
+        | exception_log_values(error)
+        | frozenset(str(value) for value in values if value is not None and str(value))
+    )
+    try:
+        yield
+    finally:
+        _SENSITIVE_LOG_VALUES.reset(token)
+
+
+def bound_target_log_values(*sources: dict[str, Any]) -> frozenset[str]:
+    """Return every string target identifier bound in config or handler arguments."""
+    values: set[str] = set()
+
+    def collect(value: Any, depth: int) -> None:
+        if depth > 4 or len(values) > MAX_SENSITIVE_LOG_VALUES:
+            return
+        if isinstance(value, str):
+            if value:
+                values.add(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item, depth + 1)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                collect(item, depth + 1)
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key, value in source.items():
+            if key in LOG_TARGET_KEYS:
+                collect(value, 0)
+    return frozenset(values)
+
+
+_EXPERIMENT_LOG_VALUES_FALLBACK_LOCK = threading.Lock()
+
+
+def _experiment_log_snapshot(
+    experiment: Any, supplied: dict[str, Any] | None = None, *, retain: bool = False
+) -> frozenset[str]:
+    """Return one consistent protected snapshot, optionally retaining arguments.
+
+    The read, the budget check of the complete prospective union (registry,
+    configuration, retained and new argument values) and the commit happen
+    under the instance's own lock, so concurrent calls on one experiment never
+    lose an accepted target and a rejected call leaves the last valid retained
+    set unchanged. The lock is never held across provider calls or logging.
+    The set lives on the instance only; other experiments never inherit it.
+    """
+    configured = bound_target_log_values(getattr(experiment, "config", {}))
+    new = bound_target_log_values(supplied) if supplied else frozenset()
+    lock = getattr(experiment, "_log_values_lock", _EXPERIMENT_LOG_VALUES_FALLBACK_LOCK)
+    with lock:
+        retained = getattr(experiment, "_log_protected_values", frozenset())
+        candidate = frozenset(retained | new)
+        snapshot = _SENSITIVE_LOG_VALUES.get() | configured | candidate
+        if len(snapshot) > MAX_SENSITIVE_LOG_VALUES:
+            raise ConfigurationError("Too many sensitive log values in one run")
+        if retain:
+            experiment._log_protected_values = candidate
+    return snapshot
+
+
+@contextmanager
+def experiment_log_scope(
+    experiment: Any, supplied: dict[str, Any] | None = None, *, retain: bool = False
+):
+    """Scope an experiment's config, call arguments and retained bound targets."""
+    snapshot = _experiment_log_snapshot(experiment, supplied, retain=retain)
+    token = _SENSITIVE_LOG_VALUES.set(snapshot)
+    try:
+        yield
+    except BaseException as error:
+        _retain_exception_log_values(error, _SENSITIVE_LOG_VALUES.get())
+        raise
+    finally:
+        _SENSITIVE_LOG_VALUES.reset(token)
+
+
+@contextmanager
+def bound_target_log_scope(*sources: dict[str, Any]):
+    """Add bound targets to the caller's registry for one public library call.
+
+    Direct library use reaches handlers without the CLI or an orchestrator
+    scope. The caller's registry is kept, so orchestrated calls lose nothing.
+    """
+    token = _SENSITIVE_LOG_VALUES.set(_SENSITIVE_LOG_VALUES.get())
+    try:
+        register_sensitive_log_values(bound_target_log_values(*sources))
+        yield
+    except BaseException as error:
+        _retain_exception_log_values(error, _SENSITIVE_LOG_VALUES.get())
+        raise
     finally:
         _SENSITIVE_LOG_VALUES.reset(token)
 
@@ -2006,6 +2177,42 @@ class PrivacyFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         return redact_runtime_text(super().format(record))
+
+
+class RedactingLogFilter(logging.Filter):
+    """Redact framework records before any host handler or formatter sees them.
+
+    The filter runs in the logging caller's context, so the active registry
+    applies even when an embedding application installs only a basic handler.
+    Message arguments, tracebacks and stack information are rendered and
+    redacted here; handlers never receive the raw exception object.
+    """
+
+    _traceback_formatter = logging.Formatter()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "_chaos_redacted", False):
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        record.msg = redact_runtime_text(message)
+        record.args = None
+        if record.exc_info:
+            record.exc_text = redact_runtime_text(
+                self._traceback_formatter.formatException(record.exc_info)
+            )
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = redact_runtime_text(record.exc_text)
+        if record.stack_info:
+            record.stack_info = redact_runtime_text(record.stack_info)
+        record._chaos_redacted = True
+        return True
+
+
+logger.addFilter(RedactingLogFilter())
 
 
 class StrictConfigLoader(yaml.SafeLoader):
@@ -3311,6 +3518,24 @@ def _guard_live_handler(method):
 
     @wraps(method)
     def guarded(self, *args, **kwargs):
+        # Every public handler call, plan or live, direct or orchestrated, logs
+        # under a scope holding the targets bound by its config and arguments.
+        try:
+            supplied = dict(signature.bind(self, *args, **kwargs).arguments)
+        except TypeError:
+            supplied = {}
+        supplied.pop("self", None)
+        # Argument-only targets persist on this instance for later recovery,
+        # committed only after the complete protected union is admitted. Plan
+        # calls first wait for any active lifecycle on this instance (live
+        # dispatch and run_rollback() hold the same lock), so recovery state
+        # cannot change under an older privacy snapshot. Live dispatch keeps
+        # its non-blocking refusal of overlapping lifecycles.
+        lifecycle = _serialized_lifecycle(self) if self.dry_run else nullcontext()
+        with lifecycle, experiment_log_scope(self, supplied, retain=True):
+            return dispatch(self, *args, **kwargs)
+
+    def dispatch(self, *args, **kwargs):
         if "function_name" in signature.parameters:
             supplied = signature.bind(self, *args, **kwargs)
             validate_lambda_function_identifier(
@@ -3348,11 +3573,13 @@ def _guard_live_handler(method):
             acquired = self._execution_lock.acquire(blocking=False)
             if not acquired:
                 raise SafetyViolation("Another experiment lifecycle is active")
+            self._lifecycle_thread = threading.get_ident()
             if self._execution_used:
                 raise SafetyViolation("Execution grant has already been consumed")
             self._execution_used = True
         except (SafetyViolation, TypeError, ValueError) as error:
             if acquired:
+                self._lifecycle_thread = None
                 self._execution_lock.release()
             # Public handlers have always returned failed ExperimentResult data
             # for rejected live work. Preserve that contract for grant checks.
@@ -3384,9 +3611,41 @@ def _guard_live_handler(method):
             self._forward_finished = True
             del self._sdk_request_authority.execution
             del self._sdk_request_authority.phase
+            self._lifecycle_thread = None
             self._execution_lock.release()
 
     return guarded
+
+
+@contextmanager
+def _serialized_lifecycle(experiment: Any):
+    """Hold the instance lifecycle lock; the owning thread never re-acquires it."""
+    lock = getattr(experiment, "_execution_lock", None)
+    if lock is None or (
+        getattr(experiment, "_lifecycle_thread", None) == threading.get_ident()
+    ):
+        yield
+        return
+    with lock:
+        experiment._lifecycle_thread = threading.get_ident()
+        try:
+            yield
+        finally:
+            experiment._lifecycle_thread = None
+
+
+def _scope_public_method(method):
+    """Run a public non-handler method under the instance's protected values."""
+
+    @wraps(method)
+    def scoped(self, *args, **kwargs):
+        with _serialized_lifecycle(self), experiment_log_scope(self):
+            return method(self, *args, **kwargs)
+
+    return scoped
+
+
+PUBLIC_SCOPED_METHODS = frozenset({"rollback", "run", "collect_metrics"})
 
 
 class ChaosExperiment:
@@ -3400,6 +3659,8 @@ class ChaosExperiment:
         handlers = {value[0] for value in AUTHORIZED_HANDLER_CALLS.values()}
         for name in handlers & cls.__dict__.keys():
             setattr(cls, name, _guard_live_handler(cls.__dict__[name]))
+        for name in PUBLIC_SCOPED_METHODS & cls.__dict__.keys():
+            setattr(cls, name, _scope_public_method(cls.__dict__[name]))
 
     def __init__(self, config: dict[str, Any], safety_controller: SafetyController):
         creation = getattr(safety_controller, "_execution_creation", None)
@@ -3418,10 +3679,16 @@ class ChaosExperiment:
             grant = None
         self._execution_grant = grant
         self._execution_lock = threading.Lock()
+        # Thread holding _execution_lock, so its nested public calls proceed.
+        self._lifecycle_thread: int | None = None
         self._execution_used = False
         self._forward_finished = False
         self._recovery_consumed = False
         self.config = copy.deepcopy(config)
+        # Append-only, instance-scoped targets bound through handler arguments,
+        # updated only under this instance's own lock.
+        self._log_values_lock = threading.Lock()
+        self._log_protected_values: frozenset[str] = frozenset()
         self.safety_controller = safety_controller
         # Capture the account authenticated by the orchestrator, rather than
         # consulting a mutable per-experiment mapping at every request.
@@ -3623,6 +3890,7 @@ class ChaosExperiment:
         """Recover only after the owned forward lifecycle has settled."""
         if not self._execution_lock.acquire(blocking=False):
             raise SafetyViolation("Another experiment lifecycle is active")
+        self._lifecycle_thread = threading.get_ident()
         recovery_grant = None
         single_use = False
         try:
@@ -3650,8 +3918,9 @@ class ChaosExperiment:
             self._in_rollback = True
             self.rollback_verified = False
             try:
-                self.rollback()
-                self._verify_additional_recovery()
+                with experiment_log_scope(self):
+                    self.rollback()
+                    self._verify_additional_recovery()
             except Exception as exc:
                 self.rollback_errors.append(str(exc))
                 raise
@@ -3663,6 +3932,7 @@ class ChaosExperiment:
                 if single_use:
                     self._end_recovery_authority()
         finally:
+            self._lifecycle_thread = None
             self._execution_lock.release()
 
     def _end_recovery_authority(self) -> None:
@@ -11131,7 +11401,8 @@ class ChaosOrchestrator:
                     except Exception as exc:
                         self._failed_future_count += 1
                         failed = True
-                        logger.error("Experiment worker failed: %s", exc)
+                        with exception_log_scope(exc):
+                            logger.error("Experiment worker failed: %s", exc)
                     if failed and stop_on_failure:
                         logger.error("Suite failure policy requested an emergency stop")
                         self.safety_controller.emergency_stop_all()
@@ -13328,6 +13599,32 @@ def confirmation_token(
     return f"{prefix}:{account_id}:{region}:{suite_name}:{digest}"
 
 
+def configured_log_values(config: Any, extra: Iterable[Any] = ()) -> set[str]:
+    """Leniently collect configured identifiers for CLI-level log redaction."""
+    values = {str(item) for item in extra if item is not None and str(item)}
+    if not isinstance(config, dict):
+        return values
+    global_config = config.get("global")
+    if isinstance(global_config, dict):
+        values.update(bound_target_log_values(global_config))
+        if global_config.get("account_id"):
+            values.add(str(global_config["account_id"]))
+    safety = config.get("safety")
+    if isinstance(safety, dict):
+        for key in ("safety_alarms", "target_allowlist"):
+            items = safety.get(key)
+            if isinstance(items, list):
+                values.update(str(item) for item in items if item)
+    suites = config.get("experiment_suites")
+    if isinstance(suites, dict):
+        for suite in suites.values():
+            experiments = suite.get("experiments") if isinstance(suite, dict) else None
+            if isinstance(experiments, list):
+                for item in experiments:
+                    values.update(bound_target_log_values(item))
+    return values
+
+
 def configure_logging(level: str) -> None:
     """Configure concise console logging without exposing experiment config values."""
     handler = logging.StreamHandler()
@@ -13446,6 +13743,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_logging(args.log_level)
+    # Exact configured identifiers stay protected until terminal exception and
+    # traceback logging below has finished, after every inner scope unwound.
+    terminal_values: set[str] = set()
 
     try:
         if args.create_sample_config:
@@ -13462,6 +13762,9 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         config = load_yaml_config(args.config)
+        terminal_values.update(
+            configured_log_values(config, (args.role_arn, args.vpc_id))
+        )
         validate_config_data(config)
         if args.show_live_token:
             print(
@@ -13507,32 +13810,35 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("Plan mode is read-only and is the default.")
 
-        orchestrator = ChaosOrchestrator(
-            args.config,
-            vpc_id=args.vpc_id,
-            dry_run_flag=args.dry_run,
-            live=args.live,
-            profile=args.profile,
-            role_arn=args.role_arn,
-            output_dir=args.output_dir,
-            confirmation=args.confirm,
-            allow_irreversible=args.allow_irreversible,
-            allow_long_term_credentials=args.allow_long_term_credentials,
-            allow_live_without_safety_alarms=args.allow_live_without_safety_alarms,
-            allow_fis_without_stop_condition=args.allow_fis_without_stop_condition,
-            allow_unbounded_fis_targets=args.allow_unbounded_fis_targets,
-            seed=args.seed,
-        )
-        return 0 if orchestrator.run_experiment_suite(args.suite) else 1
+        with sensitive_log_scope(terminal_values):
+            orchestrator = ChaosOrchestrator(
+                args.config,
+                vpc_id=args.vpc_id,
+                dry_run_flag=args.dry_run,
+                live=args.live,
+                profile=args.profile,
+                role_arn=args.role_arn,
+                output_dir=args.output_dir,
+                confirmation=args.confirm,
+                allow_irreversible=args.allow_irreversible,
+                allow_long_term_credentials=args.allow_long_term_credentials,
+                allow_live_without_safety_alarms=args.allow_live_without_safety_alarms,
+                allow_fis_without_stop_condition=args.allow_fis_without_stop_condition,
+                allow_unbounded_fis_targets=args.allow_unbounded_fis_targets,
+                seed=args.seed,
+            )
+            return 0 if orchestrator.run_experiment_suite(args.suite) else 1
     except KeyboardInterrupt:
         logger.error("Interrupted. Emergency rollback was requested.")
         return 130
     except (ConfigurationError, SafetyViolation) as exc:
-        logger.error("%s", exc)
+        with exception_log_scope(exc, terminal_values):
+            logger.error("%s", exc)
         return 2
     except Exception as exc:
-        logger.error("Unexpected failure: %s", exc)
-        logger.debug("Unexpected failure details", exc_info=True)
+        with exception_log_scope(exc, terminal_values):
+            logger.error("Unexpected failure: %s", exc)
+            logger.debug("Unexpected failure details", exc_info=True)
         return 1
 
 

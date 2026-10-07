@@ -46,9 +46,10 @@ def test_direct_live_constructor_refuses_before_client_acquisition(experiment_cl
 def test_creation_requires_actual_identity_confirmation_and_irreversible_approval(
     field, value
 ):
-    # SQS purge is planning only; another irreversible live type carries the
-    # creation-time identity, confirmation and irreversible-approval checks.
-    kind = f.ChaosType.SES_CONFIGURATION_SET_DELETE
+    # SQS purge and SES configuration-set deletion are planning only; another
+    # irreversible live type carries the creation-time identity, confirmation
+    # and irreversible-approval checks.
+    kind = f.ChaosType.KMS_GRANT_REVOKE
     aws = FakeAWS(reject_writes=False)
     item = make_orchestrator(kind, action_configs()[kind], aws, dry_run=False)
     setattr(item, field, value)
