@@ -220,13 +220,22 @@ def test_worker_aws_error_is_redacted_when_the_suite_logs_it(host_log):
     assert "not authorized to act on [RESOURCE]" in text
 
 
+def _raise_rewrapped_suite_error():
+    try:
+        with framework.sensitive_log_scope([SUITE_ONLY]):
+            raise ValueError(SUITE_ONLY)
+    except ValueError as error:
+        raise RuntimeError("outer") from error
+
+
+def _raise_in_bound_target_scope():
+    with framework.bound_target_log_scope({"instance_ids": [INSTANCE_ID]}):
+        raise ValueError(INSTANCE_ID)
+
+
 def test_scope_retains_snapshot_through_nested_rewrapping():
     with pytest.raises(RuntimeError) as caught:
-        try:
-            with framework.sensitive_log_scope([SUITE_ONLY]):
-                raise ValueError(SUITE_ONLY)
-        except ValueError as error:
-            raise RuntimeError("outer") from error
+        _raise_rewrapped_suite_error()
     assert framework._SENSITIVE_LOG_VALUES.get() == frozenset()
     assert framework.exception_log_values(caught.value) == {SUITE_ONLY}
     with framework.exception_log_scope(caught.value):
@@ -234,11 +243,8 @@ def test_scope_retains_snapshot_through_nested_rewrapping():
             "ValueError('[RESOURCE]')"
         )
     # A handler scope retains its bound targets the same way.
-    with (
-        pytest.raises(ValueError) as bound,
-        framework.bound_target_log_scope({"instance_ids": [INSTANCE_ID]}),
-    ):
-        raise ValueError(INSTANCE_ID)
+    with pytest.raises(ValueError) as bound:
+        _raise_in_bound_target_scope()
     assert framework.exception_log_values(bound.value) == {INSTANCE_ID}
     # A cyclic chain is bounded and still terminates.
     first, second = ValueError("a"), ValueError("b")
