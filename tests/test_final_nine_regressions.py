@@ -132,6 +132,13 @@ def test_vpc_explicit_or_ambiguous_delete_failure_is_not_completed(peering, resp
         f.ChaosType.VPC_PEERING_DELETE if peering else f.ChaosType.VPC_ENDPOINT_DELETE
     )
     aws = FakeAWS(reject_writes=False)
+    if not peering:
+        # VPC endpoint deletion is planning only, so no delete response is ever
+        # reached: live admission is refused before any read or write.
+        with pytest.raises(f.ConfigurationError, match="Live approval is unavailable"):
+            live_experiment(kind, aws)
+        assert not aws.calls
+        return
     original = aws.respond
     operation = "delete_vpc_peering_connection" if peering else "delete_vpc_endpoints"
     aws.respond = lambda service, name, request: (
@@ -156,6 +163,14 @@ def test_vpc_post_delete_requires_bounded_exact_target_readback(
         f.ChaosType.VPC_PEERING_DELETE if peering else f.ChaosType.VPC_ENDPOINT_DELETE
     )
     aws = FakeAWS(reject_writes=False)
+    if not peering:
+        # VPC endpoint deletion is planning only: live admission is refused.
+        with pytest.raises(f.ConfigurationError, match="Live approval is unavailable"):
+            live_experiment(kind, aws)
+        assert not aws.calls
+        # The endpoint read-back helper keeps its bounded exact-target check; it
+        # is exercised on a still-live VPC peering owner.
+        kind = f.ChaosType.VPC_PEERING_DELETE
     item = live_experiment(kind, aws)
     name = "describe_vpc_peering_connections" if peering else "describe_vpc_endpoints"
     key = "VpcPeeringConnections" if peering else "VpcEndpoints"
@@ -176,6 +191,17 @@ def test_vpc_post_delete_requires_bounded_exact_target_readback(
         else original(service, op, request)
     )
     fast_poll(item, monkeypatch)
+    if not peering:
+        # Skip the refused pre-read: the helper is entered after a deletion.
+        states.pop(0)
+        if absent:
+            item._wait_for_vpc_deletion(target, peering=False)
+        else:
+            with pytest.raises(TimeoutError):
+                item._wait_for_vpc_deletion(target, peering=False)
+        assert all(call[1] != "delete_vpc_endpoints" for call in aws.calls)
+        assert sum(call[1] == name for call in aws.calls) >= 2
+        return
     result = (
         item.delete_vpc_peering(target) if peering else item.delete_vpc_endpoint(target)
     )
@@ -604,12 +630,9 @@ def test_stop_during_terminal_read_cannot_complete_forward_wait(method):
     safety = f.SafetyController({}, session, REGION, True)
     safety.check_safety_conditions = lambda: (True, [])
     if method == "vpc":
-        item = live_experiment(
-            f.ChaosType.VPC_ENDPOINT_DELETE
-            if method == "vpc"
-            else f.ChaosType.VPC_PEERING_DELETE,
-            aws,
-        )
+        # VPC endpoint deletion is planning only; its read-back helper is driven
+        # from a still-live VPC peering owner.
+        item = live_experiment(f.ChaosType.VPC_PEERING_DELETE, aws)
         operation = "describe_vpc_endpoints"
         result = {"VpcEndpoints": []}
 

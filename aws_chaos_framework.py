@@ -585,6 +585,13 @@ CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS = frozenset(
         # changed or replaced after approval and the pre-read.
         ChaosType.KINESIS_RETENTION_MODIFY,
         ChaosType.SES_CONFIGURATION_SET_DELETE,
+        # ECR digest deletion also removes every tag alias on the digest, and
+        # VPC endpoint deletion removes the endpoint's network interfaces and
+        # gateway routes. BatchDeleteImage and DeleteVpcEndpoints accept no
+        # condition over that derived set, so aliases or associations added
+        # after approval would be destroyed without review.
+        ChaosType.ECR_IMAGE_DELETE,
+        ChaosType.VPC_ENDPOINT_DELETE,
     }
 )
 # These APIs have no conditional ownership/revision argument. A local lock or
@@ -657,6 +664,10 @@ CONCURRENCY_UNSAFE_MUTATIONS = frozenset(
         # Irreversible name-only writes without a generation, condition or lease.
         "kinesis.decrease_stream_retention_period",
         "ses.delete_configuration_set",
+        # Irreversible deletes whose provider-derived child set (tag aliases,
+        # endpoint interfaces and routes) cannot be conditioned or bound.
+        "ecr.batch_delete_image",
+        "ec2.delete_vpc_endpoints",
         # Writes reachable only from experiment types without a reviewed live
         # implementation; refused here as well as at the execution grant.
         "s3.delete_bucket_encryption",
@@ -13540,8 +13551,6 @@ def confirmation_token(
         ChaosType(item["type"]) for item in suites[suite_name]["experiments"]
     ]
     for item in suites[suite_name]["experiments"]:
-        if item["type"] == ChaosType.ECR_IMAGE_DELETE.value:
-            validate_digest_image_ids(item.get("image_ids"))
         if item["type"] == ChaosType.KMS_GRANT_REVOKE.value:
             validate_kms_key_arn(
                 item.get("key_id"),
@@ -13561,6 +13570,11 @@ def confirmation_token(
         raise ConfigurationError(
             "Live approval is unavailable for experiments without conditional recovery ownership proof"
         )
+    # ECR digest deletion is planning only and is refused above whatever its
+    # selectors are. The digest-only selector check is kept as defence in depth.
+    for item in suites[suite_name]["experiments"]:
+        if item["type"] == ChaosType.ECR_IMAGE_DELETE.value:
+            validate_digest_image_ids(item.get("image_ids"))
     irreversible = any(
         experiment_metadata(item).risk == RiskLevel.IRREVERSIBLE
         for item in experiment_types

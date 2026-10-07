@@ -2,6 +2,27 @@
 
 ## Unreleased security follow-ups
 
+### Planning-only ECR digest deletion and VPC endpoint deletion
+
+- Withdraw live support for `ecr_image_delete` and `vpc_endpoint_delete`. Each
+  irreversible delete also removes a provider-derived child set that the
+  reviewed target does not name: `BatchDeleteImage` by digest removes every tag
+  alias attached to that digest, and `DeleteVpcEndpoints` removes the
+  endpoint's network interfaces and gateway routes across its subnets and route
+  tables. Neither request accepts a condition over that set, so aliases or
+  associations present or added after approval would be destroyed outside the
+  reviewed scope and blast radius. Both types now report
+  `live_supported: false` (`LIVE no`); live tokens (even with every derived
+  child allowlisted), live suites, execution grants, direct live construction
+  and the `ecr.batch_delete_image` and `ec2.delete_vpc_endpoints` SDK requests
+  are refused. No other live type issues either request. Dry-run plans are
+  unchanged. The ECR digest, registry and response checks and the endpoint
+  selected-VPC and read-back checks are retained in the live branches as
+  defence in depth; the ECR digest selector check in `confirmation_token` now
+  runs after the planning-only refusal, so every planning-only suite receives
+  the same refusal. Compatibility: existing live configurations for these two
+  types can still produce plans but can no longer obtain a live token.
+
 ### Planning-only Kinesis retention and SES deletion, terminal log redaction and release-asset admission
 
 - Withdraw live support for `kinesis_retention_modify` and
