@@ -700,6 +700,136 @@ def test_publish_workflow_never_executes_tag_verifier_or_publishes_unbound_bytes
     assert publish[-1]["with"]["packages-dir"] == "verified-payload/packages"
 
 
+HELPER = "python -I trusted-verifier/scripts/release_asset_admission.py"
+
+
+def _publish_steps():
+    workflow = framework.yaml.safe_load(
+        (ROOT / ".github/workflows/publish.yml").read_text("utf-8")
+    )
+    return workflow["jobs"]["verify"]["steps"], workflow["jobs"]["publish"]["steps"]
+
+
+def _helper_commands(run):
+    """Return each release_asset_admission.py invocation as shell words."""
+    return [
+        shlex.split(line)
+        for line in run.replace("\\\n", " ").splitlines()
+        if "release_asset_admission.py" in line
+    ]
+
+
+def test_publish_workflow_never_downloads_or_checks_release_assets_inline():
+    verify, publish = _publish_steps()
+    for step in (*verify, *publish):
+        run = step.get("run", "")
+        # Every public release download is metadata-admitted and size-bounded.
+        assert "gh release download" not in run
+        assert "curl" not in run and "wget" not in run
+        # No downloaded manifest reaches a generic filesystem consumer.
+        assert "sha256sum" not in run and "--check" not in run
+        # No inline (stdin) Python reads downloaded evidence.
+        assert "python -I - " not in run and "<<" not in run
+        # The helper creates each output directory itself and refuses one that
+        # already exists, so neither may be created beforehand.
+        assert "mkdir release-assets" not in run
+        assert "mkdir trusted-release" not in run
+        for words in _helper_commands(run):
+            assert words[:3] == HELPER.split()
+            assert words[3] in {"download", "verify"}
+
+
+def test_publish_verify_job_admits_downloads_and_parses_manifests_with_helper():
+    verify, _publish = _publish_steps()
+    index = next(
+        i
+        for i, step in enumerate(verify)
+        if "release_asset_admission.py" in step.get("run", "")
+    )
+    step = verify[index]
+    assert step["env"] == {"SOURCE_COMMIT": "${{ steps.identity.outputs.commit }}"}
+    assert verify[index - 1].get("id") == "identity"
+    assert _helper_commands(step["run"]) == [
+        [
+            *HELPER.split(),
+            "download",
+            "--repository",
+            "$GH_REPO",
+            "--tag",
+            "$RELEASE_TAG",
+            "--output",
+            "release-assets",
+        ],
+        [
+            *HELPER.split(),
+            "verify",
+            "release-assets",
+            "--tag",
+            "$RELEASE_TAG",
+            "--source-commit",
+            "$SOURCE_COMMIT",
+            "--source",
+            "aws_chaos_framework.py",
+        ],
+    ]
+    run = step["run"]
+    distribution = "python -I trusted-verifier/scripts/verify_distribution.py"
+    assert run.startswith("set -euo pipefail\n")
+    assert (
+        run.index(f"{HELPER} download")
+        < run.index(f"{HELPER} verify")
+        < run.index(distribution)
+    )
+    # Trust order is unchanged: helper admission and parsing, then provenance,
+    # then capture of the payload from the admitted bytes.
+    provenance = next(
+        i
+        for i, step in enumerate(verify)
+        if 'gh attestation verify "$asset"' in step.get("run", "")
+    )
+    capture = next(
+        i
+        for i, step in enumerate(verify)
+        if "publish_payload.py capture release-assets" in step.get("run", "")
+    )
+    assert index < provenance < capture
+    assert all(
+        "release_asset_admission.py" not in step.get("run", "")
+        for step in verify[index + 1 :]
+    )
+
+
+def test_publish_protected_job_admits_evidence_before_attestation():
+    _verify, publish = _publish_steps()
+    commands = [
+        (i, words)
+        for i, step in enumerate(publish)
+        for words in _helper_commands(step.get("run", ""))
+    ]
+    trusted = next(i for i, step in enumerate(publish) if step.get("id") == "trusted")
+    assert commands == [
+        (
+            trusted,
+            [
+                *HELPER.split(),
+                "download",
+                "--repository",
+                "$GH_REPO",
+                "--tag",
+                "$RELEASE_TAG",
+                "--output",
+                "trusted-release",
+                "--only",
+                "release-evidence.json",
+            ],
+        )
+    ]
+    run = publish[trusted]["run"]
+    assert "mkdir trusted-attestations\n" in run
+    assert run.index(f"{HELPER} download") < run.index("gh attestation verify")
+    assert run.index('test "$commit" = "$SOURCE_COMMIT"') < run.index(HELPER)
+
+
 def test_protected_job_accepts_independently_attested_release_subjects(tmp_path):
     release = tmp_path / "release-assets"
     payload = tmp_path / "payload"
@@ -908,7 +1038,16 @@ def test_protected_publish_job_verifies_exact_subjects_before_pypi_action():
     run = steps[trusted]["run"]
     assert "refs/tags/$RELEASE_TAG^{commit}" in run
     assert 'test "$commit" = "$SOURCE_COMMIT"' in run
-    assert 'gh release download "$RELEASE_TAG" --pattern release-evidence.json' in run
+    # The protected job admits the complete release metadata by size and then
+    # streams only the evidence subject, before any attestation handling.
+    admitted = (
+        "python -I trusted-verifier/scripts/release_asset_admission.py download \\\n"
+        '  --repository "$GH_REPO" --tag "$RELEASE_TAG" --output trusted-release \\\n'
+        "  --only release-evidence.json"
+    )
+    assert admitted in run
+    assert run.index(admitted) < run.index("gh attestation verify")
+    assert "gh release download" not in run
     assert (
         'signer="https://github.com/$GH_REPO/.github/workflows/'
         'release-promotion.yml@refs/heads/main"'

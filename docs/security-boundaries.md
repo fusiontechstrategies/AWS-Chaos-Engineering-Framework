@@ -389,9 +389,14 @@ release manifests and the bounded downloader for public release assets. It
 accepts only the six fixed basenames and compares checksum and evidence names
 instead of opening them, opens only regular non-symlink files beneath the asset
 directory, and admits per-file and aggregate sizes from release metadata before
-any download. The publish workflow does not call it yet: until that workflow
-change is approved, the verify job still runs `sha256sum --check` and an inline
-evidence check, and both jobs use `gh release download` without size admission.
+any download. The publish workflow calls it from the trusted workflow commit
+for every release download and manifest check: the verify job downloads the six
+assets into a new directory and runs `verify` (tag, verified source commit and
+tagged standalone source) before distribution checks, provenance and payload
+capture, and the protected job downloads only `release-evidence.json`, after
+admitting the whole release by size, before attestation. No `gh release
+download`, `sha256sum --check` or inline evidence parsing remains in the
+workflow. The helper creates each output directory and refuses an existing one.
 
 ## Destructive-call and transition evidence
 

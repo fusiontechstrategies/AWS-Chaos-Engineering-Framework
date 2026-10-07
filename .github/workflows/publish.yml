@@ -92,36 +92,22 @@ jobs:
           actual="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)"
           test "$expected" = "$actual"
 
+      # Public release assets and their checksum and evidence manifests are
+      # untrusted until provenance is verified. The trusted helper admits the
+      # release metadata by per-file and aggregate size before any download,
+      # streams each asset under a deadline into a new private directory, and
+      # verifies the fixed six subjects without ever opening a manifest name.
       - name: Download and verify public release assets
+        env:
+          SOURCE_COMMIT: ${{ steps.identity.outputs.commit }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir release-assets
-          gh release download "$RELEASE_TAG" --pattern '*' --dir release-assets
-          (cd release-assets && sha256sum --check SHA256SUMS.txt)
+          python -I trusted-verifier/scripts/release_asset_admission.py download \
+            --repository "$GH_REPO" --tag "$RELEASE_TAG" --output release-assets
+          python -I trusted-verifier/scripts/release_asset_admission.py verify release-assets \
+            --tag "$RELEASE_TAG" --source-commit "$SOURCE_COMMIT" --source aws_chaos_framework.py
           python -I trusted-verifier/scripts/verify_distribution.py release-assets --repository-root "$GITHUB_WORKSPACE"
-          python -I - <<'PY'
-          import hashlib
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
-
-          root = Path('release-assets')
-          evidence = json.loads((root / 'release-evidence.json').read_text(encoding='utf-8'))
-          tag = os.environ['RELEASE_TAG']
-          version = tag[1:]
-          assert evidence['tag'] == tag
-          assert evidence['version'] == version
-          assert evidence['source_commit'] == subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-          assert set(evidence['expected_release_assets']) == {p.name for p in root.iterdir()}
-          for artifact in evidence['artifacts']:
-              path = root / artifact['name']
-              assert path.stat().st_size == artifact['bytes']
-              assert hashlib.sha256(path.read_bytes()).hexdigest() == artifact['sha256']
-          source = root / f'AWS-Chaos-Engineering-Framework-v{version}.py'
-          assert source.read_bytes() == Path('aws_chaos_framework.py').read_bytes()
-          PY
 
       - name: Verify GitHub provenance attestations
         shell: bash
@@ -222,8 +208,10 @@ jobs:
           test "$commit" = "$SOURCE_COMMIT"
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = false
           test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease')" = false
-          mkdir trusted-release trusted-attestations
-          gh release download "$RELEASE_TAG" --pattern release-evidence.json --dir trusted-release
+          mkdir trusted-attestations
+          python -I trusted-verifier/scripts/release_asset_admission.py download \
+            --repository "$GH_REPO" --tag "$RELEASE_TAG" --output trusted-release \
+            --only release-evidence.json
           signer="https://github.com/$GH_REPO/.github/workflows/release-promotion.yml@refs/heads/main"
           for subject in trusted-release/release-evidence.json \
             "verified-payload/packages/aws_chaos_engineering_framework-${version}-py3-none-any.whl" \
