@@ -542,8 +542,9 @@ def test_vpc_scope_refuses_types_whose_membership_is_unverified(kind):
 
 
 def test_vpc_scope_leaves_vpc_independent_types_admitted():
-    # S3 lifecycle is now planning only; Kinesis retention is VPC independent.
-    kind = framework.ChaosType.KINESIS_RETENTION_MODIFY
+    # S3 lifecycle and Kinesis retention are now planning only; KMS grant
+    # revocation is a live-supported VPC-independent type.
+    kind = framework.ChaosType.KMS_GRANT_REVOKE
     orchestrator, _aws, values = scoped(kind)
     experiment = orchestrator._create_experiment(kind, copy.deepcopy(values))
     assert experiment._execution_grant.vpc_id == VPC
