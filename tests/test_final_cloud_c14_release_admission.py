@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -24,6 +25,7 @@ import urllib.error
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import publish_payload
 from scripts import release_asset_admission as admission
@@ -767,3 +769,152 @@ def test_growth_after_the_final_read_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(admission.os, "read", grow_at_end)
     with pytest.raises(admission.AdmissionError, match="changed while it was read"):
         admission.read_regular(root, WHEEL, admission.MAX_ARCHIVE_BYTES)
+
+
+# 3. The publish workflow runs these helpers for every release download and
+#    manifest check. The exact commands are read from publish.yml and run
+#    offline against a fake release, in job order, stopping at the first
+#    failure as `set -euo pipefail` does.
+
+WORKFLOW_ENV = {"$GH_REPO": "owner/repo", "$RELEASE_TAG": TAG, "$SOURCE_COMMIT": COMMIT}
+HELPER = ["python", "-I", "trusted-verifier/scripts/release_asset_admission.py"]
+
+
+def workflow_commands(job: str) -> list[list[str]]:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/publish.yml").read_text("utf-8")
+    )
+    commands = []
+    for step in workflow["jobs"][job]["steps"]:
+        for line in step.get("run", "").replace("\\\n", " ").splitlines():
+            if "release_asset_admission.py" in line:
+                words = shlex.split(line)
+                assert words[:3] == HELPER
+                argv = [WORKFLOW_ENV.get(word, word) for word in words[3:]]
+                assert not any(word.startswith("$") for word in argv)
+                commands.append(argv)
+    assert commands
+    return commands
+
+
+def run_workflow(monkeypatch, job: str, transport) -> None:
+    install(monkeypatch, transport)
+    for argv in workflow_commands(job):
+        monkeypatch.setattr(sys, "argv", ["release_asset_admission.py", *argv])
+        admission.main()
+
+
+def workspace(tmp_path: Path, monkeypatch, root: Path) -> tuple[Path, dict]:
+    payload = {name: (root / name).read_bytes() for name in NAMES}
+    work = tmp_path / "workspace"
+    work.mkdir()
+    (work / "aws_chaos_framework.py").write_bytes(payload[SOURCE])
+    monkeypatch.chdir(work)
+    return work, payload
+
+
+def test_workflow_helper_commands_admit_and_verify_a_valid_release(
+    tmp_path, monkeypatch
+):
+    work, payload = workspace(tmp_path, monkeypatch, release(tmp_path / "published"))
+    assert [argv[0] for argv in workflow_commands("verify")] == ["download", "verify"]
+    run_workflow(monkeypatch, "verify", Transport(metadata(payload=payload), payload))
+    assert sorted(p.name for p in (work / "release-assets").iterdir()) == sorted(NAMES)
+    assert workflow_commands("publish") == [
+        [
+            "download",
+            "--repository",
+            "owner/repo",
+            "--tag",
+            TAG,
+            "--output",
+            "trusted-release",
+            "--only",
+            EVIDENCE,
+        ]
+    ]
+    transport = Transport(metadata(payload=payload), payload)
+    run_workflow(monkeypatch, "publish", transport)
+    assert [p.name for p in (work / "trusted-release").iterdir()] == [EVIDENCE]
+    assert (work / "trusted-release" / EVIDENCE).read_bytes() == payload[EVIDENCE]
+    assert sorted(p.name for p in work.iterdir()) == [
+        "aws_chaos_framework.py",
+        "release-assets",
+        "trusted-release",
+    ]
+    # Tagged source that differs from the standalone asset is refused.
+    (work / "aws_chaos_framework.py").write_bytes(b"other source")
+    monkeypatch.setattr(sys, "argv", ["x", *workflow_commands("verify")[1]])
+    with pytest.raises(admission.AdmissionError, match="tagged source"):
+        admission.main()
+
+
+@pytest.mark.parametrize(
+    "manifest,name,reason",
+    [
+        ("checksum", "/proc/self/environ", "absolute"),
+        ("checksum", "C:\\Windows\\win.ini", "absolute"),
+        ("checksum", "../../" + SBOM, "separator"),
+        ("checksum", "..", "traverses"),
+        ("checksum", "unexpected.txt", "Unexpected"),
+        ("evidence", "/etc/passwd", "absolute"),
+        ("evidence", "../" + WHEEL, "separator"),
+        ("evidence", "unexpected.whl", "Unexpected"),
+    ],
+)
+def test_workflow_helper_commands_reject_manifest_names(
+    tmp_path, monkeypatch, manifest, name, reason
+):
+    root = release(tmp_path / "published")
+    if manifest == "checksum":
+        lines = sums_lines(root)
+        lines[3] = lines[3].split("  ", 1)[0] + "  " + name
+        resum(root, lines)
+    else:
+        records = json.loads((root / EVIDENCE).read_text("utf-8"))["artifacts"]
+        records[1]["name"] = name
+        write_evidence(root, artifacts=records)
+    work, payload = workspace(tmp_path, monkeypatch, root)
+    opened = []
+    real_open = admission.os.open
+
+    def record(path, *args, **kwargs):
+        opened.append(os.fspath(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(admission.os, "open", record)
+    with pytest.raises(admission.AdmissionError, match=reason):
+        run_workflow(
+            monkeypatch, "verify", Transport(metadata(payload=payload), payload)
+        )
+    # The downloaded manifest was parsed as data; its name was never opened.
+    assert not any(name in path or Path(path).name == name for path in opened)
+
+
+@pytest.mark.parametrize("job", ["verify", "publish"])
+@pytest.mark.parametrize("violation", ["declared", "unexpected", "streamed"])
+def test_workflow_helper_commands_reject_oversize_and_unexpected_assets(
+    tmp_path, monkeypatch, job, violation
+):
+    work, payload = workspace(tmp_path, monkeypatch, release(tmp_path / "published"))
+    served = dict(payload)
+    release_metadata = metadata(payload=payload)
+    if violation == "declared":
+        release_metadata = metadata(
+            {SDIST: admission.MAX_ARCHIVE_BYTES + 1}, payload=payload
+        )
+        reason = "admission limits"
+    elif violation == "unexpected":
+        extra = dict(release_metadata["assets"][0], id=999, name="install.sh")
+        release_metadata["assets"].append(extra)
+        reason = "asset set"
+    else:
+        served[EVIDENCE] = payload[EVIDENCE] + b" " * 4096
+        reason = "byte limit"
+    transport = Transport(release_metadata, served)
+    with pytest.raises(admission.AdmissionError, match=reason):
+        run_workflow(monkeypatch, job, transport)
+    if violation != "streamed":
+        # Metadata admission failed before any asset was requested.
+        assert len(transport.requests) == 1
+    assert sorted(p.name for p in work.iterdir()) == ["aws_chaos_framework.py"]

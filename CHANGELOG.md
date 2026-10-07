@@ -49,10 +49,21 @@
   into a new private file while hashing it. `publish_payload.py capture` now
   bounds the evidence read before JSON parsing, refuses duplicate evidence
   records, and every package digest is size-bounded.
-- Not yet complete: `.github/workflows/publish.yml` is unchanged pending owner
-  approval. Until it is changed to call the helper, the verify job still runs
-  `sha256sum --check` and its inline evidence check on downloaded assets, and
-  both jobs still use `gh release download` without size admission.
+- Route every public release download and manifest check in
+  `.github/workflows/publish.yml` through the helper (owner-approved workflow
+  change). The verify job replaces `gh release download`,
+  `sha256sum --check` and its inline evidence check with
+  `release_asset_admission.py download` into a new `release-assets` directory
+  and `release_asset_admission.py verify` with the dispatched tag, the
+  verified source commit and the tagged standalone source, before
+  distribution checks, provenance and payload capture. The protected `pypi`
+  job replaces its `gh release download` with
+  `release_asset_admission.py download --only release-evidence.json` into a
+  new `trusted-release` directory, so the complete release metadata is still
+  size-admitted before the evidence is fetched and before attestation. Both
+  helpers run from the trusted workflow commit in Python isolated mode.
+  Triggers, permissions, the environment, job structure, action pins and the
+  provenance, attestation and OIDC checks are unchanged.
 
 ### Canonical AWS endpoint origin and source-bound wheel metadata
 
