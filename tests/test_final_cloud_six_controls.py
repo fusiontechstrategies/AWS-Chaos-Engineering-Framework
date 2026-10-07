@@ -492,8 +492,6 @@ OUT_OF_SCOPE = [
             "original_nacl_id": ORIGINAL_NACL,
         },
     ),
-    (framework.ChaosType.VPC_ENDPOINT_DELETE, {"endpoint_id": OUTSIDE_ENDPOINT}),
-    (framework.ChaosType.VPC_ENDPOINT_DELETE, {"endpoint_id": UNTAGGED_ENDPOINT}),
     (framework.ChaosType.VPC_PEERING_DELETE, PEERING_VALUES),
     (framework.ChaosType.VPC_PEERING_DELETE, SWAPPED_PEERING),
 ]
@@ -629,11 +627,6 @@ def run_handler(kind, experiment):
             nacls_in(VPC, original=UNTAGGED_NACL),
         ),
         (
-            framework.ChaosType.VPC_ENDPOINT_DELETE,
-            "describe_vpc_endpoints",
-            endpoints_in(OTHER_VPC),
-        ),
-        (
             framework.ChaosType.EFS_MOUNT_TARGET_DELETE,
             "describe_mount_targets",
             mount_target(VpcId=OTHER_VPC),
@@ -701,28 +694,21 @@ def test_in_scope_subnet_nacl_replacement_is_admitted():
     assert mutation_calls(aws) == ["replace_network_acl_association"]
 
 
-def test_in_scope_vpc_endpoint_deletion_is_admitted(monkeypatch):
+# VPC endpoint deletion is planning only: DeleteVpcEndpoints also removes the
+# endpoint's network interfaces and gateway routes and accepts no condition over
+# that association set. Under --vpc-id, an in-scope, untagged or outside
+# endpoint is refused before discovery, the handler's pre-read or any write.
+@pytest.mark.parametrize("endpoint", [ENDPOINT, UNTAGGED_ENDPOINT, OUTSIDE_ENDPOINT])
+def test_vpc_scoped_endpoint_deletion_cannot_obtain_live_approval(endpoint):
     kind = framework.ChaosType.VPC_ENDPOINT_DELETE
-    experiment, aws = scoped_experiment(kind)
-    aws.read_overrides[("ec2", "describe_vpc_endpoints")] = [
-        endpoints_in(VPC),
-        endpoints_in(VPC),
-        {"VpcEndpoints": []},
-    ]
-    original = aws.respond
-
-    def respond(service, operation, request):
-        response = original(service, operation, request)
-        if operation == "delete_vpc_endpoints":
-            return {"Unsuccessful": []}
-        return response
-
-    aws.respond = respond
-    fast_poll(experiment, monkeypatch)
-    result = run_handler(kind, experiment)
-    assert result.status == "completed", result.errors
-    assert result.affected_resources == [ENDPOINT]
-    assert mutation_calls(aws) == ["delete_vpc_endpoints"]
+    aws = FakeAWS(reject_writes=False)
+    aws.clients.setdefault("ec2", ModeledEC2(aws, "ec2"))
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_orchestrator(kind, {"endpoint_id": endpoint}, aws, dry_run=False)
+    assert mutation_calls(aws) == []
+    assert all(operation != "describe_vpc_endpoints" for _, operation, _ in aws.calls)
 
 
 def test_efs_mount_target_admitted_only_when_its_subnet_resolves_to_the_vpc():

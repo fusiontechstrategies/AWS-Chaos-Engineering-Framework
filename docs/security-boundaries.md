@@ -69,7 +69,14 @@ aliases are planning only. The grant lookup must return exactly that key ARN and
 grant ID. This follows the [KMS key identity contract](https://docs.aws.amazon.com/kms/latest/APIReference/API_RevokeGrant.html)
 without resolving a movable alias before deletion.
 
-Live ECR image deletion requires unique explicit `imageDigest` values in the
+ECR image deletion is planning only. `BatchDeleteImage` by digest also removes
+every tag alias attached to that digest, including aliases attached after review,
+and the request accepts no condition over the alias set, so no approval can bind
+what is destroyed. No approval combination issues a live token, and live suites,
+execution grants and the `BatchDeleteImage` SDK request are refused. Plans still
+read the reviewed repository and digests. The digest controls below are retained
+as defence in depth and run only on live dispatch, which is refused.
+Live ECR image deletion would require unique explicit `imageDigest` values in the
 reviewed configuration and target allowlist. Tag selectors remain planning only.
 No live handler resolves a tag and then deletes its current occupant. Digest
 deletion removes the image and all its tags, so operators must review that
@@ -265,7 +272,10 @@ Both are planning only: no approval combination issues a live token for them, an
 their plans cannot claim automatic recovery. The S3 lifecycle plan is prefix
 scoped and never whole-bucket. Kinesis retention decreases and SES
 configuration-set deletion are planning only as well, because both writes are
-addressed by a reusable name without a generation, condition or lease. The
+addressed by a reusable name without a generation, condition or lease. ECR
+digest deletion and VPC endpoint deletion are planning only because each delete
+also removes a provider-derived child set (tag aliases, or endpoint network
+interfaces and gateway routes) that no request condition can bind. The
 remaining irreversible live types, such as KMS grant revocation, require both
 irreversible approvals and the LIVE-IRREVERSIBLE confirmation.
 Restoring settings cannot recover backups or objects already deleted. EC2 termination and EBS detach create no implicit
@@ -656,12 +666,12 @@ the configured list. Defaults are `prod` and `production`.
 With `--vpc-id`, the exact target allowlist is necessary but not sufficient.
 Each VPC-addressable live target must also be in the matching discovered
 inventory for that VPC, which includes only resources with the required safety
-tags. Live `ec2_reboot` instances, `vpc_subnet_acl_modify` subnets and
-replacement NACLs, and `vpc_endpoint_delete` endpoints must appear in the
-corresponding discovered instance, subnet, NACL or endpoint set. Before
-mutating, each handler checks the exact describe response: the instance
-`VpcId`, the current subnet NACL association's `VpcId`, or the endpoint
-`VpcId`. The reviewed `original_nacl_id` must also be in the discovered NACL
+tags. Live `ec2_reboot` instances and `vpc_subnet_acl_modify` subnets and
+replacement NACLs must appear in the corresponding discovered instance, subnet
+or NACL set. Before mutating, each handler checks the exact describe response:
+the instance `VpcId` or the current subnet NACL association's `VpcId`.
+`vpc_endpoint_delete` is planning only, so it is refused before discovery; its
+endpoint inventory and `VpcId` checks remain as defence in depth. The reviewed `original_nacl_id` must also be in the discovered NACL
 set and equal the subnet's current NACL, because recovery re-associates the
 subnet with it. An
 `efs_mount_target_delete` target is admitted only when the exact mount-target
@@ -671,7 +681,7 @@ before the deletion, rather than at suite start.
 `vpc_peering_delete` needs both endpoints in the selected VPC. Reviewed
 endpoints must be distinct VPCs, so peering deletion is always refused under
 `--vpc-id`. Other live types that do not address a VPC resource, such as
-CloudFront, WAF, KMS and ECR, are unaffected. All remaining live
+CloudFront, WAF and KMS, are unaffected. All remaining live
 types are refused under `--vpc-id`, including RDS, Lambda, ECS and Directory
 Service, because this tool does not verify their VPC placement and tags. A live
 suite whose configured target contradicts the selected VPC fails with a

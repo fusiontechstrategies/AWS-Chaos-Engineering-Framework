@@ -181,6 +181,7 @@ all refuse the affected operations; a previous grant does not restore support.
 | SQS queue purge | `PurgeQueue` deletes whatever the queue holds when AWS processes the request. It cannot be conditioned on an exact, immutable message set, so no approved blast radius or owner check bounds the messages destroyed. `PurgeQueue` is refused at the SDK proxy. |
 | RDS reboot, cluster failover and backup retention | `RebootDBInstance`, `FailoverDBCluster` and `ModifyDBInstance` with `ApplyImmediately` accept no conditional generation or exclusive lease. A reboot, failover or immediate modification can also activate parameter, option-group or instance changes another principal queues after the plan's reads, and a failover can restart cluster members that are not counted as approved targets. All three requests are refused at the SDK proxy. |
 | Kinesis retention decrease and SES configuration-set deletion | `DecreaseStreamRetentionPeriod` and `DeleteConfigurationSet` address a reusable stream or set name and accept no stable generation, provider-enforced condition or exclusive lease. Another principal can change or replace the named resource after approval and the pre-read, and the irreversible write would then apply to that new state. Both requests are refused at the SDK proxy. |
+| ECR digest deletion and VPC endpoint deletion | `BatchDeleteImage` by digest also removes every tag alias attached to that digest, and `DeleteVpcEndpoints` also removes the endpoint's network interfaces and gateway routes across its subnets and route tables. Neither request accepts a condition over that derived child set, so aliases or associations present or added after approval would be destroyed without review. Both requests are refused at the SDK proxy. |
 
 The SDK operation inventory is evaluated against the pinned Botocore model;
 unconditional retries or additional reads do not supply absent service conditions.
@@ -224,6 +225,14 @@ on the same terms. Their plans still read the named stream or set. The Kinesis
 live suites, execution grants, direct live construction and the
 `DecreaseStreamRetentionPeriod` and `DeleteConfigurationSet` SDK requests are
 refused, and `--list-experiments` reports `LIVE no` for both types.
+ECR digest deletion and VPC endpoint deletion are planning only on the same
+terms. Their plans still read the reviewed repository digests or endpoint. The
+ECR digest, registry and response checks and the endpoint selected-VPC and
+deletion read-back checks run only on live dispatch, which is refused. Live
+tokens (even with every alias, route table, subnet, group and interface in the
+allowlist), live suites, execution grants, direct live construction and the
+`BatchDeleteImage` and `DeleteVpcEndpoints` SDK requests are refused, and
+`--list-experiments` reports `LIVE no` for both types.
 
 ### Exact Lambda identity and terminal recovery state
 

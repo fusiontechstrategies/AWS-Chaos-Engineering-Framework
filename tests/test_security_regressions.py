@@ -1032,24 +1032,35 @@ def test_live_tag_or_unproven_digest_refused_before_reads_and_token(selector):
         framework.confirmation_token(config, "reviewed")
 
 
-def test_reviewed_digest_reaches_ecr_with_account_binding_not_a_tag():
+def test_reviewed_digest_is_planning_only_and_never_reaches_ecr():
+    # ECR digest deletion is planning only: BatchDeleteImage also removes every
+    # tag alias on the digest and accepts no condition over that alias set, so
+    # even an exact reviewed digest cannot obtain live approval.
     aws = FakeAWS(reject_writes=False)
     values = {
         "repository_name": "chaos-test-repository",
         "image_ids": [{"imageDigest": DIGEST}],
     }
-    item = make_experiment(
-        framework.ChaosType.ECR_IMAGE_DELETE, values, aws, dry_run=False
-    )
-    item.safety_controller.config.update(
-        target_allowlist=[values["repository_name"], DIGEST], max_blast_radius=1
-    )
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        make_experiment(
+            framework.ChaosType.ECR_IMAGE_DELETE, values, aws, dry_run=False
+        )
+    assert not aws.calls
+    with pytest.raises(
+        framework.ConfigurationError, match="Live approval is unavailable"
+    ):
+        framework.confirmation_token(
+            config_for({"type": "ecr_image_delete", **values}), "reviewed"
+        )
+    plan_aws = FakeAWS()
+    item = make_experiment(framework.ChaosType.ECR_IMAGE_DELETE, values, plan_aws)
     result = item.delete_images(**values)
     assert result.status == "completed", result.errors
-    request = next(r for _, op, r in aws.calls if op == "batch_delete_image")
-    assert request["imageIds"] == [{"imageDigest": DIGEST}]
-    assert request["registryId"] == ACCOUNT_ID
     assert result.affected_resources == [values["repository_name"] + "/" + DIGEST]
+    assert all(op != "batch_delete_image" for _, op, _ in plan_aws.calls)
+    assert not item.mutation_attempts
 
 
 def test_tags_remain_planning_only_without_changing_delete_semantics():
@@ -1182,82 +1193,34 @@ def native_target_experiment(kind, values):
     )
 
 
-@pytest.mark.parametrize(
-    "attack",
-    [
-        "valid",
-        "registry",
-        "repository",
-        "digest",
-        "missing",
-        "extra",
-        "response_missing",
-        "response_foreign",
-        "many_tags",
-    ],
-)
-def test_native_ecr_digest_provenance_and_response_proof(attack):
+def test_native_ecr_digest_deletion_cannot_obtain_live_approval():
+    """Planning only: no provenance or response attack can reach the provider.
+
+    BatchDeleteImage removes the digest and every tag alias attached to it, and
+    no request condition binds that alias set, so a native live experiment is
+    refused before any DescribeImages or BatchDeleteImage request.
+    """
     from botocore.stub import Stubber
 
     values = {
         "repository_name": "reviewed-repo",
         "image_ids": [{"imageDigest": DIGEST}],
     }
-    item = native_target_experiment(framework.ChaosType.ECR_IMAGE_DELETE, values)
-    request = {
-        "registryId": ACCOUNT_ID,
-        "repositoryName": values["repository_name"],
-        "imageIds": values["image_ids"],
-    }
-    detail = {
-        "registryId": ACCOUNT_ID,
-        "repositoryName": values["repository_name"],
-        "imageDigest": DIGEST,
-    }
-    details = [detail]
-    if attack == "registry":
-        detail["registryId"] = "999900001111"
-    elif attack == "repository":
-        detail["repositoryName"] = "other-repo"
-    elif attack == "digest":
-        detail["imageDigest"] = "sha256:" + "2" * 64
-    elif attack == "missing":
-        details = []
-    elif attack == "extra":
-        details.append({**detail, "imageDigest": "sha256:" + "2" * 64})
-    good_read = attack in {"valid", "response_missing", "response_foreign", "many_tags"}
-    with Stubber(item.ecr._client) as stub:
-        stub.add_response("describe_images", {"imageDetails": details}, request)
-        if good_read:
-            deleted = [{"imageDigest": DIGEST}]
-            if attack == "response_missing":
-                deleted = []
-            elif attack == "response_foreign":
-                deleted = [{"imageDigest": "sha256:" + "2" * 64}]
-            elif attack == "many_tags":
-                deleted = [
-                    {"imageDigest": DIGEST, "imageTag": "one"},
-                    {"imageDigest": DIGEST, "imageTag": "two"},
-                ]
-            stub.add_response(
-                "batch_delete_image",
-                (
-                    {"failures": []}
-                    if attack == "response_missing"
-                    else {"imageIds": deleted, "failures": []}
-                ),
-                request,
+    raw = framework.boto3.Session(
+        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    ).client("ecr", region_name=REGION)
+    with Stubber(raw) as stub:
+        # No response is queued: any native request would fail the stub.
+        with pytest.raises(
+            framework.ConfigurationError, match="Live approval is unavailable"
+        ):
+            make_experiment(
+                framework.ChaosType.ECR_IMAGE_DELETE,
+                values,
+                SimpleNamespace(client=lambda service: raw),
+                dry_run=False,
             )
-        result = item.delete_images(**values)
         stub.assert_no_pending_responses()
-
-    assert result.status == (
-        "completed" if attack in {"valid", "many_tags"} else "failed"
-    ), result.errors
-    assert bool(item.mutation_attempts) == good_read
-    assert (
-        bool(item.mutation_operations) == good_read
-    )  # Bad responses cannot erase the mutation.
 
 
 @pytest.mark.parametrize(
@@ -1597,6 +1560,22 @@ def test_native_raw_protected_requests_have_no_handler_authority(
         ACCOUNT_ID,
     )
     safety.check_safety_conditions = lambda: (True, [])
+    if kind in framework.CONCURRENCY_UNSAFE_LIVE_EXPERIMENTS:
+        # ECR digest deletion is planning only, so no live owner exists. Its raw
+        # request inside an admitted dispatch is refused in
+        # test_final_cloud_c16_planning_only.py.
+        with Stubber(raw) as stub:
+            with pytest.raises(
+                framework.ConfigurationError, match="Live approval is unavailable"
+            ):
+                make_experiment(
+                    kind,
+                    {**values, "region": region},
+                    SimpleNamespace(client=lambda service: raw),
+                    dry_run=False,
+                )
+            stub.assert_no_pending_responses()
+        return
     owner = make_experiment(
         kind,
         {**values, "region": region},
