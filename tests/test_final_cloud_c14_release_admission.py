@@ -181,21 +181,29 @@ def test_evidence_names_are_only_compared_never_opened(tmp_path, name, monkeypat
     evidence["artifacts"][1]["name"] = name
     (root / EVIDENCE).write_text(json.dumps(evidence), "utf-8")
     opened = []
-    real_open = os.open
-    monkeypatch.setattr(
-        admission.os,
-        "open",
-        lambda path, *args, **kwargs: (
-            opened.append(Path(path)) or real_open(path, *args, **kwargs)
-        ),
-    )
+
+    class HelperOs:
+        # Record only the helper's own opens: patching the shared os module
+        # would also capture unrelated opens made elsewhere in the process.
+        def __getattr__(self, attribute):
+            return getattr(os, attribute)
+
+        def open(self, path, *args, **kwargs):
+            opened.append(Path(path))
+            return os.open(path, *args, **kwargs)
+
+    monkeypatch.setattr(admission, "os", HelperOs())
     with pytest.raises(admission.AdmissionError):
         admission.verify_assets(root, TAG, COMMIT)
     # Only the asset directory and its fixed children were ever opened.
-    assert all(
-        path == root or (path.name in NAMES and path.parent in {root, Path(".")})
+    unexpected = [
+        path
         for path in opened
-    )
+        if not (
+            path == root or (path.name in NAMES and path.parent in {root, Path(".")})
+        )
+    ]
+    assert not unexpected, unexpected
 
 
 @pytest.mark.parametrize(
