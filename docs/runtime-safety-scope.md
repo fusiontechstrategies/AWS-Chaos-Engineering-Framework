@@ -102,9 +102,12 @@ choice. A profile that sets `endpoint_url` therefore still talks to canonical
 AWS, and a customer endpoint-rules override (`AWS_DATA_PATH` or
 `~/.aws/models`) that redirects a service makes that service's calls fail
 closed. Account-ID-based endpoints are disabled, so account-bearing role or
-SSO credentials keep Kinesis and other services on their regional hosts. Live
-runs also refuse a non-default IMDS endpoint or a container credential URL
-outside the documented link-local and loopback addresses. See
+SSO credentials keep Kinesis and other services on their regional hosts. Plan
+and live runs, framework client creation (including direct `SafetyController`
+and planning-experiment construction) and `pin_session_credentials` also
+refuse a non-default IMDS endpoint or a container credential URL outside the
+documented link-local and loopback addresses, before any provider or SDK
+request. See
 [Canonical AWS endpoint origin](security-boundaries.md#canonical-aws-endpoint-origin).
 Controller-only clients without an experiment owner support safety and identity
 reads; they refuse all mutations and account-bound S3 bucket reads. They cannot
@@ -257,7 +260,23 @@ stop interrupts the settle wait, the update's own revision remains the only
 owner. A recovery write requires the current revision to equal the owned one. A
 later revision is refused even when it carries the identical chaos value, and an
 ambiguous forward with no owned revision cannot write. Recovery that needs no write only reads back the original
-values. Live WAF and Lambda recovery is single use: the first `run_rollback`
+values, and only when every forward update either returned a new revision or
+was explicitly recorded by the client proxy as never dispatched. An update
+whose SDK invocation began without a returned response, or whose response
+carried no new `RevisionId`, may have been accepted and can become visible
+after a read of the original values, so its recovery is never verified: it
+fails, the process-wide live block is set and manual reconciliation is
+required. When the update returned revision R, a no-write recovery claim also
+requires the recovery read to report R itself with an explicit
+`LastUpdateStatus` of `Successful`. A stale or other-generation read of
+original values, or a read whose status is missing or unknown, fails recovery
+the same way. The configuration waiter likewise accepts only an explicit
+`Successful` status. A restoration write is sent only after a read of R with an
+explicit `Successful` status. Its response must issue a new revision R2, and
+recovery is verified only from one read that carries R2, an explicit
+`Successful` status and the restored values together. A read still showing R
+is waited out. Any other revision, a missing or unknown status, a timeout or
+mismatched values fail recovery with the process-wide live block. Live WAF and Lambda recovery is single use: the first `run_rollback`
 consumes it under the lifecycle lock. Verified or failed, that attempt clears
 owned markers and revokes the execution grant, so a later call cannot mint
 another write. Failed recovery requires operator reconciliation.

@@ -2,6 +2,78 @@
 
 ## Unreleased security follow-ups
 
+### Lambda lost-response recovery and credential-transport admission
+
+- Lambda configuration recovery no longer treats one read of the original
+  values as proof that an ambiguous forward update was never accepted.
+  `UpdateFunctionConfiguration` is asynchronous: AWS can accept a request whose
+  response is lost, and a later read can still show the prior generation. The
+  client proxy now records when an SDK invocation begins separately from a
+  returned response, and records explicit evidence when an emergency stop
+  refuses an admitted attempt before invocation. For `lambda_error_injection`,
+  `lambda_timeout_modify`, `lambda_memory_limit` and
+  `lambda_environment_corrupt`, recovery fails before any recovery read or
+  write, sets the process-wide live block and requires manual reconciliation
+  when an update was dispatched without a response, when an attempt has neither
+  a response nor explicit non-dispatch evidence, or when a response carried no
+  new `RevisionId`. When the response issued a new revision R, recovery that
+  needs no write is verified only when the recovery read reports RevisionId R
+  with an explicit `LastUpdateStatus` of `Successful`. A read under any other
+  revision, or with a missing, unknown or non-successful status, fails recovery
+  with the same block. An attempt the proxy recorded as never dispatched may
+  verify recovery without a write and without that revision binding.
+- The Lambda configuration waiter, used to settle the forward update and the
+  recovery write, now treats only an explicit `LastUpdateStatus` of
+  `Successful` as success, `Failed` as failure and `InProgress` as pending.
+  A missing or unknown status fails closed. While settling the forward update
+  this fails the experiment, and recovery is still bound to the revision R that
+  the update returned. While settling a recovery write it fails recovery and
+  sets the process-wide live block.
+- A restoration write is sent only when the recovery read reports the owned
+  revision R with an explicit `Successful` status (an `InProgress` read is
+  waited out first). Otherwise recovery fails before the write and sets the
+  process-wide live block. The restoration's own response must issue a new
+  `RevisionId` R2. Verification then uses the single waiter read that reports
+  R2 with an explicit `Successful` status, and compares the restored values
+  from that same read. A read still showing R is treated as not yet settled
+  and waited out; any other revision is refused. A restoration response without
+  a new revision, another revision, a missing or unknown status, `Failed`, a
+  timeout or mismatched values fail recovery and set the process-wide live
+  block. The separate, unchecked verification read that previously followed
+  the waiter is gone.
+- Response-bound ownership, the settled readback of the returned revision,
+  `InProgress` waits and later-revision refusals are unchanged. Compatibility:
+  a Lambda forward update that fails inside the SDK call (for example a
+  timeout), or whose response lacks a new revision, now always reports failed
+  recovery, even when the function still shows its original values. So does a
+  no-write recovery whose read is not revision R with an explicit `Successful`
+  status, a restoration attempted from a read of R that is not explicitly
+  `Successful`, and a restoration that is not read back at its own response
+  revision with an explicit `Successful` status and the restored values.
+- The IMDS and container credential address policy
+  (`require_credential_transport_policy`) is no longer live-only. It now runs
+  at three points:
+  - in `ChaosOrchestrator` construction, in plan and live mode alike,
+    immediately after the session is origin-hardened and before role
+    assumption, credential pinning, client creation or `GetCallerIdentity`;
+  - in `origin_bound_client` before every framework SDK client is created,
+    which covers `SafetyController.client` and therefore direct construction of
+    a `SafetyController` or of a planning experiment with a caller-supplied
+    session;
+  - in `pin_session_credentials` before it resolves credentials.
+  At each of these points, a non-default `AWS_EC2_METADATA_SERVICE_ENDPOINT`
+  (or profile `ec2_metadata_service_endpoint`) and a container credential URL
+  outside `169.254.170.2`, `169.254.170.23`, `fd00:ec2::23` or loopback are
+  refused before any provider or SDK request, so a configured container
+  authorization token is not sent to such a host through these paths. The
+  policy reads the environment and the session's configuration when each check
+  runs. Credentials that a caller resolves directly from its own session,
+  outside these framework entry points, are outside this boundary. The refusal
+  messages now begin "Credential resolution refuses". Compatibility: plan runs
+  and direct library planning with such a provider endpoint now fail instead of
+  continuing (orchestrator plan runs previously continued with an identity
+  warning).
+
 ### Planning-only ECR digest deletion and VPC endpoint deletion
 
 - Withdraw live support for `ecr_image_delete` and `vpc_endpoint_delete`. Each

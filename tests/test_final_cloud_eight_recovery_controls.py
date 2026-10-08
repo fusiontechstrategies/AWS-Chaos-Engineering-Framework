@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import itertools
 import logging
 
 import pytest
@@ -383,6 +384,10 @@ def test_lambda_settled_issued_revision_owns_one_verified_recovery(kind):
     )
     assert result.status == "completed", result.errors
     assert item.lambda_confirmed_revision == "rev-forward"
+    # The restoration's own response issues the restored generation.
+    aws.write_responses[("lambda", "update_function_configuration")] = [
+        {"RevisionId": "rev-restored"}
+    ]
     item.run_rollback()
     assert item.rollback_verified and not item.rollback_errors
     requests = writes(aws, "update_function_configuration")
@@ -417,25 +422,573 @@ def test_lambda_issued_revision_without_requested_values_is_not_confirmed():
     assert len(writes(aws, "update_function_configuration")) == 1
 
 
-def test_lambda_unlanded_environment_forward_verifies_original_without_a_write():
-    aws = FakeAWS(reject_writes=False)
+def lambda_lost_response_case(kind, aws):
+    """AWS accepts the update, the response is lost and the first read is stale.
+
+    The forward pre-read and the first recovery read both show the original
+    generation; the accepted generation only becomes visible on a later read.
+    """
+    original = copy.deepcopy(
+        FakeAWS().respond("lambda", "get_function_configuration", {})
+    )
+    _, fields = LAMBDA_HANDLERS[kind]
+    accepted = {**original, **copy.deepcopy(fields), "RevisionId": "rev-accepted"}
+    aws.read_overrides[("lambda", "get_function_configuration")] = [
+        original,
+        copy.deepcopy(original),
+        accepted,
+    ]
     respond = aws.respond
 
-    def lost(service, operation, request):
+    def accepted_then_timeout(service, operation, request):
         if operation == "update_function_configuration":
             aws.calls.append((service, operation, request))
-            raise TimeoutError("synthetic failure before the write landed")
+            raise TimeoutError("synthetic lost response after AWS accepted the write")
         return respond(service, operation, request)
 
-    aws.respond = lost
-    kind = framework.ChaosType.LAMBDA_ENVIRONMENT_CORRUPT
+    aws.respond = accepted_then_timeout
+    return lambda_handler_item(kind, aws)
+
+
+def lambda_handler_item(kind, aws):
+    method, _ = LAMBDA_HANDLERS[kind]
     values = action_configs()[kind]
+    arguments = {
+        name: values[name]
+        for name, _, _ in framework.AUTHORIZED_HANDLER_CALLS[kind][1]
+        if name in values
+    }
     item = make_experiment(kind, values, aws, dry_run=False)
-    assert item.corrupt_environment(**values).status == "failed"
+    return item, method, arguments
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_accepted_update_with_lost_response_never_verifies_a_stale_read(kind):
+    aws = FakeAWS(reject_writes=False)
+    item, method, arguments = lambda_lost_response_case(kind, aws)
+    result = getattr(item, method)(**arguments)
+    assert result.status == "failed"
     assert item.lambda_confirmed_revision is None
-    # Unowned state already equals the original: no recovery write is minted.
+    assert item.mutation_attempts == ["lambda.update_function_configuration"]
+    assert item.mutation_dispatches == ["lambda.update_function_configuration"]
+    assert not item.mutation_operations and not item.mutation_undispatched
+    assert not framework._LIVE_RECOVERY_BLOCKED.is_set()
+    # The original-looking first read is no proof the accepted update never lands.
+    with pytest.raises(
+        framework.SafetyViolation, match="dispatched without a response"
+    ):
+        item.run_rollback()
+    assert not item.rollback_verified and not item.rollback_attempts
+    assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert len(writes(aws, "update_function_configuration")) == 1
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+def test_orchestrated_lambda_lost_response_sets_the_process_wide_live_block():
+    aws = FakeAWS(reject_writes=False)
+    lambda_lost_response_case(MEMORY, aws)
+    values = {"function_name": FUNCTION, "memory_mb": 128}
+    orchestrator = make_orchestrator(MEMORY, values, aws, dry_run=False)
+    result = orchestrator._run_single_experiment({"type": MEMORY.value, **values})
+    assert result.rollback_successful is False and result.status == "failed"
+    assert any("dispatched without a response" in e for e in result.rollback_errors)
+    assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert len(writes(aws, "update_function_configuration")) == 1
+
+
+def stopped_before_invocation(kind, aws):
+    """An emergency stop recorded during admission refuses the SDK invocation."""
+    original = copy.deepcopy(
+        FakeAWS().respond("lambda", "get_function_configuration", {})
+    )
+    aws.read_overrides[("lambda", "get_function_configuration")] = [
+        original,
+        copy.deepcopy(original),
+    ]
+    item, method, arguments = lambda_handler_item(kind, aws)
+    record = item._record_mutation_attempt
+
+    def stop_during_admission(operation):
+        record(operation)
+        item.safety_controller.emergency_stop_all()
+
+    item._record_mutation_attempt = stop_during_admission
+    result = getattr(item, method)(**arguments)
+    assert result.status == "failed"
+    assert any("admitted SDK dispatch" in error for error in result.errors)
+    assert not writes(aws, "update_function_configuration")
+    assert item.mutation_attempts == ["lambda.update_function_configuration"]
+    assert not item.mutation_dispatches and not item.mutation_operations
+    return item
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_proven_undispatched_forward_verifies_original_without_a_write(kind):
+    aws = FakeAWS(reject_writes=False)
+    item = stopped_before_invocation(kind, aws)
+    assert item.mutation_undispatched == ["lambda.update_function_configuration"]
+    # Unowned state equals the original and the proxy proved non-dispatch.
     item.run_rollback()
     assert item.rollback_verified and not item.rollback_attempts
+    assert not framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert not writes(aws, "update_function_configuration")
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_undispatched_claim_requires_explicit_proxy_evidence(kind):
+    aws = FakeAWS(reject_writes=False)
+    item = stopped_before_invocation(kind, aws)
+    # The same pre-invocation failure without the proxy's evidence is ambiguous.
+    item.mutation_undispatched.clear()
+    with pytest.raises(framework.SafetyViolation, match="no evidence that it was"):
+        item.run_rollback()
+    assert not item.rollback_verified and not item.rollback_attempts
+    assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert not writes(aws, "update_function_configuration")
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+def lambda_original():
+    return copy.deepcopy(FakeAWS().respond("lambda", "get_function_configuration", {}))
+
+
+def lambda_item_with_values(kind, aws, values):
+    method, _ = LAMBDA_HANDLERS[kind]
+    arguments = {
+        name: values[name]
+        for name, _, _ in framework.AUTHORIZED_HANDLER_CALLS[kind][1]
+        if name in values
+    }
+    return make_experiment(kind, values, aws, dry_run=False), method, arguments
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+@pytest.mark.parametrize(
+    "response",
+    [{}, {"RevisionId": ""}, {"RevisionId": ORIGINAL_REVISION}, None],
+    ids=["absent", "empty", "prior", "no-body"],
+)
+def test_lambda_response_without_new_revision_never_verifies_an_original_read(
+    kind, response
+):
+    aws = FakeAWS(reject_writes=False)
+    original = lambda_original()
+    aws.read_overrides[("lambda", "get_function_configuration")] = [
+        original,
+        copy.deepcopy(original),
+    ]
+    aws.write_responses[("lambda", "update_function_configuration")] = [response]
+    item, method, arguments = lambda_item_with_values(kind, aws, action_configs()[kind])
+    result = getattr(item, method)(**arguments)
+    assert result.status == "failed"
+    assert item.mutation_operations == ["lambda.update_function_configuration"]
+    assert item.lambda_issued_revision is None
+    assert not framework._LIVE_RECOVERY_BLOCKED.is_set()
+    # The function reads as original, yet the answered update may still land.
+    with pytest.raises(
+        framework.SafetyViolation,
+        match=r"returned no new RevisionId\); recovery is unverified",
+    ):
+        item.run_rollback()
+    assert not item.rollback_verified and not item.rollback_attempts
+    assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert len(writes(aws, "update_function_configuration")) == 1
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+def stop_interrupts_settle_wait(kind, aws, values, original, recovery_read):
+    """The update returns rev-forward; a stop then interrupts its settle wait."""
+    aws.read_overrides[("lambda", "get_function_configuration")] = [
+        original,
+        recovery_read,
+    ]
+    aws.write_responses[("lambda", "update_function_configuration")] = [
+        {"RevisionId": "rev-forward"}
+    ]
+    item, method, arguments = lambda_item_with_values(kind, aws, values)
+    respond = aws.respond
+
+    def stop_during_write(service, operation, request):
+        if operation == "update_function_configuration":
+            item.safety_controller.emergency_stop_all()
+        return respond(service, operation, request)
+
+    aws.respond = stop_during_write
+    result = getattr(item, method)(**arguments)
+    assert result.status == "failed"
+    assert item.lambda_issued_revision == "rev-forward"
+    assert item.lambda_confirmed_revision == "rev-forward"
+    assert len(writes(aws, "update_function_configuration")) == 1
+    return item
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"RevisionId": ORIGINAL_REVISION},
+        {"RevisionId": "rev-later"},
+        {"RevisionId": "rev-forward", "LastUpdateStatus": "Pending"},
+    ],
+    ids=["stale-prior", "other-generation", "nonterminal-issued"],
+)
+def test_lambda_original_read_not_bound_to_terminal_issued_revision_is_refused(
+    kind, state
+):
+    aws = FakeAWS(reject_writes=False)
+    original = lambda_original()
+    item = stop_interrupts_settle_wait(
+        kind, aws, action_configs()[kind], original, {**original, **state}
+    )
+    assert not framework._LIVE_RECOVERY_BLOCKED.is_set()
+    with pytest.raises(
+        framework.SafetyViolation, match="not the terminal generation issued"
+    ):
+        item.run_rollback()
+    assert not item.rollback_verified and not item.rollback_attempts
+    assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert len(writes(aws, "update_function_configuration")) == 1
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+def without_status(response):
+    """The same configuration read with no LastUpdateStatus member."""
+    response = copy.deepcopy(response)
+    del response["LastUpdateStatus"]
+    return response
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_no_write_read_of_issued_revision_without_status_is_refused(kind):
+    aws = FakeAWS(reject_writes=False)
+    original = lambda_original()
+    # Revision R with original values, but no evidence the update is terminal.
+    read = without_status({**original, "RevisionId": "rev-forward"})
+    item = stop_interrupts_settle_wait(
+        kind, aws, action_configs()[kind], original, read
+    )
+    with pytest.raises(
+        framework.SafetyViolation, match="not the terminal generation issued"
+    ):
+        item.run_rollback()
+    assert not item.rollback_verified and not item.rollback_attempts
+    assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert len(writes(aws, "update_function_configuration")) == 1
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+def lambda_owned_and_restored(kind):
+    original = lambda_original()
+    _, fields = LAMBDA_HANDLERS[kind]
+    owned = {**original, **copy.deepcopy(fields), "RevisionId": "rev-forward"}
+    restored = {**original, "RevisionId": "rev-restored"}
+    return original, owned, restored
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_recovery_waiter_refuses_a_read_without_status(kind):
+    aws = FakeAWS(reject_writes=False)
+    original, owned, restored = lambda_owned_and_restored(kind)
+    aws.read_overrides[("lambda", "get_function_configuration")] = [
+        original,
+        owned,
+        copy.deepcopy(owned),
+        without_status(restored),
+    ]
+    aws.write_responses[("lambda", "update_function_configuration")] = [
+        {"RevisionId": "rev-forward"},
+        {"RevisionId": "rev-restored"},
+    ]
+    item, method, arguments = lambda_item_with_values(kind, aws, action_configs()[kind])
+    assert getattr(item, method)(**arguments).status == "completed"
+    assert not framework._LIVE_RECOVERY_BLOCKED.is_set()
+    # The restoration write was sent, but its terminal state is not proven.
+    with pytest.raises(framework.SafetyViolation, match="status is missing or unknown"):
+        item.run_rollback()
+    assert not item.rollback_verified
+    assert item.rollback_attempts == ["lambda.update_function_configuration"]
+    assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert len(writes(aws, "update_function_configuration")) == 2
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_forward_waiter_never_confirms_a_read_without_status(kind):
+    aws = FakeAWS(reject_writes=False)
+    original, owned, restored = lambda_owned_and_restored(kind)
+    aws.read_overrides[("lambda", "get_function_configuration")] = [
+        original,
+        without_status(owned),
+        copy.deepcopy(owned),
+        restored,
+        copy.deepcopy(restored),
+    ]
+    aws.write_responses[("lambda", "update_function_configuration")] = [
+        {"RevisionId": "rev-forward"},
+        {"RevisionId": "rev-restored"},
+    ]
+    item, method, arguments = lambda_item_with_values(kind, aws, action_configs()[kind])
+    result = getattr(item, method)(**arguments)
+    assert result.status == "failed"
+    assert any("status is missing or unknown" in error for error in result.errors)
+    # The update's own response revision still owns the recovery that follows.
+    assert item.lambda_confirmed_revision == "rev-forward"
+    item.run_rollback()
+    assert item.rollback_verified
+    assert item.rollback_attempts == ["lambda.update_function_configuration"]
+    assert len(writes(aws, "update_function_configuration")) == 2
+
+
+def completed_forward_then(kind, aws, recovery_reads, restore_response):
+    """A confirmed forward update R, then scripted recovery reads and restore response."""
+    original, owned, restored = lambda_owned_and_restored(kind)
+    aws.read_overrides[("lambda", "get_function_configuration")] = [
+        original,
+        owned,
+        *recovery_reads(owned, restored),
+    ]
+    aws.write_responses[("lambda", "update_function_configuration")] = [
+        {"RevisionId": "rev-forward"},
+        restore_response,
+    ]
+    item, method, arguments = lambda_item_with_values(kind, aws, action_configs()[kind])
+    assert getattr(item, method)(**arguments).status == "completed"
+    assert item.lambda_confirmed_revision == "rev-forward"
+    return item
+
+
+def scripted_clock(monkeypatch):
+    """Ordinary simulated time: each reading advances 100 seconds; sleeps return."""
+    ticks = itertools.count(0, 100)
+    monkeypatch.setattr(framework.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(framework.time, "sleep", lambda seconds: None)
+
+
+def assert_restore_unverified(item, aws):
+    assert not item.rollback_verified
+    assert item.rollback_attempts == ["lambda.update_function_configuration"]
+    assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert len(writes(aws, "update_function_configuration")) == 2
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_stale_successful_read_then_restored_values_without_status_refuse(
+    kind, monkeypatch
+):
+    scripted_clock(monkeypatch)
+    aws = FakeAWS(reject_writes=False)
+    item = completed_forward_then(
+        kind,
+        aws,
+        lambda owned, restored: [
+            copy.deepcopy(owned),
+            # The waiter first sees the earlier generation, still Successful.
+            copy.deepcopy(owned),
+            without_status(restored),
+        ],
+        {"RevisionId": "rev-restored"},
+    )
+    with pytest.raises(framework.SafetyViolation, match="status is missing or unknown"):
+        item.run_rollback()
+    assert_restore_unverified(item, aws)
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_stale_successful_read_then_in_progress_restoration_refuses(
+    kind, monkeypatch
+):
+    scripted_clock(monkeypatch)
+    aws = FakeAWS(reject_writes=False)
+    item = completed_forward_then(
+        kind,
+        aws,
+        lambda owned, restored: [
+            copy.deepcopy(owned),
+            copy.deepcopy(owned),
+            *[{**restored, "LastUpdateStatus": "InProgress"} for _ in range(4)],
+        ],
+        {"RevisionId": "rev-restored"},
+    )
+    # The restored values never settle at R2 before the deadline.
+    with pytest.raises(TimeoutError, match="Timed out waiting for Lambda"):
+        item.run_rollback()
+    assert_restore_unverified(item, aws)
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+@pytest.mark.parametrize(
+    "response",
+    [{}, {"RevisionId": ""}, {"RevisionId": "rev-forward"}, None],
+    ids=["absent", "empty", "prior", "no-body"],
+)
+def test_lambda_restore_response_without_new_revision_refuses(kind, response):
+    aws = FakeAWS(reject_writes=False)
+    item = completed_forward_then(
+        kind,
+        aws,
+        lambda owned, restored: [copy.deepcopy(owned), restored, restored],
+        response,
+    )
+    with pytest.raises(
+        framework.SafetyViolation, match="recovery update returned no new RevisionId"
+    ):
+        item.run_rollback()
+    assert_restore_unverified(item, aws)
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+@pytest.mark.parametrize(
+    "states",
+    [
+        [None],
+        ["Pending"],
+        ["InProgress", "Successful", "InProgress"],
+    ],
+    ids=["missing", "unknown", "in-progress-after-wait"],
+)
+def test_lambda_restoration_requires_explicit_successful_owned_revision(kind, states):
+    aws = FakeAWS(reject_writes=False)
+    original, owned, _ = lambda_owned_and_restored(kind)
+    reads = []
+    for state in states:
+        read = copy.deepcopy(owned)
+        if state is None:
+            del read["LastUpdateStatus"]
+        else:
+            read["LastUpdateStatus"] = state
+        reads.append(read)
+    # Forward settlement is interrupted, so R was never read back as terminal.
+    item = stop_interrupts_settle_wait(
+        kind, aws, action_configs()[kind], original, reads[0]
+    )
+    aws.read_overrides[("lambda", "get_function_configuration")].extend(reads[1:])
+    with pytest.raises(framework.SafetyViolation, match="explicit Successful state"):
+        item.run_rollback()
+    assert not item.rollback_verified and not item.rollback_attempts
+    assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert len(writes(aws, "update_function_configuration")) == 1
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_pre_restoration_wait_refuses_a_read_without_status(kind):
+    aws = FakeAWS(reject_writes=False)
+    original, owned, _ = lambda_owned_and_restored(kind)
+    pending = {**owned, "LastUpdateStatus": "InProgress"}
+    # Forward settlement is interrupted; recovery then waits on R itself.
+    item = stop_interrupts_settle_wait(
+        kind, aws, action_configs()[kind], original, pending
+    )
+    aws.read_overrides[("lambda", "get_function_configuration")].append(
+        without_status(owned)
+    )
+    with pytest.raises(framework.SafetyViolation, match="status is missing or unknown"):
+        item.run_rollback()
+    assert not item.rollback_verified and not item.rollback_attempts
+    assert framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert len(writes(aws, "update_function_configuration")) == 1
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_restoration_wait_refuses_another_revision(kind, monkeypatch):
+    scripted_clock(monkeypatch)
+    aws = FakeAWS(reject_writes=False)
+    item = completed_forward_then(
+        kind,
+        aws,
+        lambda owned, restored: [
+            copy.deepcopy(owned),
+            {**restored, "RevisionId": "rev-other"},
+            restored,
+        ],
+        {"RevisionId": "rev-restored"},
+    )
+    with pytest.raises(
+        framework.SafetyViolation, match="differs from the expected update"
+    ):
+        item.run_rollback()
+    assert_restore_unverified(item, aws)
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_restoration_values_come_from_the_settled_revision_read(kind):
+    aws = FakeAWS(reject_writes=False)
+    item = completed_forward_then(
+        kind,
+        aws,
+        lambda owned, restored: [
+            copy.deepcopy(owned),
+            # R2 settles Successful but does not carry the restored values;
+            # a later read that does is not the settling observation.
+            {**owned, "RevisionId": "rev-restored"},
+            restored,
+        ],
+        {"RevisionId": "rev-restored"},
+    )
+    with pytest.raises(framework.SafetyViolation, match="recovery is not verified"):
+        item.run_rollback()
+    assert_restore_unverified(item, aws)
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_restoration_settled_at_its_own_revision_verifies(kind, monkeypatch):
+    scripted_clock(monkeypatch)
+    aws = FakeAWS(reject_writes=False)
+    item = completed_forward_then(
+        kind,
+        aws,
+        lambda owned, restored: [
+            copy.deepcopy(owned),
+            # A stale Successful R is waited out; only R2 itself settles it.
+            copy.deepcopy(owned),
+            {**restored, "LastUpdateStatus": "InProgress"},
+            restored,
+        ],
+        {"RevisionId": "rev-restored"},
+    )
+    item.run_rollback()
+    assert item.rollback_verified and not item.rollback_errors
+    assert item.rollback_attempts == ["lambda.update_function_configuration"]
+    assert not framework._LIVE_RECOVERY_BLOCKED.is_set()
+    assert [w["RevisionId"] for w in writes(aws, "update_function_configuration")] == [
+        ORIGINAL_REVISION,
+        "rev-forward",
+    ]
+    assert not aws.read_overrides[("lambda", "get_function_configuration")]
+    assert_recovery_authority_ended(item, aws, "update_function_configuration")
+
+
+def no_op_lambda_case(kind):
+    """Requested values equal to the original: generation R legitimately reads original."""
+    original = lambda_original()
+    values = copy.deepcopy(action_configs()[kind])
+    if kind == framework.ChaosType.LAMBDA_ERROR_INJECTION:
+        original["Environment"]["Variables"]["CHAOS_ERROR_RATE"] = str(
+            values["error_rate"]
+        )
+    elif kind == framework.ChaosType.LAMBDA_TIMEOUT_MODIFY:
+        values["timeout_seconds"] = original["Timeout"]
+    elif kind == MEMORY:
+        values["memory_mb"] = original["MemorySize"]
+    else:
+        values["corrupt_vars"] = copy.deepcopy(original["Environment"]["Variables"])
+    return values, original
+
+
+@pytest.mark.parametrize("kind", list(LAMBDA_HANDLERS), ids=lambda kind: kind.value)
+def test_lambda_terminal_issued_revision_with_original_values_verifies(kind):
+    aws = FakeAWS(reject_writes=False)
+    values, original = no_op_lambda_case(kind)
+    item = stop_interrupts_settle_wait(
+        kind, aws, values, original, {**original, "RevisionId": "rev-forward"}
+    )
+    # Generation R itself carries the original values: nothing can land later.
+    item.run_rollback()
+    assert item.rollback_verified and not item.rollback_attempts
+    assert not framework._LIVE_RECOVERY_BLOCKED.is_set()
     assert len(writes(aws, "update_function_configuration")) == 1
     assert_recovery_authority_ended(item, aws, "update_function_configuration")
 
@@ -1334,7 +1887,8 @@ def empty_map_recovery(aws, restored_environment):
         copy.deepcopy(restored),
     ]
     aws.write_responses[("lambda", "update_function_configuration")] = [
-        {"RevisionId": "rev-forward"}
+        {"RevisionId": "rev-forward"},
+        {"RevisionId": "rev-restored"},
     ]
     item = make_experiment(kind, action_configs()[kind], aws, dry_run=False)
     assert item.inject_error(**handler_arguments(kind)).status == "completed"

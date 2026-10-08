@@ -1732,6 +1732,8 @@ def pin_session_credentials(
         raise SafetyViolation(
             "Credentials must be resolved from an origin-hardened AWS session"
         )
+    # Resolution may reach the raw IMDS or container provider transports.
+    require_credential_transport_policy(session)
     credentials = session.get_credentials()
     frozen = credentials.get_frozen_credentials() if credentials else None
     if frozen is None or not frozen.access_key or not frozen.secret_key:
@@ -2026,6 +2028,10 @@ def origin_bound_client(session: Any, service: str, region: str, config: Any) ->
     region and approved FIPS choice. Identity and ownership responses therefore
     come only from AWS; response-owner checks remain as defence in depth.
     """
+    # Creating a client resolves credentials, possibly through the raw IMDS or
+    # container provider transports, for every caller including direct library
+    # construction of a SafetyController or experiment.
+    require_credential_transport_policy(session)
     use_fips = configured_fips_endpoint(session)
     parents, hosts = canonical_endpoint_origin(service, region, use_fips)
     client = session.client(
@@ -2127,15 +2133,18 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def require_credential_transport_policy(session: Any) -> None:
-    """Refuse configured IMDS or container credential addresses in live mode.
+    """Refuse configured IMDS or container credential addresses in every mode.
 
     These providers use their own plain HTTP transports, not SDK clients, so
-    they cannot be canonical-origin bound. A configured IMDS endpoint
-    (``AWS_EC2_METADATA_SERVICE_ENDPOINT`` or the profile setting) must be the
-    default IPv4 or IPv6 address, and the container credential URL (the
-    relative URI joined to 169.254.170.2, or the full URI) must use HTTP(S)
-    without userinfo to 169.254.170.2, 169.254.170.23, fd00:ec2::23 or a
-    loopback address. Botocore itself admits any HTTPS host for a full URI.
+    they cannot be canonical-origin bound. Plan and live runs both resolve
+    credentials, so orchestrator construction, origin_bound_client and
+    pin_session_credentials run this check before resolving credentials. A
+    configured IMDS endpoint (``AWS_EC2_METADATA_SERVICE_ENDPOINT`` or the
+    profile setting) must be the default IPv4 or IPv6 address, and the
+    container credential URL (the relative URI joined to 169.254.170.2, or the
+    full URI) must use HTTP(S) without userinfo to 169.254.170.2,
+    169.254.170.23, fd00:ec2::23 or a loopback address. Botocore itself admits
+    any HTTPS host for a full URI.
     """
     core = _botocore_core(session)
     endpoint = (
@@ -2143,7 +2152,7 @@ def require_credential_transport_policy(session: Any) -> None:
     )
     if endpoint is not None and str(endpoint).rstrip("/") not in DEFAULT_IMDS_ENDPOINTS:
         raise SafetyViolation(
-            "Live runs refuse a non-default EC2 instance metadata endpoint"
+            "Credential resolution refuses a non-default EC2 instance metadata endpoint"
         )
     relative = os.environ.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
     full = os.environ.get("AWS_CONTAINER_CREDENTIALS_FULL_URI")
@@ -2164,8 +2173,8 @@ def require_credential_transport_policy(session: Any) -> None:
         or not (host in CONTAINER_CREDENTIAL_HOSTS or _is_loopback_host(host))
     ):
         raise SafetyViolation(
-            "Live runs refuse a container credential URL outside the documented "
-            "link-local and loopback addresses"
+            "Credential resolution refuses a container credential URL outside the "
+            "documented link-local and loopback addresses"
         )
 
 
@@ -2637,7 +2646,15 @@ class AwsClientProxy:
                     _PROCESS_EMERGENCY_STOP.stop_requested()
                     or self._owner.safety_controller.emergency_stop.is_set()
                 ):
+                    # Explicit proof that this attempt never reached the SDK.
+                    self._owner._record_mutation_not_dispatched(
+                        f"{self._service}.{name}"
+                    )
                     raise EmergencyStop("Emergency stop prevents admitted SDK dispatch")
+                if self._owner is not None:
+                    # From here AWS may accept the request even if no response
+                    # returns, so the attempt is no longer provably undispatched.
+                    self._owner._record_mutation_dispatch(f"{self._service}.{name}")
                 response = attribute(*args, **kwargs)
                 if self._owner is not None:
                     self._owner._record_mutation(f"{self._service}.{name}")
@@ -3712,6 +3729,10 @@ class ChaosExperiment:
         self.result = None
         self.mutation_operations: list[str] = []
         self.mutation_attempts: list[str] = []
+        # Forward invocations that began (AWS may have accepted them even without
+        # a response) and attempts the proxy proved it never invoked.
+        self.mutation_dispatches: list[str] = []
+        self.mutation_undispatched: list[str] = []
         self.rollback_operations: list[str] = []
         self.rollback_attempts: list[str] = []
         self.rollback_errors: list[str] = []
@@ -3884,6 +3905,16 @@ class ChaosExperiment:
             self.rollback_attempts.append(operation)
         else:
             self.mutation_attempts.append(operation)
+
+    def _record_mutation_dispatch(self, operation: str) -> None:
+        """Record that a forward SDK invocation began, before any response."""
+        if not self._is_recovery_dispatch():
+            self.mutation_dispatches.append(operation)
+
+    def _record_mutation_not_dispatched(self, operation: str) -> None:
+        """Record explicit proof that an attempted forward write was never invoked."""
+        if not self._is_recovery_dispatch():
+            self.mutation_undispatched.append(operation)
 
     def _is_recovery_dispatch(self) -> bool:
         """Recovery exemptions belong only to this thread's admitted phase."""
@@ -6520,6 +6551,9 @@ class LambdaChaosExperiment(ChaosExperiment):
         self.lambda_client = self.client("lambda")
         # Only the revision issued by this execution's own write can own recovery.
         self.lambda_confirmed_revision: str | None = None
+        # The new RevisionId the forward update's own response issued. Unlike
+        # recovery ownership, it is kept to bind no-write recovery evidence.
+        self.lambda_issued_revision: str | None = None
         self.lambda_ownership_refusal: str | None = None
 
     def _clear_recovery_ownership(self) -> None:
@@ -6570,6 +6604,7 @@ class LambdaChaosExperiment(ChaosExperiment):
             )
         # A successful conditional write returns its own generation. A stop that
         # interrupts the state wait below leaves recovery bound to that revision.
+        self.lambda_issued_revision = issued
         self.lambda_confirmed_revision = issued
         current = self._wait_for_configuration(function_name, True)
         # Equal values under any other revision may be another principal's write;
@@ -6594,9 +6629,19 @@ class LambdaChaosExperiment(ChaosExperiment):
         )
 
     def _wait_for_configuration(
-        self, function_name: str, interruptible: bool
+        self,
+        function_name: str,
+        interruptible: bool,
+        expected_revision: str | None = None,
+        prior_revision: str | None = None,
     ) -> dict[str, Any]:
-        """Wait for a Lambda configuration update to reach a successful terminal state."""
+        """Wait for a Lambda configuration update to reach a successful terminal state.
+
+        With ``expected_revision``, only a read of exactly that revision can
+        succeed, and the returned read is the single observation carrying it. A
+        read of ``prior_revision`` is the earlier generation still visible and
+        is waited out; any other revision is refused.
+        """
         deadline = time.monotonic() + int(self.config.get("state_timeout_seconds", 600))
         while time.monotonic() < deadline:
             if interruptible:
@@ -6604,11 +6649,30 @@ class LambdaChaosExperiment(ChaosExperiment):
             current = self.lambda_client.get_function_configuration(
                 FunctionName=function_name
             )
-            status = current.get("LastUpdateStatus", "Successful")
+            # Only an explicit Successful status is terminal success. An absent
+            # or unknown status proves nothing about the update's generation.
+            status = current.get("LastUpdateStatus")
+            if expected_revision is not None and (
+                current.get("RevisionId") != expected_revision
+            ):
+                if current.get("RevisionId") != prior_revision:
+                    raise SafetyViolation(
+                        "Lambda configuration revision differs from the expected "
+                        "update; reconcile manually"
+                    )
+                # Earlier-generation evidence, even Successful, never settles this one.
+                status = "InProgress"
             if status == "Successful":
                 return current
             if status == "Failed":
                 raise RuntimeError("Lambda configuration update failed")
+            if status != "InProgress":
+                if not interruptible:
+                    _LIVE_RECOVERY_BLOCKED.set()
+                raise SafetyViolation(
+                    "Lambda configuration update status is missing or unknown; "
+                    "reconcile manually"
+                )
             wait_seconds = min(5.0, max(0.1, deadline - time.monotonic()))
             if interruptible:
                 self._wait_forward(wait_seconds)
@@ -6893,12 +6957,109 @@ class LambdaChaosExperiment(ChaosExperiment):
 
         return result
 
+    def _require_settled_configuration_attempts(self) -> None:
+        """Refuse recovery claims while a forward update may still land.
+
+        UpdateFunctionConfiguration is asynchronous: AWS can accept a request
+        whose response is lost, and a later read may still show the prior
+        generation. A matching read is therefore no proof of non-acceptance.
+        Every attempt needs a returned response or the proxy's explicit
+        evidence that it was never invoked; otherwise recovery stays
+        unverified, later live work in this process is blocked and the
+        function must be reconciled.
+        """
+        operation = "lambda.update_function_configuration"
+        answered = self.mutation_operations.count(operation)
+        if self.mutation_dispatches.count(operation) > answered:
+            _LIVE_RECOVERY_BLOCKED.set()
+            raise SafetyViolation(
+                "Lambda forward revision was not confirmed (the update was "
+                "dispatched without a response and may still become visible); "
+                "recovery is unverified, reconcile manually"
+            )
+        if self.mutation_attempts.count(operation) > answered + (
+            self.mutation_undispatched.count(operation)
+        ):
+            _LIVE_RECOVERY_BLOCKED.set()
+            raise SafetyViolation(
+                "Lambda forward revision was not confirmed (an attempted update "
+                "has no evidence that it was never dispatched); recovery is "
+                "unverified, reconcile manually"
+            )
+        if answered and not self.lambda_issued_revision:
+            # A response without a new RevisionId is as ambiguous as no response.
+            _LIVE_RECOVERY_BLOCKED.set()
+            reason = self.lambda_ownership_refusal or (
+                "the update returned no new RevisionId"
+            )
+            raise SafetyViolation(
+                f"Lambda forward revision was not confirmed ({reason}); "
+                "recovery is unverified, reconcile manually"
+            )
+
+    def _require_terminal_issued_generation(self, current: dict[str, Any]) -> None:
+        """Bind a no-write recovery claim to the update's own terminal generation.
+
+        A read of original values under any other revision may be a stale read
+        taken before the returned generation became visible.
+        """
+        if not self.mutation_operations.count("lambda.update_function_configuration"):
+            return
+        if (
+            current.get("LastUpdateStatus") != "Successful"
+            or current.get("RevisionId") != self.lambda_issued_revision
+        ):
+            _LIVE_RECOVERY_BLOCKED.set()
+            raise SafetyViolation(
+                "Lambda recovery read is not the terminal generation issued by "
+                "the forward update; recovery is unverified, reconcile manually"
+            )
+
+    def _verify_restoration(
+        self, prior_revision: str, written: Any, update: dict[str, Any]
+    ) -> None:
+        """Verify a restoration from one read of its own terminal revision.
+
+        The restoration response must issue a new RevisionId R2, and a single
+        accepted read must carry R2, an explicit Successful status and the
+        restored values together. Anything less leaves recovery unverified and
+        blocks later live work in this process.
+        """
+        try:
+            restored_revision = (
+                written.get("RevisionId") if isinstance(written, dict) else None
+            )
+            if (
+                not isinstance(restored_revision, str)
+                or not restored_revision
+                or restored_revision == prior_revision
+            ):
+                raise SafetyViolation(
+                    "Lambda recovery update returned no new RevisionId; recovery "
+                    "is unverified, reconcile manually"
+                )
+            restored = self._wait_for_configuration(
+                self.function_name, False, restored_revision, prior_revision
+            )
+            # Environment is compared as readable variables: an omitted
+            # Environment is an empty map, while Environment.Error never verifies.
+            if any(
+                self._configuration_value(restored, property_name)
+                != (value["Variables"] if property_name == "Environment" else value)
+                for property_name, value in update.items()
+            ):
+                raise SafetyViolation("Lambda configuration recovery is not verified")
+        except Exception:
+            _LIVE_RECOVERY_BLOCKED.set()
+            raise
+
     def rollback(self):
         """Restore owned fields with revision checks and preserve unrelated edits."""
         if not self.dry_run:
             self._require_execution_grant(dispatch=True)
         if not hasattr(self, "function_name") or not self.mutation_attempts:
             return
+        self._require_settled_configuration_attempts()
         current = self.lambda_client.get_function_configuration(
             FunctionName=self.function_name
         )
@@ -6939,6 +7100,8 @@ class LambdaChaosExperiment(ChaosExperiment):
                     getattr(self, f"owned_{attribute}"),
                 ):
                     update[property_name] = original
+        if not update:
+            self._require_terminal_issued_generation(current)
         if update:
             revision = current.get("RevisionId")
             if not revision:
@@ -6956,21 +7119,17 @@ class LambdaChaosExperiment(ChaosExperiment):
                 raise SafetyViolation(
                     "Lambda revision changed after the confirmed forward write; reconcile manually"
                 )
-            self.lambda_client.update_function_configuration(
+            if current.get("LastUpdateStatus") != "Successful":
+                # Restore only from an explicitly terminal read of the owned revision.
+                _LIVE_RECOVERY_BLOCKED.set()
+                raise SafetyViolation(
+                    "Lambda owned revision is not in an explicit Successful state; "
+                    "recovery is unverified, reconcile manually"
+                )
+            written = self.lambda_client.update_function_configuration(
                 FunctionName=self.function_name, RevisionId=revision, **update
             )
-            self._wait_for_configuration(self.function_name, False)
-            restored = self.lambda_client.get_function_configuration(
-                FunctionName=self.function_name
-            )
-            # Environment is compared as readable variables: an omitted
-            # Environment is an empty map, while Environment.Error never verifies.
-            if any(
-                self._configuration_value(restored, property_name)
-                != (value["Variables"] if property_name == "Environment" else value)
-                for property_name, value in update.items()
-            ):
-                raise SafetyViolation("Lambda configuration recovery is not verified")
+            self._verify_restoration(revision, written, update)
         if hasattr(self, "original_concurrency"):
             current_limit = self.lambda_client.get_function_concurrency(
                 FunctionName=self.function_name
@@ -10933,8 +11092,10 @@ class ChaosOrchestrator:
         session = harden_session_origin(
             boto3.Session(profile_name=profile, region_name=self.region)
         )
-        if self.live:
-            require_credential_transport_policy(session)
+        # Plan mode resolves credentials too (role assumption and the STS
+        # identity read), so the raw provider transports are checked in both
+        # modes before any request.
+        require_credential_transport_policy(session)
         self.approval_scope = {
             "profile": profile,
             "role_arn": requested_role,

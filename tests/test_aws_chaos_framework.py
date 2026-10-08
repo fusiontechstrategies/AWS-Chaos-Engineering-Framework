@@ -516,6 +516,12 @@ class FakeAWS:
             # the default reads above describe the earlier "lock-1" generation.
             ("wafv2", "update_web_acl"): {"NextLockToken": "lock-2"},
             ("wafv2", "update_ip_set"): {"NextLockToken": "lock-2"},
+            # UpdateFunctionConfiguration always returns the RevisionId it
+            # created; unscripted writes here are restorations to the
+            # "memory-restored-revision" generation that prepare_lambda_memory reads.
+            ("lambda", "update_function_configuration"): {
+                "RevisionId": "memory-restored-revision"
+            },
             ("kms", "describe_key"): {
                 "KeyMetadata": {"KeyId": "alias/chaos-test", "Enabled": True}
             },
