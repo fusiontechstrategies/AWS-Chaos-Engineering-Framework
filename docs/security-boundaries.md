@@ -246,7 +246,21 @@ those checks is refused. These reads alone do not prevent later external writes.
 Lambda writes also use RevisionId and preserve unrelated environment variables.
 Lambda ownership is the `RevisionId` returned by the update itself; a settled read
 of any other revision is not adopted. Recovery writes require the current
-revision to equal it; WAF and Lambda recovery is single use and revokes the
+revision to equal it. An update whose SDK invocation began but returned no
+response may still be accepted and become visible later, so a read of the
+original values never verifies its recovery: recovery stays unverified, the
+process-wide live block is set and the function must be reconciled. A
+response without a new `RevisionId` is handled the same way. When the update
+returned a new revision, recovery without a write is verified only when the
+recovery read reports that revision with an explicit `LastUpdateStatus` of
+`Successful`; a missing or unknown status is never treated as success, here or
+in the configuration waiter. A restoration write is sent only from an
+explicitly `Successful` read of the owned revision, its response must issue a
+new revision, and it is verified only from one read that reports that new
+revision, an explicit `Successful` status and the restored values together;
+otherwise recovery fails and the process-wide live block is set. Only an
+attempt the client proxy explicitly recorded as never dispatched may otherwise
+verify recovery without a write; WAF and Lambda recovery is single use and revokes the
 execution grant after verification or failure.
 S3/SNS whole-policy changes, EBS IOPS changes, OpenSearch node-count changes and
 security-group ingress changes retain planning and dry runs only. Live tokens,
@@ -608,8 +622,15 @@ SDK client involved in a run, in live and plan mode, is origin-bound:
 ### Credential transports outside the SDK client stack
 
 The EC2 instance metadata (IMDS) and container credential providers use their
-own plain HTTP transports, so they cannot be canonical-origin bound. Live runs
-apply an explicit address policy before any credential is resolved:
+own plain HTTP transports, so they cannot be canonical-origin bound. Plan and
+live runs both resolve credentials (role assumption and the STS identity read),
+so an explicit address policy is applied in both modes. The orchestrator
+applies it immediately after the session is origin-hardened and before any role
+assumption, credential resolution, client creation or STS request. It is also
+applied before every framework SDK client is created (so direct
+`SafetyController` and planning-experiment construction with a caller-supplied
+session are covered) and before `pin_session_credentials` resolves
+credentials:
 
 - A configured IMDS endpoint (`AWS_EC2_METADATA_SERVICE_ENDPOINT` or the
   profile `ec2_metadata_service_endpoint`) is admitted only when it is
@@ -622,8 +643,11 @@ apply an explicit address policy before any credential is resolved:
   ECS/EKS link-local hosts `169.254.170.2`, `169.254.170.23` and
   `fd00:ec2::23`, or a loopback address. Botocore itself admits loopback for
   plain HTTP and any host for HTTPS; the framework refuses the latter.
-- Any other value fails live initialization before a credential request. Plan
-  mode does not apply this policy; it neither mutates nor trusts the identity.
+- Any other value is refused at those points before any provider or SDK
+  request, so a malicious provider endpoint receives no request or configured
+  container authorization token through them. Credentials a caller resolves
+  directly from its own session, outside the framework, are outside this
+  boundary.
 
 These transports are unauthenticated plain HTTP on the instance or task. An
 environment that can intercept link-local traffic can still supply arbitrary

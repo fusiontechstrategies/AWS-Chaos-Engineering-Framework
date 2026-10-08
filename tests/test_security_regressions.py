@@ -1671,7 +1671,8 @@ def test_lambda_recovery_preserves_opaque_arn_values():
         restored,
     ]
     aws.write_responses[("lambda", "update_function_configuration")] = [
-        {"RevisionId": "rev-owned"}
+        {"RevisionId": "rev-owned"},
+        {"RevisionId": "rev-restored"},
     ]
     item, values = experiment(
         framework.ChaosType.LAMBDA_ENVIRONMENT_CORRUPT,

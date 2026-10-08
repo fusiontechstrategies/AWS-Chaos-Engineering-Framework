@@ -39,13 +39,13 @@ Version 2.0.4 is available on [PyPI](https://pypi.org/project/aws-chaos-engineer
 | --- | --- |
 | Default mode | Plans and validates. It does not issue mutating AWS requests. |
 | Identity binding | Live mode requires the active account, configured account, region, partition, and caller identity to agree. |
-| Credentials | Temporary credentials are required by default. Long-term credentials need configuration and CLI approval. |
+| Credentials | Temporary credentials are required by default. Long-term credentials need configuration and CLI approval. Plan and live runs, framework client creation and credential pinning refuse a non-default IMDS endpoint or a container credential URL outside the documented link-local and loopback addresses before any credential request. |
 | Targets | Live extensions require exact allowlisting. Optional VPC discovery includes only resources with required safety tags. |
 | Blast radius | Per-run and per-experiment limits are enforced before execution. |
 | Stop controls | Extension runs require CloudWatch alarms by default. FIS template inspection checks alarm stop conditions; live FIS starts are disabled. |
 | Confirmation | Live execution requires an exact, non-secret token containing the account, region, and suite. |
 | Irreversible actions | Destructive actions require a stronger token plus two independent approvals. |
-| Rollback | Reversible changes capture prior state, track AWS write attempts, and report recovery failures honestly. |
+| Rollback | Reversible changes capture prior state, track AWS write attempts, and report recovery failures honestly. Lambda configuration recovery is verified only from a single read that carries the expected revision, an explicit `Successful` status and the expected values. With no restore needed, that is the forward update's own response revision; only a forward update the client proved was never dispatched verifies from the original values alone. After a restore, it is the restore's own response revision, and the restore is sent only after an explicitly `Successful` read of the forward revision. A forward update dispatched without a new response revision is never verified from a read of the original values. Otherwise recovery fails and later live runs in the process are blocked. |
 | Reports | Account, identity, alarm, and resource identifiers are omitted or redacted unless explicitly requested. |
 
 Safety checks fail closed. Missing alarms, unresolved targets, mismatched identities, ambiguous target scopes, and unsupported experiment types stop live execution.

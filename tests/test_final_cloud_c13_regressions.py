@@ -37,6 +37,7 @@ from urllib.parse import urlsplit
 
 import boto3
 import botocore.credentials
+import botocore.httpsession
 import botocore.session
 import botocore.tokens
 import botocore.utils
@@ -1259,7 +1260,9 @@ def test_configured_credential_transport_overrides_fail_closed(
     for name, value in variables.items():
         monkeypatch.setenv(name, value)
     session = boto3.Session(botocore_session=botocore.session.Session())
-    with pytest.raises(framework.SafetyViolation, match="Live runs refuse"):
+    with pytest.raises(
+        framework.SafetyViolation, match="Credential resolution refuses"
+    ):
         framework.require_credential_transport_policy(session)
 
 
@@ -1270,16 +1273,211 @@ def test_configured_credential_transport_overrides_fail_closed(
         ("AWS_CONTAINER_CREDENTIALS_FULL_URI", "https://attacker.example/creds"),
     ],
 )
-def test_live_admission_refuses_transport_override_before_any_request(
+def test_live_and_plan_admission_refuse_transport_override_before_any_request(
     tmp_path, monkeypatch, name, value
 ):
     signed = offline_aws(monkeypatch, tmp_path, environment={name: value})
-    with pytest.raises(framework.SafetyViolation, match="Live runs refuse"):
+    with pytest.raises(
+        framework.SafetyViolation, match="Credential resolution refuses"
+    ):
         live_orchestrator(tmp_path)
     assert signed == []
-    # Plan mode keeps working: it neither mutates nor trusts the identity.
-    orchestrator, _values = live_orchestrator(tmp_path, live=False)
-    assert orchestrator.actual_account == ACCOUNT_ID
+    # Plan mode also resolves credentials, so it is refused the same way.
+    with pytest.raises(
+        framework.SafetyViolation, match="Credential resolution refuses"
+    ):
+        live_orchestrator(tmp_path, live=False)
+    assert signed == []
+
+
+def provider_only_aws(
+    monkeypatch, tmp_path, environment: dict[str, str], profile_lines: str = ""
+) -> tuple[list[tuple[str, str, str]], list[tuple[str, Any]]]:
+    """Offline sessions whose only credential source is a raw provider.
+
+    No static credential exists and instance metadata is enabled, so without
+    the transport policy botocore would reach the IMDS or container provider.
+    SDK requests are answered offline by ``offline_aws``; the providers' own
+    plain HTTP sessions are recorded and never sent.
+    """
+    signed = offline_aws(
+        monkeypatch, tmp_path, environment=environment, profile_lines=profile_lines
+    )
+    (tmp_path / "aws-credentials").write_text("", encoding="ascii")
+    for variable in (
+        "AWS_EC2_METADATA_DISABLED",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    ):
+        if variable not in environment:
+            monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("BOTO_CONFIG", str(tmp_path / "absent-boto-config"))
+    provider: list[tuple[str, Any]] = []
+
+    def record_provider_request(_session, request):
+        provider.append(
+            (urlsplit(request.url).netloc, request.headers.get("Authorization"))
+        )
+        raise Delivered(request.url)
+
+    monkeypatch.setattr(
+        botocore.httpsession.URLLib3Session, "send", record_provider_request
+    )
+    return signed, provider
+
+
+def plan_orchestrator_or_refusal(tmp_path) -> str | None:
+    """Construct a plan-mode orchestrator; return its refusal, if any."""
+    try:
+        live_orchestrator(tmp_path, live=False)
+    except framework.SafetyViolation as exc:
+        return str(exc)
+    except Delivered:
+        return None
+    return None
+
+
+@pytest.mark.parametrize(
+    "environment,profile_lines",
+    [
+        ({"AWS_EC2_METADATA_SERVICE_ENDPOINT": "http://attacker.example/"}, ""),
+        ({}, "ec2_metadata_service_endpoint = http://attacker.example/\n"),
+    ],
+    ids=["environment", "profile"],
+)
+def test_plan_mode_refuses_non_default_imds_endpoint_before_any_request(
+    tmp_path, monkeypatch, environment, profile_lines
+):
+    signed, provider = provider_only_aws(
+        monkeypatch, tmp_path, environment, profile_lines
+    )
+    refusal = plan_orchestrator_or_refusal(tmp_path)
+    assert refusal == (
+        "Credential resolution refuses a non-default EC2 instance metadata endpoint"
+    )
+    assert provider == []
+    assert signed == []
+
+
+@pytest.mark.parametrize("token", ["none", "token", "token-file"])
+def test_plan_mode_refuses_arbitrary_https_container_uri_without_sending(
+    tmp_path, monkeypatch, token
+):
+    environment = {
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI": "https://attacker.example/creds"
+    }
+    if token == "token":
+        environment["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = "synthetic-provider-token"
+    elif token == "token-file":
+        token_file = tmp_path / "container-token"
+        token_file.write_text("synthetic-provider-token", encoding="ascii")
+        environment["AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"] = str(token_file)
+    signed, provider = provider_only_aws(monkeypatch, tmp_path, environment)
+    refusal = plan_orchestrator_or_refusal(tmp_path)
+    assert refusal == (
+        "Credential resolution refuses a container credential URL outside the "
+        "documented link-local and loopback addresses"
+    )
+    assert provider == []
+    assert signed == []
+
+
+def test_plan_mode_admitted_loopback_container_uri_reaches_only_that_provider(
+    tmp_path, monkeypatch
+):
+    # Control: the same harness observes a provider request once admitted.
+    environment = {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:9/creds"}
+    signed, provider = provider_only_aws(monkeypatch, tmp_path, environment)
+    assert plan_orchestrator_or_refusal(tmp_path) is None
+    assert {host for host, _ in provider} == {"127.0.0.1:9"}
+    assert signed == []
+
+
+DIRECT_ENTRY_POINTS = ("safety-controller", "planning-experiment", "pinning")
+
+
+def resolve_through_direct_entry(entry: str) -> str:
+    """Drive one library entry point that resolves credentials without an orchestrator.
+
+    Returns "refused: <message>", "provider-request" when the offline provider
+    recorder was reached, or "resolved".
+    """
+    session = framework.boto3.Session(profile_name=PROFILE, region_name=PROFILE_REGION)
+    try:
+        if entry == "pinning":
+            framework.pin_session_credentials(
+                framework.harden_session_origin(session), PROFILE_REGION
+            )
+        else:
+            # A caller-supplied session, exactly as direct library planning uses it.
+            controller = framework.SafetyController(
+                {}, session, PROFILE_REGION, False, expected_account=ACCOUNT_ID
+            )
+            if entry == "safety-controller":
+                controller.client("sts")
+            else:
+                framework.LambdaChaosExperiment(
+                    {"region": PROFILE_REGION, "dry_run": True}, controller
+                )
+    except framework.SafetyViolation as exc:
+        return f"refused: {exc}"
+    except Delivered:
+        return "provider-request"
+    return "resolved"
+
+
+@pytest.mark.parametrize("entry", DIRECT_ENTRY_POINTS)
+@pytest.mark.parametrize(
+    "environment,expected",
+    [
+        (
+            {"AWS_EC2_METADATA_SERVICE_ENDPOINT": "http://attacker.example/"},
+            "refused: Credential resolution refuses a non-default EC2 instance "
+            "metadata endpoint",
+        ),
+        (
+            {
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI": "https://attacker.example/creds",
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN": "synthetic-provider-token",
+            },
+            "refused: Credential resolution refuses a container credential URL "
+            "outside the documented link-local and loopback addresses",
+        ),
+    ],
+    ids=["imds-endpoint", "container-uri-with-token"],
+)
+def test_direct_entry_points_refuse_provider_overrides_before_any_request(
+    tmp_path, monkeypatch, entry, environment, expected
+):
+    signed, provider = provider_only_aws(monkeypatch, tmp_path, environment)
+    assert resolve_through_direct_entry(entry) == expected
+    assert provider == []
+    assert signed == []
+
+
+@pytest.mark.parametrize("entry", DIRECT_ENTRY_POINTS)
+@pytest.mark.parametrize(
+    "environment,host",
+    [
+        (
+            {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:9/creds"},
+            "127.0.0.1:9",
+        ),
+        ({}, "169.254.169.254"),
+    ],
+    ids=["loopback-container", "default-imds"],
+)
+def test_direct_entry_points_admit_default_and_loopback_providers(
+    tmp_path, monkeypatch, entry, environment, host
+):
+    # Control: the same harness observes the admitted provider's request.
+    signed, provider = provider_only_aws(monkeypatch, tmp_path, environment)
+    assert resolve_through_direct_entry(entry) == "provider-request"
+    assert {recorded for recorded, _ in provider} == {host}
+    assert signed == []
 
 
 def kinesis_session(monkeypatch, tmp_path) -> tuple[Any, list[str]]:
