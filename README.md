@@ -33,6 +33,8 @@ The framework does not replace AWS FIS. It makes FIS easier to govern and suppli
 
 Version 2.0.4 is available on [PyPI](https://pypi.org/project/aws-chaos-engineering-framework/2.0.4/) and as a verified GitHub release. Install it with `python -m pip install aws-chaos-engineering-framework==2.0.4`, then run the read-only `aws-chaos-framework --list-experiments` command. The [release page](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/releases/tag/v2.0.4) provides the standalone runtime, wheel, source distribution, SPDX SBOM, SHA-256 checksums, release evidence, and GitHub provenance attestations.
 
+For a practical review before any live run, read [Before I let an AWS chaos experiment touch anything](https://builder.aws.com/content/3K3DcMergzl11QROC81uyl0cnOy/before-i-let-an-aws-chaos-experiment-touch-anything). The guide walks through identity binding, exact targets, stop alarms, blast-radius limits, rollback, evidence, and a plan-mode rehearsal.
+
 ## Safety model
 
 | Guardrail | Enforced behavior |
