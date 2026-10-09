@@ -747,13 +747,11 @@ def test_readme_quick_start_installs_locks_before_the_local_project():
     commands = install_commands(
         section((ROOT / "README.md").read_text("utf-8"), "## Quick start")
     )
+    locked = "python -m pip install --require-hashes --only-binary :all: -r "
     assert commands == [
-        "python -m pip install --require-hashes --only-binary :all: "
-        "-r requirements-pip-lock.txt",
-        "python -m pip install --require-hashes --only-binary :all: "
-        "-r requirements-build-lock.txt",
-        "python -m pip install --require-hashes --only-binary :all: "
-        "-r requirements-runtime-lock.txt",
+        locked + "requirements-pip-lock.txt",
+        locked + "requirements-build-lock.txt",
+        locked + "requirements-runtime-lock.txt",
         "python -m pip install --no-build-isolation --no-deps .",
     ]
 
