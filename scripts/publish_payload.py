@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import shutil
+import tempfile
 from pathlib import Path
 
 # Only the protected release-promotion controller on main attests release
@@ -20,6 +22,24 @@ MAX_EVIDENCE_BYTES = 1_048_576
 MAX_ATTESTATION_BYTES = 4_194_304
 # Matches the per-distribution limit admitted before download.
 MAX_PACKAGE_BYTES = 16 * 1024 * 1024
+# The trusted normalizers' timestamp range; evidence outside it is refused.
+MIN_SOURCE_DATE_EPOCH = 315532800
+MAX_SOURCE_DATE_EPOCH = 0xFFFFFFFF
+
+
+def _load_trusted_helper(name: str):
+    """Load a reviewed sibling from this trusted checkout, never from a tag."""
+    path = Path(__file__).resolve().with_name(name + ".py")
+    spec = importlib.util.spec_from_file_location("trusted_" + name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError("Trusted distribution normalizer is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+normalize_wheel = _load_trusted_helper("normalize_wheel")
+normalize_sdist = _load_trusted_helper("normalize_sdist")
 
 
 def expected_names(tag: str) -> set[str]:
@@ -197,6 +217,38 @@ def require_attested(
     raise ValueError("No protected release attestation for publish subject")
 
 
+def require_canonical_regeneration(
+    name: str, value: bytes, source_date_epoch: int
+) -> None:
+    """Refuse package bytes that differ from their trusted canonical regeneration.
+
+    Existing provenance can predate the promotion controller's byte gate, so a
+    protected-signer attestation alone does not prove canonical bytes. A
+    private copy of the exact captured bytes is regenerated with the trusted
+    normalizer and must be byte-identical before anything is published.
+    """
+    normalize = (
+        normalize_wheel.normalize_wheel
+        if name.endswith(".whl")
+        else normalize_sdist.normalize_sdist
+    )
+    with tempfile.TemporaryDirectory(prefix="publish-regeneration-") as directory:
+        private = Path(directory) / name
+        private.write_bytes(value)
+        try:
+            normalize(private, source_date_epoch)
+        except (
+            normalize_wheel.WheelNormalizationError,
+            normalize_sdist.SdistNormalizationError,
+            ValueError,
+        ) as error:
+            raise ValueError(f"{name} cannot be regenerated canonically") from error
+        if private.read_bytes() != value:
+            raise ValueError(
+                f"{name} is not byte-identical to its trusted canonical regeneration"
+            )
+
+
 def authenticate(
     payload_dir: Path,
     tag: str,
@@ -238,17 +290,36 @@ def authenticate(
             raise ValueError("Invalid protected release evidence")
         records[item.get("name")] = item
     packages = payload_dir / "packages"
+    captured: dict[str, bytes] = {}
     for name in sorted(names):
         record = records.get(name)
         source = packages / name
-        actual = digest(source)
+        # One bounded capture: digest, provenance and regeneration all bind
+        # these exact bytes, and the published file must still equal them.
+        value = _bounded_bytes(source, MAX_PACKAGE_BYTES)
+        actual = hashlib.sha256(value).hexdigest()
         if (
             record is None
             or actual != record.get("sha256")
-            or source.stat().st_size != record.get("bytes")
+            or len(value) != record.get("bytes")
         ):
             raise ValueError("Package does not match protected release evidence")
         require_attested(attestation_dir / f"{name}.json", name, actual, repository)
+        captured[name] = value
+    # Provenance alone may predate the promotion byte gate. The epoch comes
+    # only from the attested evidence, and every published byte must equal
+    # its trusted canonical regeneration before the publish step runs.
+    epoch = evidence.get("source_date_epoch")
+    if (
+        type(epoch) is not int
+        or not MIN_SOURCE_DATE_EPOCH <= epoch <= MAX_SOURCE_DATE_EPOCH
+    ):
+        raise ValueError("Protected release evidence has no valid SOURCE_DATE_EPOCH")
+    for name, value in sorted(captured.items()):
+        require_canonical_regeneration(name, value, epoch)
+    for name, value in sorted(captured.items()):
+        if digest(packages / name) != hashlib.sha256(value).hexdigest():
+            raise ValueError("Package changed after canonical verification")
 
 
 def main() -> None:

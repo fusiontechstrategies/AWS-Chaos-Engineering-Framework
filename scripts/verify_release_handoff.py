@@ -42,7 +42,9 @@ def preflight_archives(directory):
                 ):
                     raise ValueError("Wheel handoff is not stored canonically")
         else:
-            with archive_budget.open_tar(path, max_stream_bytes=MAX_TOTAL_BYTES):
+            with archive_budget.open_tar(
+                path, max_stream_bytes=MAX_TOTAL_BYTES, canonical_gzip=True
+            ):
                 pass
 
 
@@ -121,6 +123,9 @@ def verify_handoff(assets, source, commit, epoch, expected_tag=None):
             (dist / name).write_bytes((assets / name).read_bytes())
         preflight_archives(dist)
         rebuilt = root / "rebuilt"
+        # Trusted prepare_release regenerates private wheel and sdist copies
+        # with the trusted normalizers and refuses any candidate whose bytes
+        # differ, before checksums or evidence are built for attestation.
         prepare.prepare_release(source, dist, rebuilt, version, tag, commit, epoch)
         manifest = integrity.manifest(rebuilt)
         integrity.verify_assets(assets, manifest)

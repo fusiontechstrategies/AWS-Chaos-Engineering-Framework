@@ -1222,7 +1222,8 @@ def test_hardened_session_binds_every_created_client(tmp_path, monkeypatch):
         {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://169.254.170.23/v1/credentials"},
         {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://[fd00:ec2::23]/v1/credentials"},
         {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:8080/creds"},
-        {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://localhost:51679/creds"},
+        {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.2/creds"},
+        {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://[::1]:51679/creds"},
     ],
 )
 def test_default_imds_and_documented_container_addresses_are_admitted(
@@ -1249,6 +1250,14 @@ def test_default_imds_and_documented_container_addresses_are_admitted(
         {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "ftp://169.254.170.2/creds"},
         {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://169.254.170.2:99999/"},
         {"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "@attacker.example/creds"},
+        # A host name is never admitted by spelling, not even localhost.
+        {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://localhost:51679/creds"},
+        {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "https://localhost/creds"},
+        # Only normalized numeric loopback literals are admitted.
+        {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.1/creds"},
+        {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://[0:0:0:0:0:0:0:1]/creds"},
+        {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://[::ffff:127.0.0.1]/creds"},
+        {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://[::1%25lo]/creds"},
     ],
 )
 def test_configured_credential_transport_overrides_fail_closed(
@@ -1385,14 +1394,43 @@ def test_plan_mode_refuses_arbitrary_https_container_uri_without_sending(
     assert signed == []
 
 
+@pytest.mark.parametrize("token", ["token", "token-file"])
+@pytest.mark.parametrize(
+    "url", ["http://localhost:51679/creds", "https://localhost/creds"]
+)
+def test_plan_mode_refuses_localhost_container_uri_before_provider_transport(
+    tmp_path, monkeypatch, url, token
+):
+    # localhost is a name: resolution could select a non-loopback recipient.
+    environment = {"AWS_CONTAINER_CREDENTIALS_FULL_URI": url}
+    if token == "token":
+        environment["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = "synthetic-provider-token"
+    else:
+        token_file = tmp_path / "container-token"
+        token_file.write_text("synthetic-provider-token", encoding="ascii")
+        environment["AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"] = str(token_file)
+    signed, provider = provider_only_aws(monkeypatch, tmp_path, environment)
+    refusal = plan_orchestrator_or_refusal(tmp_path)
+    assert refusal == (
+        "Credential resolution refuses a container credential URL outside the "
+        "documented link-local and loopback addresses"
+    )
+    assert provider == []
+    assert signed == []
+
+
+@pytest.mark.parametrize(
+    "url,netloc",
+    [("http://127.0.0.1:9/creds", "127.0.0.1:9"), ("http://[::1]:9/creds", "[::1]:9")],
+)
 def test_plan_mode_admitted_loopback_container_uri_reaches_only_that_provider(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, url, netloc
 ):
     # Control: the same harness observes a provider request once admitted.
-    environment = {"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:9/creds"}
+    environment = {"AWS_CONTAINER_CREDENTIALS_FULL_URI": url}
     signed, provider = provider_only_aws(monkeypatch, tmp_path, environment)
     assert plan_orchestrator_or_refusal(tmp_path) is None
-    assert {host for host, _ in provider} == {"127.0.0.1:9"}
+    assert {host for host, _ in provider} == {netloc}
     assert signed == []
 
 
