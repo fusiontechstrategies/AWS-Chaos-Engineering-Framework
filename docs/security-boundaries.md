@@ -355,6 +355,28 @@ equal the physical header's size. Ordinary PAX metadata and long names remain
 supported. The decompressed stream includes headers, padding and end records in
 its budget. Wheel RECORD parsing is separately capped at 128 rows.
 
+Raw representation bytes are admitted too, not only decoded member views.
+Every byte before a ZIP central directory must belong to exactly one local
+record (its header, data and any data descriptor that repeats the central CRC
+and sizes), so gaps between records or before the central directory are
+refused. Gzip input must be exactly one member followed by nothing else;
+concatenated members, including empty members whose optional header fields
+carry data, and trailing bytes are refused, and the member CRC and size are
+checked. Release inventory and protected handoff admission further require
+the normalizer's exact gzip header and stored-block serialization.
+
+Before any checksum, release evidence or asset is written, `prepare_release.py`
+captures each wheel and sdist exactly once; semantic validation, inventory,
+regeneration and asset output all use those captured bytes. It regenerates a
+private copy with the trusted `normalize_wheel.py` and `normalize_sdist.py`,
+and refuses a candidate whose bytes differ from that regeneration. The
+protected promotion verifier runs this trusted copy of `prepare_release.py`, so
+only bytes equal to their trusted canonical regeneration can become attested
+release subjects. Because earlier provenance may predate this gate, the
+protected PyPI job's trusted `publish_payload.py verify` repeats it on a single
+capture of each package, using the attested evidence's `source_date_epoch`,
+before the publish action can add PyPI attestations.
+
 Member reads use bounded chunks and verify actual bytes against the admitted
 size. Normalized TAR and gzip output are streamed rather than assembled as a
 second full TAR buffer. Existing canonical content, hash, source-provenance and
@@ -641,8 +663,15 @@ credentials:
   to `169.254.170.2`, or `AWS_CONTAINER_CREDENTIALS_FULL_URI`) must use HTTP or
   HTTPS without user information, a valid port, and one of the documented
   ECS/EKS link-local hosts `169.254.170.2`, `169.254.170.23` and
-  `fd00:ec2::23`, or a loopback address. Botocore itself admits loopback for
-  plain HTTP and any host for HTTPS; the framework refuses the latter.
+  `fd00:ec2::23`, or a normalized numeric loopback literal: an IPv4 address in
+  `127.0.0.0/8` or exactly `::1`. Host names, including `localhost`, are
+  refused over HTTP and HTTPS, because the provider transport would resolve
+  the name without pinning the connection to a loopback address and a hostile
+  resolver could direct the request, and any configured container
+  authorization token, elsewhere. Noncanonical, scoped and IPv4-mapped
+  spellings are refused too. Botocore itself admits `localhost` and loopback
+  for plain HTTP and any host for HTTPS; the framework refuses names and
+  arbitrary HTTPS hosts.
 - Any other value is refused at those points before any provider or SDK
   request, so a malicious provider endpoint receives no request or configured
   container authorization token through them. Credentials a caller resolves

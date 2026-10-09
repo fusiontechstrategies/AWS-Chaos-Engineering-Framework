@@ -31,7 +31,7 @@ AWS FIS can supply managed faults, but this framework currently permits only rea
 
 The framework does not replace AWS FIS. It makes FIS easier to govern and supplies a guarded extension layer for additional AWS services.
 
-Version 2.0.4 is available on [PyPI](https://pypi.org/project/aws-chaos-engineering-framework/2.0.4/) and as a verified GitHub release. Install it with `python -m pip install aws-chaos-engineering-framework==2.0.4`, then run the read-only `aws-chaos-framework --list-experiments` command. The [release page](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/releases/tag/v2.0.4) provides the standalone runtime, wheel, source distribution, SPDX SBOM, SHA-256 checksums, release evidence, and GitHub provenance attestations.
+Version 2.0.4 is available on [PyPI](https://pypi.org/project/aws-chaos-engineering-framework/2.0.4/) and as a verified GitHub release. A non-verified convenience install, `python -m pip install aws-chaos-engineering-framework==2.0.4`, installs the package and whatever dependency artifacts your configured index serves, without hash verification. Security-sensitive operators should use the hash-locked [Quick start](#quick-start) or the provenance-verified release assets instead. Then run the read-only `aws-chaos-framework --list-experiments` command. The [release page](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/releases/tag/v2.0.4) provides the standalone runtime, wheel, source distribution, SPDX SBOM, SHA-256 checksums, release evidence, and GitHub provenance attestations.
 
 ## Safety model
 
@@ -39,7 +39,7 @@ Version 2.0.4 is available on [PyPI](https://pypi.org/project/aws-chaos-engineer
 | --- | --- |
 | Default mode | Plans and validates. It does not issue mutating AWS requests. |
 | Identity binding | Live mode requires the active account, configured account, region, partition, and caller identity to agree. |
-| Credentials | Temporary credentials are required by default. Long-term credentials need configuration and CLI approval. Plan and live runs, framework client creation and credential pinning refuse a non-default IMDS endpoint or a container credential URL outside the documented link-local and loopback addresses before any credential request. |
+| Credentials | Temporary credentials are required by default. Long-term credentials need configuration and CLI approval. Plan and live runs, framework client creation and credential pinning refuse a non-default IMDS endpoint or a container credential URL outside the documented link-local addresses and numeric loopback literals (host names such as `localhost` are refused) before any credential request. |
 | Targets | Live extensions require exact allowlisting. Optional VPC discovery includes only resources with required safety tags. |
 | Blast radius | Per-run and per-experiment limits are enforced before execution. |
 | Stop controls | Extension runs require CloudWatch alarms by default. FIS template inspection checks alarm stop conditions; live FIS starts are disabled. |
@@ -62,13 +62,19 @@ The tool supports standard AWS partitions and both AWS GovCloud regions. CloudFr
 
 ## Quick start
 
-Clone the repository and create an isolated Python environment:
+Clone the repository, create an isolated Python environment and install
+only hash-verified wheels from the repository's lockfiles: first the pinned
+installer, then the pinned build tools and runtime dependencies. The local
+project is then built with exactly those tools, without build isolation or any
+further dependency resolution:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install .
+python -m pip install --require-hashes --only-binary :all: -r requirements-pip-lock.txt
+python -m pip install --require-hashes --only-binary :all: -r requirements-build-lock.txt
+python -m pip install --require-hashes --only-binary :all: -r requirements-runtime-lock.txt
+python -m pip install --no-build-isolation --no-deps .
 ```
 
 Create and validate a safe starter configuration:

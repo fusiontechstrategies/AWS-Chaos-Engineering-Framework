@@ -2,6 +2,54 @@
 
 ## Unreleased security follow-ups
 
+### Canonical release bytes, numeric loopback credential URLs and hash-locked setup
+
+- Protected release promotion now binds every raw wheel and sdist byte, not
+  only the decoded member view. Before any checksum, release evidence or asset
+  is written, `prepare_release.py` (the trusted copy that the protected
+  verifier runs) captures each candidate exactly once, then runs semantic
+  validation, inventory, canonical regeneration and asset output on those same
+  captured bytes, so changing an input file after capture has no effect. A
+  private copy is regenerated with the trusted `normalize_wheel.py` and
+  `normalize_sdist.py`, and the candidate is refused unless the regenerated
+  bytes are identical. Only those verified bytes are written as release
+  assets, so a semantically valid distribution that carries extra
+  representation bytes can no longer receive protected provenance.
+- PyPI publication applies the same gate. Provenance from the protected
+  promotion workflow may predate this byte gate, so the protected `pypi` job's
+  trusted `publish_payload.py verify` now reads each package once, checks that
+  capture against the attested evidence and provenance, regenerates it with
+  the trusted normalizers using the attested evidence's `source_date_epoch`,
+  and refuses any difference, a missing or invalid epoch, or a package file
+  that changes after verification, before the PyPI publish action runs.
+  Compatibility: a release whose attested distributions are not canonical can
+  no longer be published to PyPI.
+- Raw archive admission is stricter for every caller of the shared archive
+  reader. Local ZIP records, including any data descriptor that repeats the
+  central CRC and sizes, must contiguously cover every byte before the central
+  directory, so gaps between records or before the central directory are
+  refused. Gzip input must be exactly one member followed by nothing else:
+  concatenated members (including empty members whose FEXTRA, FNAME or
+  FCOMMENT fields carry data) and trailing bytes are refused, and the member
+  CRC and size are checked. Release inventory and protected handoff admission
+  also require the normalizer's exact gzip header and stored-block
+  serialization.
+- A container credential URL must now name a documented link-local address or
+  a normalized numeric loopback literal (an IPv4 address in `127.0.0.0/8` or
+  exactly `::1`). Host names, including `localhost` over HTTP or HTTPS, are
+  refused before any provider request, because the provider transport would
+  resolve the name without pinning the connection to loopback. Noncanonical,
+  scoped and IPv4-mapped spellings are refused too. Compatibility: replace
+  `localhost` in `AWS_CONTAINER_CREDENTIALS_FULL_URI` with `127.0.0.1` or
+  `[::1]`.
+- The README quick start now installs pip, the build tools and the runtime
+  dependencies only from the repository's hash-locked lockfiles with
+  `--require-hashes --only-binary :all:`, then installs the local project with
+  `--no-build-isolation --no-deps`. It no longer upgrades pip to an unpinned
+  version or lets pip resolve unhashed build and runtime dependencies. The
+  PyPI one-line install is labelled as a non-verified convenience path. An
+  offline test lints the README and CONTRIBUTING install commands.
+
 ### Lambda lost-response recovery and credential-transport admission
 
 - Lambda configuration recovery no longer treats one read of the original
@@ -63,8 +111,8 @@
   - in `pin_session_credentials` before it resolves credentials.
   At each of these points, a non-default `AWS_EC2_METADATA_SERVICE_ENDPOINT`
   (or profile `ec2_metadata_service_endpoint`) and a container credential URL
-  outside `169.254.170.2`, `169.254.170.23`, `fd00:ec2::23` or loopback are
-  refused before any provider or SDK request, so a configured container
+  outside `169.254.170.2`, `169.254.170.23`, `fd00:ec2::23` or a numeric
+  loopback literal (not `localhost`, see above) are refused before any provider or SDK request, so a configured container
   authorization token is not sent to such a host through these paths. The
   policy reads the environment and the session's configuration when each check
   runs. Credentials that a caller resolves directly from its own session,

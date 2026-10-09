@@ -2,13 +2,16 @@
 
 import copy
 import hashlib
+import io
 import json
 import logging
 import re
 import shlex
 import subprocess
 import sys
+import tarfile
 import threading
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -470,12 +473,47 @@ def test_report_disclosure_flags_only_affect_their_typed_fields(
     assert ("additional_info" in details) is diagnostics
 
 
+PUBLISH_EPOCH = 315532800
+
+
+def canonical_package(path):
+    """Write a tiny package normalized by the trusted normalizers."""
+    if path.name.endswith(".whl"):
+        info = "aws_chaos_engineering_framework-2.0.4.dist-info"
+        values = {
+            "aws_chaos_framework.py": b"verified synthetic package bytes\n",
+            f"{info}/METADATA": b"Metadata-Version: 2.4\n",
+            f"{info}/WHEEL": b"Wheel-Version: 1.0\n",
+        }
+        rows = [
+            f"{name},{publish_payload.normalize_wheel.sha256_record_digest(data)},"
+            f"{len(data)}\n"
+            for name, data in values.items()
+        ]
+        values[f"{info}/RECORD"] = ("".join(rows) + f"{info}/RECORD,,\n").encode()
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, data in values.items():
+                archive.writestr(name, data)
+        publish_payload.normalize_wheel.normalize_wheel(path, PUBLISH_EPOCH)
+        return
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        data = b"verified synthetic package bytes\n"
+        member = tarfile.TarInfo("aws_chaos_engineering_framework-2.0.4/PKG-INFO")
+        member.size = len(data)
+        archive.addfile(member, io.BytesIO(data))
+    path.write_bytes(
+        publish_payload.normalize_sdist.build_stored_gzip(raw.getvalue(), PUBLISH_EPOCH)
+    )
+    publish_payload.normalize_sdist.normalize_sdist(path, PUBLISH_EPOCH)
+
+
 def release_fixture(root):
     root.mkdir()
     records = []
     for name in publish_payload.expected_names("v2.0.4"):
-        data = b"verified synthetic package bytes: " + name.encode()
-        (root / name).write_bytes(data)
+        canonical_package(root / name)
+        data = (root / name).read_bytes()
         records.append(
             {
                 "name": name,
@@ -490,6 +528,7 @@ def release_fixture(root):
                 "tag": "v2.0.4",
                 "version": "2.0.4",
                 "source_commit": "a" * 40,
+                "source_date_epoch": PUBLISH_EPOCH,
                 "artifacts": records,
             }
         ),

@@ -2116,20 +2116,31 @@ def harden_session_origin(session: Any) -> Any:
 
 # Credential transports outside the AWS SDK client stack. Only botocore's
 # default IMDS addresses and the documented ECS/EKS container credential
-# addresses (or loopback, which botocore itself admits for plain HTTP) are used.
+# addresses (or a numeric loopback literal) are used. Host names, including
+# ``localhost``, are refused: name resolution is not pinned to loopback.
 DEFAULT_IMDS_ENDPOINTS = frozenset({"http://169.254.169.254", "http://[fd00:ec2::254]"})
 CONTAINER_CREDENTIAL_HOSTS = frozenset(
     {"169.254.170.2", "169.254.170.23", "fd00:ec2::23"}
 )
+IPV6_LOOPBACK = ipaddress.IPv6Address("::1")
 
 
-def _is_loopback_host(host: str) -> bool:
-    if host == "localhost":
-        return True
+def _is_numeric_loopback_literal(host: str) -> bool:
+    """Admit only a normalized IPv4 127.0.0.0/8 literal or exactly ``::1``.
+
+    Names are never resolved here, so a host name such as ``localhost`` is
+    refused rather than trusted by spelling. Noncanonical spellings, scoped
+    and IPv4-mapped IPv6 forms are refused as well.
+    """
     try:
-        return ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
     except ValueError:
         return False
+    if str(address) != host:
+        return False
+    if address.version == 4:
+        return address.is_loopback
+    return address == IPV6_LOOPBACK and address.scope_id is None
 
 
 def require_credential_transport_policy(session: Any) -> None:
@@ -2143,8 +2154,11 @@ def require_credential_transport_policy(session: Any) -> None:
     profile setting) must be the default IPv4 or IPv6 address, and the
     container credential URL (the relative URI joined to 169.254.170.2, or the
     full URI) must use HTTP(S) without userinfo to 169.254.170.2,
-    169.254.170.23, fd00:ec2::23 or a loopback address. Botocore itself admits
-    any HTTPS host for a full URI.
+    169.254.170.23, fd00:ec2::23 or a normalized numeric loopback literal
+    (127.0.0.0/8 or ::1). Host names, including ``localhost``, are refused
+    because the provider transport would resolve them without pinning the
+    connection to loopback. Botocore itself admits ``localhost`` and any HTTPS
+    host for a full URI.
     """
     core = _botocore_core(session)
     endpoint = (
@@ -2170,7 +2184,9 @@ def require_credential_transport_policy(session: Any) -> None:
         or parts.scheme not in {"http", "https"}
         or parts.username is not None
         or parts.password is not None
-        or not (host in CONTAINER_CREDENTIAL_HOSTS or _is_loopback_host(host))
+        or not (
+            host in CONTAINER_CREDENTIAL_HOSTS or _is_numeric_loopback_literal(host)
+        )
     ):
         raise SafetyViolation(
             "Credential resolution refuses a container credential URL outside the "

@@ -106,8 +106,8 @@ SSO credentials keep Kinesis and other services on their regional hosts. Plan
 and live runs, framework client creation (including direct `SafetyController`
 and planning-experiment construction) and `pin_session_credentials` also
 refuse a non-default IMDS endpoint or a container credential URL outside the
-documented link-local and loopback addresses, before any provider or SDK
-request. See
+documented link-local addresses and numeric loopback literals (host names such
+as `localhost` are refused), before any provider or SDK request. See
 [Canonical AWS endpoint origin](security-boundaries.md#canonical-aws-endpoint-origin).
 Controller-only clients without an experiment owner support safety and identity
 reads; they refuse all mutations and account-bound S3 bucket reads. They cannot

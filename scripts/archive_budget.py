@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import gzip
 import io
 import os
 import stat
@@ -83,6 +82,11 @@ def _exact(handle, count):
     return value
 
 
+ZIP_COVERAGE_ERROR = (
+    "ZIP local records do not contiguously cover the bytes before the central directory"
+)
+
+
 def zip_preflight(
     handle, size, max_member_bytes=None, max_expanded_bytes=None, max_members=None
 ):
@@ -125,6 +129,7 @@ def zip_preflight(
     member_limit = _limit(max_member_bytes, MAX_MEMBER_BYTES)
     total_limit = _limit(max_expanded_bytes, MAX_EXPANDED_BYTES)
     total = 0
+    spans = []
     for _ in range(count):
         position = handle.tell()
         require(
@@ -133,7 +138,8 @@ def zip_preflight(
         )
         record = struct.unpack("<4s6H3I5H2I", _exact(handle, 46))
         require(record[0] == b"PK\x01\x02", "ZIP central record is malformed")
-        flags, method, compressed, expanded = record[3], record[4], record[8], record[9]
+        flags, method, checksum = record[3], record[4], record[7]
+        compressed, expanded = record[8], record[9]
         name_size, extra_size, comment_size, member_disk, local_offset = record[
             10:14
         ] + (record[16],)
@@ -175,18 +181,49 @@ def zip_preflight(
         handle.seek(local_offset)
         local = struct.unpack("<4s5H3I2H", _exact(handle, 30))
         require(local[0] == b"PK\x03\x04", "ZIP local record is malformed")
+        local_end = local_offset + 30 + local[9] + local[10] + compressed
         require(
             local[9] <= MAX_NAME_BYTES
             and local[10] <= MAX_METADATA_BYTES
-            and local_offset + 30 + local[9] + local[10] + compressed <= central_offset,
+            and local_end <= central_offset,
             "ZIP local metadata or compressed range exceeds its budget",
         )
+        if flags & 0x08:
+            local_end += _data_descriptor(
+                handle, local_end, central_offset, (checksum, compressed, expanded)
+            )
+        spans.append((local_offset, local_end))
         handle.seek(next_record)
     require(
         handle.tell() == central_offset + central_size,
         "ZIP member count differs from central metadata",
     )
+    # Every raw byte before the central directory must belong to exactly one
+    # admitted local record, so no unparsed gap can carry unreviewed bytes.
+    position = 0
+    for start, end in sorted(spans):
+        require(start == position, ZIP_COVERAGE_ERROR)
+        position = end
+    require(position == central_offset, ZIP_COVERAGE_ERROR)
     handle.seek(0)
+
+
+def _data_descriptor(handle, offset, central_offset, expected):
+    """Return the length of a data descriptor that repeats the central values."""
+    handle.seek(offset)
+    available = min(16, central_offset - offset)
+    require(available >= 12, "ZIP data descriptor is missing or truncated")
+    value = _exact(handle, available)
+    if available == 16 and struct.unpack("<4s3I", value) == (
+        b"PK\x07\x08",
+        *expected,
+    ):
+        return 16
+    require(
+        struct.unpack("<3I", value[:12]) == expected,
+        "ZIP data descriptor differs from its central record",
+    )
+    return 12
 
 
 @contextmanager
@@ -376,23 +413,135 @@ def tar_preflight(raw, stream_size):
     raw.seek(0)
 
 
+GZIP_MAGIC = b"\x1f\x8b\x08"
+GZIP_FHCRC, GZIP_FEXTRA, GZIP_FNAME, GZIP_FCOMMENT = 0x02, 0x04, 0x08, 0x10
+STORED_BLOCK_BYTES = 0xFFFF
+CANONICAL_GZIP_ERROR = "Gzip stream is not the canonical stored-block serialization"
+
+
+def _gzip_bytes(handle, count):
+    """Read a gzip framing field whose length the format itself bounds."""
+    value = handle.read(count)
+    require(len(value) == count, "Gzip member is truncated")
+    return value
+
+
+def _gzip_string(handle, header):
+    """Read one bounded zero-terminated gzip header field."""
+    for _ in range(MAX_NAME_BYTES + 1):
+        value = _gzip_bytes(handle, 1)
+        header.append(value)
+        if value == b"\x00":
+            return
+    raise ArchiveBudgetError("Gzip header field exceeds its byte budget")
+
+
+def _gzip_header(handle):
+    """Parse one RFC 1952 member header; return its fixed ten bytes."""
+    fixed = _gzip_bytes(handle, 10)
+    require(
+        fixed[:3] == GZIP_MAGIC and fixed[3] & 0xE0 == 0,
+        "Gzip header is malformed or uses reserved flags",
+    )
+    flags = fixed[3]
+    header = [fixed]
+    if flags & GZIP_FEXTRA:
+        size = _gzip_bytes(handle, 2)
+        header += [size, _gzip_bytes(handle, struct.unpack("<H", size)[0])]
+    for flag in (GZIP_FNAME, GZIP_FCOMMENT):
+        if flags & flag:
+            _gzip_string(handle, header)
+    if flags & GZIP_FHCRC:
+        require(
+            struct.unpack("<H", _gzip_bytes(handle, 2))[0]
+            == zlib.crc32(b"".join(header)) & 0xFFFF,
+            "Gzip header checksum is invalid",
+        )
+    return fixed
+
+
+def _gunzip_one_member(compressed, raw, limit):
+    """Decode exactly one gzip member; refuse concatenated or trailing bytes."""
+    fixed = _gzip_header(compressed)
+    decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+    pending = b""
+    total = crc = 0
+    while not decoder.eof:
+        if not pending:
+            pending = compressed.read(CHUNK_BYTES)
+            require(pending, "Gzip member is truncated")
+        chunk = decoder.decompress(pending, CHUNK_BYTES)
+        pending = decoder.unconsumed_tail
+        total += len(chunk)
+        require(
+            total <= limit,
+            "TAR stream exceeds decoded archive budget (expanded bytes or compression ratio)",
+        )
+        crc = zlib.crc32(chunk, crc)
+        raw.write(chunk)
+    # unused_data plus at most nine more bytes: exactly eight means the member
+    # trailer ends the file, with no further gzip member or trailing data.
+    trailer = decoder.unused_data + compressed.read(9)
+    require(
+        len(trailer) == 8,
+        "Gzip input must be exactly one member with no trailing bytes",
+    )
+    require(
+        struct.unpack("<2I", trailer) == (crc & 0xFFFFFFFF, total & 0xFFFFFFFF),
+        "Gzip member checksum or size is invalid",
+    )
+    return fixed, total
+
+
+def _require_canonical_gzip(fixed, compressed, size, raw):
+    """Require the normalizer's exact header and stored-block serialization."""
+    require(
+        fixed[3] == 0 and fixed[8:] == b"\x00\xff",
+        "Gzip header is not canonical",
+    )
+    compressed.seek(10)
+    raw.seek(0)
+    block = raw.read(STORED_BLOCK_BYTES)
+    if not block:
+        require(
+            _gzip_bytes(compressed, 5) == b"\x01\x00\x00\xff\xff", CANONICAL_GZIP_ERROR
+        )
+    while block:
+        following = raw.read(STORED_BLOCK_BYTES)
+        expected = (
+            (0 if following else 1).to_bytes(1, "little")
+            + len(block).to_bytes(2, "little")
+            + (len(block) ^ 0xFFFF).to_bytes(2, "little")
+            + block
+        )
+        require(compressed.read(len(expected)) == expected, CANONICAL_GZIP_ERROR)
+        block = following
+    require(compressed.tell() == size - 8, CANONICAL_GZIP_ERROR)
+    raw.seek(0)
+
+
 @contextmanager
-def open_tar(path, error_type=ArchiveBudgetError, *, max_stream_bytes=None):
+def open_tar(
+    path,
+    error_type=ArchiveBudgetError,
+    *,
+    max_stream_bytes=None,
+    canonical_gzip=False,
+):
+    """Admit one gzip member, then bounded TAR metadata, before tarfile parsing.
+
+    With ``canonical_gzip`` the raw gzip bytes must also be exactly the
+    trusted normalizer's header and stored-block serialization.
+    """
     try:
         with snapshot(path) as (compressed, size), tempfile.TemporaryFile() as raw:
             limit = min(
                 _limit(max_stream_bytes, MAX_STREAM_BYTES), max(1, size) * MAX_RATIO
             )
-            total = 0
-            with gzip.GzipFile(fileobj=compressed) as decoder:
-                while chunk := decoder.read(min(CHUNK_BYTES, limit - total + 1)):
-                    total += len(chunk)
-                    require(
-                        total <= limit,
-                        "TAR stream exceeds decoded archive budget (expanded bytes or compression ratio)",
-                    )
-                    raw.write(chunk)
+            fixed, total = _gunzip_one_member(compressed, raw, limit)
             tar_preflight(raw, total)
+            if canonical_gzip:
+                _require_canonical_gzip(fixed, compressed, size, raw)
             with tarfile.open(fileobj=raw, mode="r:") as archive:
                 yield archive
     except ArchiveBudgetError as error:
