@@ -336,18 +336,35 @@ def _verify_package_metadata(
         raise ValueError("project dependencies differ from the reviewed requirements")
 
 
+def _one_line(value: object) -> str:
+    """Render archive-controlled values without terminal or line controls."""
+    return ascii(value)
+
+
+def _assert_safe_archive_name(name: str) -> None:
+    if any(
+        ord(char) < 32 or 127 <= ord(char) < 160 or char in "\u2028\u2029"
+        for char in name
+    ):
+        raise ValueError(
+            f"archive member name contains a control character: {_one_line(name)}"
+        )
+
+
 def _assert_safe_names(names: list[str]) -> None:
+    for name in names:
+        _assert_safe_archive_name(name)
     if len(names) != len(set(names)):
         raise ValueError("archive contains duplicate paths")
     for name in names:
         path = PurePosixPath(name)
         if path.is_absolute() or ".." in path.parts:
-            raise ValueError(f"archive contains an unsafe path: {name}")
+            raise ValueError(f"archive contains an unsafe path: {_one_line(name)}")
         lower_name = name.lower()
         if any(lower_name.endswith(suffix) for suffix in BLOCKED_SUFFIXES):
-            raise ValueError(f"archive contains a blocked file type: {name}")
+            raise ValueError(f"archive contains a blocked file type: {_one_line(name)}")
         if "__pycache__" in path.parts:
-            raise ValueError(f"archive contains a Python cache: {name}")
+            raise ValueError(f"archive contains a Python cache: {_one_line(name)}")
 
 
 def _runtime_requirements(requirements_path: Path) -> set[str]:
@@ -424,7 +441,11 @@ def validate_entry_points(entry_points: str, repository_root: Path) -> None:
 def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None:
     project = _approved_project(repository_root)
     with archive_budget.open_zip(wheel_path) as archive:
-        names = archive.namelist()
+        members = archive.infolist()
+        for member in members:
+            _assert_safe_archive_name(member.orig_filename)
+            _assert_safe_archive_name(member.filename)
+        names = [member.filename for member in members]
         _assert_safe_names(names)
         info = f"aws_chaos_engineering_framework-{version}.dist-info/"
         allowed = {MODULE_NAME} | {
@@ -440,7 +461,9 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
         }
         unexpected = set(names) - allowed
         if unexpected:
-            raise ValueError(f"wheel contains unreviewed files: {sorted(unexpected)}")
+            raise ValueError(
+                f"wheel contains unreviewed files: {_one_line(sorted(unexpected))}"
+            )
         if set(names) != allowed:
             raise ValueError("wheel is missing canonical metadata members")
         members = archive.infolist()
@@ -464,7 +487,7 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
         executable_python = [name for name in names if name.endswith(".py")]
         if executable_python != [MODULE_NAME]:
             raise ValueError(
-                f"wheel has unexpected Python modules: {executable_python}"
+                f"wheel has unexpected Python modules: {_one_line(executable_python)}"
             )
 
         metadata_names = [
@@ -480,9 +503,13 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
 
         metadata = email.message_from_bytes(values[metadata_names[0]])
         if metadata.get("Name") != PROJECT_NAME:
-            raise ValueError(f"unexpected project name: {metadata.get('Name')}")
+            raise ValueError(
+                f"unexpected project name: {_one_line(metadata.get('Name'))}"
+            )
         if metadata.get("Version") != version:
-            raise ValueError(f"unexpected project version: {metadata.get('Version')}")
+            raise ValueError(
+                f"unexpected project version: {_one_line(metadata.get('Version'))}"
+            )
         python_specifiers = {
             value.strip()
             for value in (metadata.get("Requires-Python") or "").split(",")
@@ -490,7 +517,7 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
         }
         if python_specifiers != {">=3.10", "<3.15"}:
             raise ValueError(
-                f"unexpected Python range: {metadata.get('Requires-Python')}"
+                f"unexpected Python range: {_one_line(metadata.get('Requires-Python'))}"
             )
         if set(metadata.get_all("Requires-Dist", [])) != _runtime_requirements(
             repository_root / "requirements.txt"
@@ -535,6 +562,7 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
     with archive_budget.open_tar(sdist_path) as archive:
         budget = archive_budget.MemberBudget()
         for member in archive:
+            _assert_safe_archive_name(member.name)
             names.append(member.name)
             if len(names) > 128:
                 raise ValueError("source distribution exceeds the member budget")
@@ -556,7 +584,8 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
             relative = canonical[len(root) + 1 :]
             if relative not in expected_files:
                 raise ValueError(
-                    f"source distribution contains an unreviewed file: {relative}"
+                    "source distribution contains an unreviewed file: "
+                    f"{_one_line(relative)}"
                 )
             if member.mode != 0o644 or not 0 <= member.size <= 8_388_608:
                 raise ValueError("source distribution has unsafe mode or size")
@@ -575,7 +604,8 @@ def _verify_sdist(sdist_path: Path, repository_root: Path) -> None:
                 repository_root, relative
             ):
                 raise ValueError(
-                    f"source distribution content differs from the repository: {relative}"
+                    "source distribution content differs from the repository: "
+                    f"{_one_line(relative)}"
                 )
             values[relative] = contents
     _assert_safe_names(names)
@@ -632,9 +662,12 @@ def main() -> None:
         args.repository_root or Path(__file__).resolve().parents[1]
     ).absolute()
     wheel, sdist = verify_distribution(args.dist_dir.resolve(), repository_root)
-    print(f"Verified {wheel.name}")
-    print(f"Verified {sdist.name}")
+    print(f"Verified {_one_line(wheel.name)}")
+    print(f"Verified {_one_line(sdist.name)}")
+
+
+run_with_actions_command_guard = archive_budget.run_with_actions_command_guard
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(run_with_actions_command_guard(main))

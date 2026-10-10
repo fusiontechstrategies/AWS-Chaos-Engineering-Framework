@@ -732,4 +732,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_verifier_module.run_with_actions_command_guard(main))

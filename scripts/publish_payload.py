@@ -40,6 +40,7 @@ def _load_trusted_helper(name: str):
 
 normalize_wheel = _load_trusted_helper("normalize_wheel")
 normalize_sdist = _load_trusted_helper("normalize_sdist")
+archive_budget = _load_trusted_helper("archive_budget")
 
 
 def expected_names(tag: str) -> set[str]:
@@ -353,4 +354,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(archive_budget.run_with_actions_command_guard(main))
