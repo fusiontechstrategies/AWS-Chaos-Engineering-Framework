@@ -221,9 +221,13 @@ def offline_profile_aws(monkeypatch, tmp_path, provider=None):
 
     def session_factory(**kwargs):
         core = botocore.session.Session()
-        if provider is not None:
-            core.get_component("credential_provider").insert_before("env", provider)
         session = real_session(botocore_session=core, **kwargs)
+        # Hardened before the custom provider builds the credential resolver,
+        # which then omits the env provider for the explicit profile; the
+        # custom provider still leads the chain.
+        framework.harden_session_origin(session)
+        if provider is not None:
+            core.get_component("credential_provider").providers.insert(0, provider)
         session.events.register("before-send", offline)
         return session
 

@@ -95,6 +95,7 @@ APPROVED_SOURCE_PATHS = frozenset(
         "tests/test_final_cloud_c14_release_admission.py",
         "tests/test_final_cloud_c16_planning_only.py",
         "tests/test_final_cloud_c18_regressions.py",
+        "tests/test_final_cloud_c19_regressions.py",
         "tests/test_final_cloud_eight_recovery_controls.py",
         "tests/test_final_cloud_eight_scope_controls.py",
         "tests/test_final_cloud_six_controls.py",

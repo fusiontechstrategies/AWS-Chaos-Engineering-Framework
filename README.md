@@ -240,6 +240,17 @@ its handler and recovery lifecycle; premature or reentrant recovery is refused.
 Raw client mutations are refused. Legacy EC2 SSM shell faults
 are disabled; FIS remains planning only.
 
+Direct library use requires an origin-hardened session. Create the session and
+harden it before botocore initializes its credential or token providers, then
+pass it on:
+`SafetyController(config, harden_session_origin(boto3.Session(profile_name=...)), region, False)`.
+`SafetyController` construction, `origin_bound_client` and every experiment
+constructor raise `SafetyViolation` for a boto3 session that
+`harden_session_origin` has not marked, before any credential or token is
+resolved, and `harden_session_origin` refuses a session whose credential or
+token provider was already initialized. A session object without a botocore
+core (a test double) remains accepted.
+
 Direct handler calls redact their own targets without the CLI. Each public
 handler call registers the identifiers bound by the experiment configuration
 and call arguments, and the experiment instance keeps an append-only set of

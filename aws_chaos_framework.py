@@ -1728,10 +1728,7 @@ def pin_session_credentials(
     session, so the profile's provider chain is never consulted and nothing
     refreshes them.
     """
-    if _botocore_core(session) is not None and not is_origin_hardened(session):
-        raise SafetyViolation(
-            "Credentials must be resolved from an origin-hardened AWS session"
-        )
+    require_origin_hardened_session(session)
     # Resolution may reach the raw IMDS or container provider transports.
     require_credential_transport_policy(session)
     credentials = session.get_credentials()
@@ -2026,11 +2023,15 @@ def origin_bound_client(session: Any, service: str, region: str, config: Any) ->
     AWS_ENDPOINT_URL and AWS_ENDPOINT_URL_<SERVICE>) are ignored, and the
     client is bound to botocore's canonical host for its partition, service,
     region and approved FIPS choice. Identity and ownership responses therefore
-    come only from AWS; response-owner checks remain as defence in depth.
+    come only from AWS; response-owner checks remain as defence in depth. A
+    botocore-backed session must already be origin-hardened.
     """
-    # Creating a client resolves credentials, possibly through the raw IMDS or
-    # container provider transports, for every caller including direct library
+    # Creating a client resolves credentials. Provider-created SDK clients are
+    # bound only on an origin-hardened session, so any other botocore-backed
+    # session is refused first, for every caller including direct library
     # construction of a SafetyController or experiment.
+    require_origin_hardened_session(session)
+    # Resolution may also reach the raw IMDS or container provider transports.
     require_credential_transport_policy(session)
     use_fips = configured_fips_endpoint(session)
     parents, hosts = canonical_endpoint_origin(service, region, use_fips)
@@ -2064,6 +2065,37 @@ def is_origin_hardened(session: Any) -> bool:
     return core is not None and core in _HARDENED_CORES
 
 
+def require_origin_hardened_session(session: Any) -> None:
+    """Refuse a botocore-backed session that harden_session_origin has not marked.
+
+    This is the direct-library session contract. Resolving credentials or
+    tokens can create assume-role, web-identity, SSO, SSO-OIDC and login
+    provider clients from the session, and only a hardened session binds
+    them, so the check runs before the session is stored or used and before
+    any credential is resolved. A session object without a botocore core (a
+    test double) has no provider chain and is admitted; its clients are still
+    bound by origin_bound_client.
+    """
+    if _botocore_core(session) is not None and not is_origin_hardened(session):
+        raise SafetyViolation(
+            "Credentials must be resolved from an origin-hardened AWS session"
+        )
+
+
+def _credential_resolver_built(core: Any) -> bool:
+    """Return whether botocore already built a credential or token provider.
+
+    The SSO and login providers capture the session's ``create_client`` when
+    the credential resolver is built. The separate token provider can cache
+    an SSO-OIDC client. Either provider built before hardening can retain an
+    unwrapped client creator. An uninspectable component store counts as built.
+    """
+    built = getattr(getattr(core, "_components", None), "_components", None)
+    return not isinstance(built, dict) or any(
+        name in built for name in ("credential_provider", "token_provider")
+    )
+
+
 def harden_session_origin(session: Any) -> Any:
     """Bind every client a botocore session creates, including credential providers.
 
@@ -2081,10 +2113,17 @@ def harden_session_origin(session: Any) -> Any:
     explicit ``endpoint_url`` is refused. The same settings are also set
     session-wide as defence in depth. A session object without a botocore core
     has no provider chain; its clients are still bound by origin_bound_client.
+    A session whose credential resolver or token provider was already built
+    is refused rather than marked: either can retain an unwrapped provider
+    client creator.
     """
     core = _botocore_core(session)
     if core is None or is_origin_hardened(session):
         return session
+    if _credential_resolver_built(core):
+        raise SafetyViolation(
+            "An AWS session must be origin-hardened before its credential or token providers are initialized"
+        )
     use_fips = configured_fips_endpoint(session)
     for name, value in (*SESSION_ORIGIN_SETTINGS, ("use_fips_endpoint", use_fips)):
         core.set_config_variable(name, value)
@@ -2714,6 +2753,8 @@ class SafetyController:
         live: bool,
         expected_account: str | None = None,
     ):
+        # Direct-library callers pass harden_session_origin(boto3.Session(...)).
+        require_origin_hardened_session(session)
         self.config = config
         self.expected_account = expected_account
         self.session = session
@@ -2738,6 +2779,7 @@ class SafetyController:
         region_name: str | None = None,
     ) -> AwsClientProxy:
         """Return a cached, origin-bound SDK client wrapped with mutation tracking."""
+        require_origin_hardened_session(self.session)
         client_region = region_name or self.region
         key = (service, client_region)
         with self._client_lock:
@@ -3707,6 +3749,7 @@ class ChaosExperiment:
             setattr(cls, name, _scope_public_method(cls.__dict__[name]))
 
     def __init__(self, config: dict[str, Any], safety_controller: SafetyController):
+        require_origin_hardened_session(getattr(safety_controller, "session", None))
         creation = getattr(safety_controller, "_execution_creation", None)
         grant = getattr(creation, "grant", None)
         if config.get("dry_run", True) is not True:
