@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -549,4 +550,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    budget_path = Path(__file__).resolve().with_name("archive_budget.py")
+    budget_spec = importlib.util.spec_from_file_location(
+        "trusted_archive_budget", budget_path
+    )
+    if budget_spec is None or budget_spec.loader is None:
+        raise ImportError("Trusted archive budget helper is unavailable")
+    budget = importlib.util.module_from_spec(budget_spec)
+    budget_spec.loader.exec_module(budget)
+    raise SystemExit(budget.run_with_actions_command_guard(main))

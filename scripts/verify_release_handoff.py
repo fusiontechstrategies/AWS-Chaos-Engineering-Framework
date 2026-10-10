@@ -171,4 +171,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    verifier = load_trusted_helper("verify_distribution")
+    raise SystemExit(verifier.run_with_actions_command_guard(main))

@@ -197,8 +197,10 @@ python -m ruff format --check .
 python -m ruff check .
 python -m pytest -q
 python -m bandit -q -r .\aws_chaos_framework.py
-python -m pip_audit -r .\requirements.txt
+python -m pip_audit -r .\requirements-runtime-lock.txt --require-hashes --disable-pip --progress-spinner off
 ```
+
+Audit the committed, hashed runtime lock. `requirements.txt` lists direct dependencies and must not be used as an audit lock.
 
 CI runs the test suite across supported Python versions and validates Python 3.12 on Windows and macOS. The release-candidate job builds normalized wheel and source archives twice, requires byte-identical results, installs each package independently, and preserves the exact six-file candidate as workflow evidence. CodeQL, Semgrep, Trivy, dependency auditing, secret scanning, and Dependabot are configured for the public repository.
 

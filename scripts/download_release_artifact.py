@@ -254,4 +254,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(archive_budget.run_with_actions_command_guard(main))

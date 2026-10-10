@@ -28,8 +28,10 @@ python -m ruff format --check .
 python -m ruff check .
 python -m pytest -q
 python -m bandit -q -r .\aws_chaos_framework.py
-python -m pip_audit -r .\requirements.txt
+python -m pip_audit -r .\requirements-runtime-lock.txt --require-hashes --disable-pip --progress-spinner off
 ```
+
+Audit the committed, hashed runtime lock. `requirements.txt` lists direct dependencies and must not be used as an audit lock.
 
 ## Adding or changing an experiment
 

@@ -277,9 +277,9 @@ def main() -> int:
     parser.add_argument("--source-date-epoch", required=True, type=int)
     arguments = parser.parse_args()
     digest = normalize_wheel(arguments.path, arguments.source_date_epoch)
-    print(f"Normalized {arguments.path.name}: sha256:{digest}")
+    print(f"Normalized {ascii(arguments.path.name)}: sha256:{digest}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(archive_budget.run_with_actions_command_guard(main))

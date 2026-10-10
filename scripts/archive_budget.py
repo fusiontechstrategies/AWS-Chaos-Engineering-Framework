@@ -5,10 +5,13 @@ from __future__ import annotations
 import csv
 import io
 import os
+import secrets
 import stat
 import struct
+import sys
 import tarfile
 import tempfile
+import traceback
 import zipfile
 import zlib
 from contextlib import contextmanager
@@ -28,6 +31,29 @@ MAX_RATIO = 200
 
 class ArchiveBudgetError(ValueError):
     """An archive exceeds the reviewed resource or format boundary."""
+
+
+def run_with_actions_command_guard(run):
+    """Keep archive CLI output inside a suspended Actions command channel."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return run()
+    sys.stdout.flush()
+    token = secrets.token_hex(32)
+    print(f"::stop-commands::{token}", file=sys.stderr, flush=True)
+    try:
+        try:
+            return run()
+        except SystemExit as error:
+            if isinstance(error.code, str):
+                print(error.code, file=sys.stderr, flush=True)
+                return 1
+            return error.code or 0
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            return 1
+    finally:
+        sys.stdout.flush()
+        print(f"::{token}::", file=sys.stderr, flush=True)
 
 
 def require(condition, message):
@@ -85,6 +111,18 @@ def _exact(handle, count):
 ZIP_COVERAGE_ERROR = (
     "ZIP local records do not contiguously cover the bytes before the central directory"
 )
+
+
+def _assert_no_unicode_path_extra(extra):
+    """Refuse path rewriting before ZipFile sanitizes a Unicode Path value."""
+    offset = 0
+    while offset < len(extra):
+        require(offset + 4 <= len(extra), "ZIP extra metadata is malformed")
+        kind, length = struct.unpack_from("<HH", extra, offset)
+        offset += 4
+        require(offset + length <= len(extra), "ZIP extra metadata is malformed")
+        require(kind != 0x7075, "ZIP Unicode Path metadata is unsupported")
+        offset += length
 
 
 def zip_preflight(
@@ -178,6 +216,15 @@ def zip_preflight(
             next_record <= central_offset + central_size,
             "ZIP central metadata is truncated",
         )
+        # Check the bytes before ZipFile can truncate at NUL or apply a
+        # Unicode-path extra field to its public filename.
+        handle.seek(position + 46)
+        central_name = _exact(handle, name_size)
+        require(
+            not any(byte < 32 or byte == 127 for byte in central_name),
+            "ZIP member name contains a control character",
+        )
+        _assert_no_unicode_path_extra(_exact(handle, extra_size))
         handle.seek(local_offset)
         local = struct.unpack("<4s5H3I2H", _exact(handle, 30))
         require(local[0] == b"PK\x03\x04", "ZIP local record is malformed")
@@ -188,6 +235,12 @@ def zip_preflight(
             and local_end <= central_offset,
             "ZIP local metadata or compressed range exceeds its budget",
         )
+        local_name = _exact(handle, local[9])
+        require(
+            local_name == central_name,
+            "ZIP local member name differs from its central record",
+        )
+        _assert_no_unicode_path_extra(_exact(handle, local[10]))
         if flags & 0x08:
             local_end += _data_descriptor(
                 handle, local_end, central_offset, (checksum, compressed, expanded)
