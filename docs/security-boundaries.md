@@ -582,6 +582,25 @@ SDK client involved in a run, in live and plan mode, is origin-bound:
   config's `region_name`, else the session region, as botocore resolves it);
   an explicit `endpoint_url` is refused. The settings below are also set
   session-wide. Credentials are frozen only from a hardened session.
+- Direct-library session contract. A caller-supplied session must already be
+  hardened: create it, pass it to `harden_session_origin` before botocore
+  initializes its credential or token providers, then hand it to
+  `SafetyController`. Construction
+  refuses a boto3 session with a botocore core that is not marked
+  origin-hardened, before the session is stored or any credential or token is
+  resolved, so an assume-role (including its ExternalId), web-identity, SSO,
+  SSO-OIDC or login provider request never honours a configured endpoint.
+  `origin_bound_client`, which creates every framework client, applies the
+  same check before creating a client or running the credential transport
+  policy, and every experiment constructor checks its controller's session,
+  so a direct factory call or a session replaced after construction is
+  refused the same way. `harden_session_origin` refuses a session whose
+  credential resolver or token provider was already built: SSO and login
+  providers can capture an unwrapped `create_client`, while the token provider
+  can cache an unwrapped SSO-OIDC client. Such a session cannot be hardened in
+  place, and a new one must be created. A session object
+  without a botocore core (a test double) has no provider chain and is still
+  accepted; its clients are bound by `origin_bound_client`.
 - Configured endpoint URLs are ignored (`ignore_configured_endpoint_urls`):
   profile `endpoint_url`, `services` sections, `AWS_ENDPOINT_URL` and
   `AWS_ENDPOINT_URL_<SERVICE>`. Dual-stack, S3 accelerate and S3 dual-stack are

@@ -2,6 +2,28 @@
 
 ## Unreleased security follow-ups
 
+### Origin-hardened direct-library sessions
+
+- Direct library planning now requires an origin-hardened session.
+  `SafetyController` construction refuses a boto3 session with a botocore
+  core that `harden_session_origin` has not marked, before the session is
+  stored and before any credential or token is resolved. Previously a
+  caller-created session was kept as is, and the first framework client could
+  resolve assume-role (with its ExternalId), web-identity, SSO, SSO-OIDC
+  refresh or login credentials through provider clients that still honoured a
+  configured profile `endpoint_url` or `AWS_ENDPOINT_URL*` override.
+  `origin_bound_client`, which creates every framework client, applies the
+  same check before any credential resolution, and every experiment
+  constructor checks its controller's session, so a direct factory call or a
+  session replaced after construction is refused too.
+- `harden_session_origin` refuses a session whose credential resolver or token
+  provider was already built. SSO and login providers can capture an unwrapped
+  `create_client`, and the token provider can cache an unwrapped SSO-OIDC
+  client. Create a new session and harden it before either provider is built.
+- Compatibility: pass `harden_session_origin(boto3.Session(...))` to
+  `SafetyController`, as `ChaosOrchestrator` already does. A session object
+  without a botocore core (a test double) is still accepted.
+
 ### Canonical release bytes, numeric loopback credential URLs and hash-locked setup
 
 - Protected release promotion now binds every raw wheel and sdist byte, not

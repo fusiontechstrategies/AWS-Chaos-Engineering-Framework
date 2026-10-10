@@ -501,7 +501,9 @@ def test_canonical_commercial_govcloud_china_and_fips_origins_are_bound(
         raise Delivered(request.url)
 
     session.events.register("before-send", offline)
-    client = framework.origin_bound_client(session, service, region, Config())
+    client = framework.origin_bound_client(
+        framework.harden_session_origin(session), service, region, Config()
+    )
     operation = {
         "sts": "get_caller_identity",
         "ec2": "describe_vpcs",
@@ -1452,7 +1454,11 @@ def resolve_through_direct_entry(entry: str) -> str:
         else:
             # A caller-supplied session, exactly as direct library planning uses it.
             controller = framework.SafetyController(
-                {}, session, PROFILE_REGION, False, expected_account=ACCOUNT_ID
+                {},
+                framework.harden_session_origin(session),
+                PROFILE_REGION,
+                False,
+                expected_account=ACCOUNT_ID,
             )
             if entry == "safety-controller":
                 controller.client("sts")
@@ -1563,14 +1569,34 @@ def test_account_bearing_credentials_keep_kinesis_on_the_canonical_host(
 def test_origin_bound_client_disables_account_endpoints_without_session_hardening(
     tmp_path, monkeypatch
 ):
-    # The per-client setting alone keeps the host canonical, independent of the
-    # session-wide defence-in-depth settings.
+    # An unhardened real session could resolve credentials through unbound
+    # provider clients, so the factory refuses it before any request.
     session, sent = kinesis_session(monkeypatch, tmp_path)
     assert not framework.is_origin_hardened(session)
-    client = framework.origin_bound_client(session, "kinesis", "us-east-1", Config())
+    with pytest.raises(framework.SafetyViolation, match="origin-hardened"):
+        framework.origin_bound_client(session, "kinesis", "us-east-1", Config())
+    assert sent == []
+    # The per-client setting alone keeps the host canonical, independent of the
+    # session-wide defence-in-depth settings: a test double without a botocore
+    # core delegates to the same unhardened session, whose session-wide account
+    # endpoint mode is botocore's default.
+    double = SimpleNamespace(client=session.client)
+    assert session._session.get_config_variable("account_id_endpoint_mode") == (
+        "preferred"
+    )
+    client = framework.origin_bound_client(double, "kinesis", "us-east-1", Config())
+    assert client.meta.config.account_id_endpoint_mode == "disabled"
     with pytest.raises(Delivered):
         client.describe_stream(StreamName="chaos-test-stream")
     assert sent == ["kinesis.us-east-1.amazonaws.com"]
+    # A hardened session produces a client with the same per-client setting.
+    hardened, hardened_sent = kinesis_session(monkeypatch, tmp_path)
+    framework.harden_session_origin(hardened)
+    client = framework.origin_bound_client(hardened, "kinesis", "us-east-1", Config())
+    assert client.meta.config.account_id_endpoint_mode == "disabled"
+    with pytest.raises(Delivered):
+        client.describe_stream(StreamName="chaos-test-stream")
+    assert hardened_sent == ["kinesis.us-east-1.amazonaws.com"]
 
 
 def test_default_account_endpoint_mode_selects_a_host_outside_the_canonical_set(

@@ -896,7 +896,11 @@ def test_botocore_region_redirect_of_lifecycle_write_is_refused(monkeypatch, red
         region_name=REGION,
     )
     controller = framework.SafetyController(
-        {}, session, REGION, True, expected_account=ACCOUNT_ID
+        {},
+        framework.harden_session_origin(session),
+        REGION,
+        True,
+        expected_account=ACCOUNT_ID,
     )
     # The signing guard is installed on the cached SDK client itself, so it
     # also binds S3 writes that do not pass through an experiment owner.
