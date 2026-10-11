@@ -2207,8 +2207,11 @@ def require_credential_transport_policy(session: Any) -> None:
     169.254.170.23, fd00:ec2::23 or a normalized numeric loopback literal
     (127.0.0.0/8 or ::1). Host names, including ``localhost``, are refused
     because the provider transport would resolve them without pinning the
-    connection to loopback. Botocore itself admits ``localhost`` and any HTTPS
-    host for a full URI.
+    connection to loopback. Plain HTTP loopback is also refused when either
+    container authorization-token setting is present: another local process
+    could own that TCP port and receive the bearer token. HTTPS loopback
+    remains subject to botocore's certificate verification. Botocore itself
+    admits ``localhost`` and any HTTPS host for a full URI.
     """
     core = _botocore_core(session)
     endpoint = (
@@ -2241,6 +2244,18 @@ def require_credential_transport_policy(session: Any) -> None:
         raise SafetyViolation(
             "Credential resolution refuses a container credential URL outside the "
             "documented link-local and loopback addresses"
+        )
+    if (
+        parts.scheme == "http"
+        and _is_numeric_loopback_literal(host)
+        and (
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN" in os.environ
+            or "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" in os.environ
+        )
+    ):
+        raise SafetyViolation(
+            "Credential resolution refuses token-bearing plaintext loopback "
+            "container credentials"
         )
 
 
