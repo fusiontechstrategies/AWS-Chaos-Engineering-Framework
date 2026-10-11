@@ -165,6 +165,8 @@ EC2 termination is planning only: AWS cannot bind a termination request to the r
 ## Evidence and privacy
 
 Each suite creates an atomic JSON report in `chaos-reports/` unless another output directory is selected. Reports include mode, framework version, action status, duration, mutation attempts, rollback attempts, and recovery outcomes.
+On POSIX systems, report output requires a directory owned by the current user and rejects shared group- or other-writable directories without sticky-bit protection. Report publication verifies that the final file is the exact private temporary file written by the framework; a changed file identity fails without announcing a saved report.
+On Windows, reports are stored in a fresh private directory directly under the user's profile. The chosen `--output-dir` is not used as a publication path on Windows, because a previously shared directory may retain open writer handles even after its access list is narrowed. A requested directory equal to or containing the profile is refused because it would overlap the private publication anchor. The actual report path is returned and logged. The framework creates the private directory with a protected access list from inception, rejects reparse points in its path, and checks the temporary file's access list before publication.
 
 By default, reports omit AWS identity and resource identifiers. These fields can be enabled separately:
 

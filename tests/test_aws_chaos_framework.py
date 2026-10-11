@@ -1273,12 +1273,12 @@ def test_runtime_text_redacts_arns_accounts_and_access_keys() -> None:
 
 def test_atomic_report_write_refuses_overwrite(tmp_path: Path) -> None:
     report = tmp_path / "report.json"
-    framework.atomic_write_json(report, {"safe": True})
+    published = framework.atomic_write_json(report, {"safe": True})
 
     with pytest.raises(FileExistsError):
         framework.atomic_write_json(report, {"safe": False})
 
-    assert json.loads(report.read_text(encoding="utf-8")) == {"safe": True}
+    assert json.loads(published.read_text(encoding="utf-8")) == {"safe": True}
 
 
 def test_evidence_report_redacts_identity_and_targets_by_default(
