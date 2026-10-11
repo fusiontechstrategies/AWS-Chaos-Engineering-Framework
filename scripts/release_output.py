@@ -530,22 +530,42 @@ class OwnedOutput:
                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                         dir_fd=self.parent_fd,
                     )
-                    self.private_fds[name] = fd
-                    opened = os.fstat(fd)
-                    named = os.stat(name, dir_fd=self.parent_fd, follow_symlinks=False)
-                    if (
-                        not stat.S_ISDIR(opened.st_mode)
-                        or opened.st_uid != os.geteuid()
-                        or opened.st_mode & 0o077
-                        or (opened.st_dev, opened.st_ino)
-                        != (named.st_dev, named.st_ino)
-                    ):
-                        raise PermissionError("Private release directory changed")
-                    return self.path.parent / name
+                    retained = None
+                    try:
+                        opened = os.fstat(fd)
+                        named = os.stat(
+                            name, dir_fd=self.parent_fd, follow_symlinks=False
+                        )
+                        if (
+                            not stat.S_ISDIR(opened.st_mode)
+                            or opened.st_uid != os.geteuid()
+                            or opened.st_mode & 0o077
+                            or (opened.st_dev, opened.st_ino)
+                            != (named.st_dev, named.st_ino)
+                        ):
+                            raise PermissionError("Private release directory changed")
+                        private = self.path.parent / name
+                        # Register the publication descriptor before closing
+                        # the validation descriptor, so either close failure
+                        # still has an explicit owner and cleanup path.
+                        retained = os.dup(fd)
+                        self.private_fds[name] = retained
+                        return private
+                    except BaseException:
+                        if retained is not None:
+                            self.private_fds.pop(name, None)
+                            to_close, retained = retained, None
+                            os.close(to_close)
+                        raise
+                    finally:
+                        try:
+                            os.close(fd)
+                        except BaseException:
+                            if retained is not None:
+                                self.private_fds.pop(name, None)
+                                os.close(retained)
+                            raise
                 except BaseException:
-                    fd = self.private_fds.pop(name, None)
-                    if fd is not None:
-                        os.close(fd)
                     os.rmdir(name, dir_fd=self.parent_fd)
                     raise
             raise FileExistsError("Could not allocate private release directory")
