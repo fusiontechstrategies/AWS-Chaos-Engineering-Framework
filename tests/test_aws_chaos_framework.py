@@ -238,6 +238,7 @@ class FakeAWS:
                 "MountTargets": [
                     {
                         "MountTargetId": "fsmt-0123456789abcdef0",
+                        "NetworkInterfaceId": "eni-0123456789abcdef0",
                         "FileSystemId": "fs-0123456789abcdef0",
                         "SubnetId": "subnet-0123456789abcdef0",
                         "IpAddress": "10.20.1.10",
@@ -777,7 +778,8 @@ def action_configs() -> dict[framework.ChaosType, dict[str, Any]]:
             "provisioned_throughput": 1.0,
         },
         framework.ChaosType.EFS_MOUNT_TARGET_DELETE: {
-            "mount_target_id": "fsmt-0123456789abcdef0"
+            "mount_target_id": "fsmt-0123456789abcdef0",
+            "network_interface_id": "eni-0123456789abcdef0",
         },
         framework.ChaosType.VPC_SUBNET_ACL_MODIFY: {
             "subnet_id": "subnet-0123456789abcdef0",

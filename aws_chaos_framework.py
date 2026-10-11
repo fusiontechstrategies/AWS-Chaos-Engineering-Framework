@@ -692,7 +692,7 @@ REQUIRED_PARAMETERS: dict[ChaosType, tuple[str, ...]] = {
     ChaosType.EC2_DISK_FILL: ("instance_ids",),
     ChaosType.EBS_DETACH_VOLUME: ("volume_id", "attachment"),
     ChaosType.EBS_THROTTLE_IOPS: ("volume_id",),
-    ChaosType.EFS_MOUNT_TARGET_DELETE: ("mount_target_id",),
+    ChaosType.EFS_MOUNT_TARGET_DELETE: ("mount_target_id", "network_interface_id"),
     ChaosType.EFS_THROTTLE_THROUGHPUT: ("file_system_id",),
     ChaosType.VPC_SUBNET_ACL_MODIFY: ("subnet_id", "nacl_id", "original_nacl_id"),
     ChaosType.VPC_ROUTE_TABLE_MODIFY: ("route_table_id", "destination_cidr"),
@@ -804,6 +804,7 @@ TARGET_PARAMETER_KEYS = frozenset(
         "ip_set_id",
         "key_id",
         "mount_target_id",
+        "network_interface_id",
         "nacl_id",
         "original_nacl_id",
         "parameter_group_name",
@@ -1415,6 +1416,15 @@ def derived_target_scope(
     experiment_type: ChaosType, config: dict[str, Any]
 ) -> set[str]:
     """Validate the explicit, digest-bound child resources and attachment tuple."""
+    if experiment_type == ChaosType.EFS_MOUNT_TARGET_DELETE:
+        interface = config.get("network_interface_id")
+        if not isinstance(interface, str) or not re.fullmatch(
+            r"eni-[0-9a-f]{8,17}", interface
+        ):
+            raise ConfigurationError(
+                "EFS deletion needs the exact reviewed network_interface_id"
+            )
+        return {interface}
     if experiment_type == ChaosType.EC2_TERMINATE:
         expected = config.get("delete_on_termination_volumes")
         instances = config.get("instance_ids")
@@ -3055,7 +3065,7 @@ AUTHORIZED_HANDLER_CALLS = {
     ),
     ChaosType.EFS_MOUNT_TARGET_DELETE: (
         "delete_mount_target",
-        (("mount_target_id", False, None),),
+        (("mount_target_id", False, None), ("network_interface_id", False, None)),
     ),
     ChaosType.EFS_THROTTLE_THROUGHPUT: (
         "throttle_throughput",
@@ -5078,7 +5088,9 @@ class EFSChaosExperiment(ChaosExperiment):
                 time.sleep(wait_seconds)
         raise TimeoutError("Timed out waiting for the EFS throughput update")
 
-    def delete_mount_target(self, mount_target_id: str) -> ExperimentResult:
+    def delete_mount_target(
+        self, mount_target_id: str, network_interface_id: str
+    ) -> ExperimentResult:
         """Delete EFS mount target"""
         experiment_id = _experiment_id("efs-mount-delete")
         result = ExperimentResult(
@@ -5088,15 +5100,31 @@ class EFSChaosExperiment(ChaosExperiment):
         )
 
         try:
+            # Direct-library plans do not pass through suite validation. Refuse
+            # an absent or malformed reviewed child in either execution mode.
+            derived_target_scope(ChaosType.EFS_MOUNT_TARGET_DELETE, self.config)
+            if (
+                self.config.get("mount_target_id") != mount_target_id
+                or self.config.get("network_interface_id") != network_interface_id
+            ):
+                raise SafetyViolation(
+                    "EFS target differs from the reviewed configuration"
+                )
             # Get mount target details
             mt_info = self.efs.describe_mount_targets(MountTargetId=mount_target_id)
             if mt_info["MountTargets"]:
                 mt = mt_info["MountTargets"][0]
-                scope = self._live_vpc_scope()
-                if scope is not None and (
+                if (
                     len(mt_info["MountTargets"]) != 1
                     or mt.get("MountTargetId") != mount_target_id
-                    or mt.get("VpcId") != scope.vpc_id
+                    or mt.get("NetworkInterfaceId") != network_interface_id
+                ):
+                    raise SafetyViolation(
+                        "EFS mount target or network interface differs from the reviewed scope"
+                    )
+                scope = self._live_vpc_scope()
+                if scope is not None and (
+                    mt.get("VpcId") != scope.vpc_id
                     or ("subnets", mt.get("SubnetId")) not in scope.vpc_inventory
                 ):
                     raise SafetyViolation(
@@ -5110,13 +5138,13 @@ class EFSChaosExperiment(ChaosExperiment):
                 if not self.dry_run:
                     # Delete mount target
                     self.efs.delete_mount_target(MountTargetId=mount_target_id)
-                    result.affected_resources = [mount_target_id]
+                    result.affected_resources = [mount_target_id, network_interface_id]
                     logger.info(f"Deleted mount target: {mount_target_id}")
                 else:
                     logger.info(
                         f"DRY RUN: Would delete mount target: {mount_target_id}"
                     )
-                    result.affected_resources = [mount_target_id]
+                    result.affected_resources = [mount_target_id, network_interface_id]
             else:
                 raise ConfigurationError(
                     f"EFS mount target not found: {mount_target_id}"
@@ -11799,6 +11827,9 @@ class ChaosOrchestrator:
         if experiment_type == ChaosType.EBS_DETACH_VOLUME:
             derived_target_scope(experiment_type, config)
             return 2
+        if experiment_type == ChaosType.EFS_MOUNT_TARGET_DELETE:
+            derived_target_scope(experiment_type, config)
+            return 2
         if experiment_type in {
             ChaosType.CLOUDFRONT_CACHE_INVALIDATE,
             ChaosType.WAF_IP_SET_MODIFY,
@@ -12235,7 +12266,9 @@ class ChaosOrchestrator:
 
         # EFS experiments
         elif experiment_type == ChaosType.EFS_MOUNT_TARGET_DELETE:
-            return experiment.delete_mount_target(config["mount_target_id"])
+            return experiment.delete_mount_target(
+                config["mount_target_id"], config["network_interface_id"]
+            )
         elif experiment_type == ChaosType.EFS_THROTTLE_THROUGHPUT:
             return experiment.throttle_throughput(
                 config["file_system_id"],

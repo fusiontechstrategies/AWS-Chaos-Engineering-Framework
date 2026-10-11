@@ -301,8 +301,13 @@ def test_direct_ec2_plan_handler_redacts_bound_targets_at_info(host_log):
 def test_direct_efs_plan_handler_redacts_bound_target_at_error(host_log):
     aws = FakeAWS(reject_writes=True)
     aws.read_overrides[("efs", "describe_mount_targets")] = [{"MountTargets": []}]
-    item = direct(framework.EFSChaosExperiment, aws)
-    result = item.delete_mount_target(MOUNT_TARGET)
+    item = direct(
+        framework.EFSChaosExperiment,
+        aws,
+        mount_target_id=MOUNT_TARGET,
+        network_interface_id="eni-0123456789abcdef0",
+    )
+    result = item.delete_mount_target(MOUNT_TARGET, "eni-0123456789abcdef0")
     assert result.status == "failed"
     text = host_log.getvalue()
     assert "ERROR Error deleting mount target" in text
@@ -478,7 +483,7 @@ def test_protected_values_are_instance_scoped_and_append_only(host_log):
     assert other._log_protected_values == frozenset()
     assert framework.ChaosExperiment.__dict__.get("_log_protected_values") is None
     # A later handler call only adds to the first instance's set.
-    first.delete_mount_target("fsmt-0123456789abcdef0")
+    first.delete_mount_target("fsmt-0123456789abcdef0", "eni-0123456789abcdef0")
     assert retained < first._log_protected_values
     assert other._log_protected_values == frozenset()
     host_log.truncate(0)
@@ -539,7 +544,9 @@ def test_concurrent_calls_on_one_instance_retain_every_target(host_log):
             name="throttle",
         ),
         threading.Thread(
-            target=item.delete_mount_target, args=(MOUNT_TARGET_B,), name="mount"
+            target=item.delete_mount_target,
+            args=(MOUNT_TARGET_B, "eni-0123456789abcdef0"),
+            name="mount",
         ),
     ]
     for call in calls:
@@ -577,7 +584,7 @@ def test_over_budget_call_is_rejected_without_changing_retained_targets(
     # Retained plus new arguments alone fit; with the configured target the
     # complete union exceeds the budget, so nothing may be committed.
     with pytest.raises(framework.ConfigurationError, match="Too many"):
-        item.delete_mount_target(MOUNT_TARGET_B)
+        item.delete_mount_target(MOUNT_TARGET_B, "eni-0123456789abcdef0")
     assert item._log_protected_values is retained
     assert aws.calls == calls_before
     host_log.truncate(0)
