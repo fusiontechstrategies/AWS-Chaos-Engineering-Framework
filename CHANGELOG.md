@@ -2,6 +2,13 @@
 
 ## Unreleased security follow-ups
 
+### Loopback container credential tokens
+
+- Container credentials configured on a numeric loopback URL over plain HTTP
+  are refused when an authorization token or token file is configured. This
+  applies before credential requests from the orchestrator and direct library
+  entry points. HTTPS numeric loopback remains subject to certificate checks.
+
 ### Release download output publication
 
 - Both release download helpers reject shared or reparse-point output parents

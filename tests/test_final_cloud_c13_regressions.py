@@ -1436,7 +1436,12 @@ def test_plan_mode_admitted_loopback_container_uri_reaches_only_that_provider(
     assert signed == []
 
 
-DIRECT_ENTRY_POINTS = ("safety-controller", "planning-experiment", "pinning")
+DIRECT_ENTRY_POINTS = (
+    "safety-controller",
+    "planning-experiment",
+    "pinning",
+    "origin-bound-client",
+)
 
 
 def resolve_through_direct_entry(entry: str) -> str:
@@ -1450,6 +1455,13 @@ def resolve_through_direct_entry(entry: str) -> str:
         if entry == "pinning":
             framework.pin_session_credentials(
                 framework.harden_session_origin(session), PROFILE_REGION
+            )
+        elif entry == "origin-bound-client":
+            framework.origin_bound_client(
+                framework.harden_session_origin(session),
+                "sts",
+                PROFILE_REGION,
+                Config(),
             )
         else:
             # A caller-supplied session, exactly as direct library planning uses it.
@@ -1471,6 +1483,52 @@ def resolve_through_direct_entry(entry: str) -> str:
     except Delivered:
         return "provider-request"
     return "resolved"
+
+
+@pytest.mark.parametrize("entry", ("orchestrator", *DIRECT_ENTRY_POINTS))
+@pytest.mark.parametrize("url", ["http://127.0.0.1:9/creds", "http://[::1]:9/creds"])
+@pytest.mark.parametrize("token_setting", ["token", "token-file"])
+def test_token_bearing_plaintext_loopback_refused_before_provider_request(
+    tmp_path, monkeypatch, entry, url, token_setting
+):
+    environment = {"AWS_CONTAINER_CREDENTIALS_FULL_URI": url}
+    secret = "synthetic-provider-token"
+    if token_setting == "token":
+        environment["AWS_CONTAINER_AUTHORIZATION_TOKEN"] = secret
+    else:
+        token_file = tmp_path / "container-token"
+        token_file.write_text(secret, encoding="ascii")
+        environment["AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"] = str(token_file)
+    signed, provider = provider_only_aws(monkeypatch, tmp_path, environment)
+    refusal = (
+        plan_orchestrator_or_refusal(tmp_path)
+        if entry == "orchestrator"
+        else resolve_through_direct_entry(entry)
+    )
+    assert refusal == (
+        "Credential resolution refuses token-bearing plaintext loopback "
+        "container credentials"
+        if entry == "orchestrator"
+        else "refused: Credential resolution refuses token-bearing plaintext "
+        "loopback container credentials"
+    )
+    assert secret not in refusal
+    assert str(tmp_path) not in refusal
+    assert provider == []
+    assert signed == []
+
+
+def test_token_bearing_https_loopback_stays_admissible_to_provider_policy(
+    tmp_path, monkeypatch
+):
+    environment = {
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI": "https://127.0.0.1:9443/creds",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN": "synthetic-provider-token",
+    }
+    signed, provider = provider_only_aws(monkeypatch, tmp_path, environment)
+    assert plan_orchestrator_or_refusal(tmp_path) is None
+    assert provider == [("127.0.0.1:9443", "synthetic-provider-token")]
+    assert signed == []
 
 
 @pytest.mark.parametrize("entry", DIRECT_ENTRY_POINTS)

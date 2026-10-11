@@ -697,7 +697,11 @@ credentials:
   authorization token, elsewhere. Noncanonical, scoped and IPv4-mapped
   spellings are refused too. Botocore itself admits `localhost` and loopback
   for plain HTTP and any host for HTTPS; the framework refuses names and
-  arbitrary HTTPS hosts.
+  arbitrary HTTPS hosts. A numeric loopback container credential URL using
+  plain HTTP is refused whenever `AWS_CONTAINER_AUTHORIZATION_TOKEN` or
+  `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` is configured, because another local
+  process could receive the token if it controls the listening port. HTTPS
+  numeric loopback remains permitted under the certificate policy.
 - Any other value is refused at those points before any provider or SDK
   request, so a malicious provider endpoint receives no request or configured
   container authorization token through them. Credentials a caller resolves

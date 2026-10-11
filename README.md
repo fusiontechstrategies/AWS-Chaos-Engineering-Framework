@@ -39,7 +39,7 @@ Version 2.0.4 is available on [PyPI](https://pypi.org/project/aws-chaos-engineer
 | --- | --- |
 | Default mode | Plans and validates. It does not issue mutating AWS requests. |
 | Identity binding | Live mode requires the active account, configured account, region, partition, and caller identity to agree. |
-| Credentials | Temporary credentials are required by default. Long-term credentials need configuration and CLI approval. Plan and live runs, framework client creation and credential pinning refuse a non-default IMDS endpoint or a container credential URL outside the documented link-local addresses and numeric loopback literals (host names such as `localhost` are refused) before any credential request. |
+| Credentials | Temporary credentials are required by default. Long-term credentials need configuration and CLI approval. Plan and live runs, framework client creation and credential pinning refuse a non-default IMDS endpoint or a container credential URL outside the documented link-local addresses and numeric loopback literals (host names such as `localhost` are refused) before any credential request. Plain HTTP loopback container credential URLs are also refused when an authorization token or token file is configured. |
 | Targets | Live extensions require exact allowlisting. Optional VPC discovery includes only resources with required safety tags. |
 | Blast radius | Per-run and per-experiment limits are enforced before execution. |
 | Stop controls | Extension runs require CloudWatch alarms by default. FIS template inspection checks alarm stop conditions; live FIS starts are disabled. |
