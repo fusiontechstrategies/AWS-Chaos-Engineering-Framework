@@ -13,6 +13,7 @@ from pathlib import Path
 def _reject_darwin_extended_acl(fd: int) -> None:
     """Fail closed if a mode-private directory grants extra ACL authority."""
     import ctypes
+    import errno
 
     libc = ctypes.CDLL(None, use_errno=True)
     libc.acl_get_fd_np.argtypes = (ctypes.c_int, ctypes.c_int)
@@ -26,9 +27,15 @@ def _reject_darwin_extended_acl(fd: int) -> None:
     libc.acl_valid.argtypes = (ctypes.c_void_p,)
     libc.acl_valid.restype = ctypes.c_int
     libc.acl_free.argtypes = (ctypes.c_void_p,)
+    ctypes.set_errno(0)
     acl = libc.acl_get_fd_np(fd, 0x100)  # ACL_TYPE_EXTENDED
     if not acl:
-        raise PermissionError("Cannot inspect release-output extended ACL")
+        error = ctypes.get_errno()
+        # Darwin returns no ACL object when the pinned directory has no
+        # extended entries. All other inspection failures remain closed.
+        if error in {errno.ENOENT, getattr(errno, "ENOATTR", -1)}:
+            return
+        raise PermissionError(f"Cannot inspect release-output extended ACL ({error})")
     try:
         if libc.acl_valid(acl) != 0:
             raise PermissionError("Cannot validate release-output extended ACL")
@@ -167,7 +174,7 @@ def _windows_open_relative(
     return result.value
 
 
-def _windows_user_sid() -> str:
+def _windows_token_sid(information_class: int) -> str:
     ctypes, wintypes, kernel, advapi = _windows_api()
     pointer = ctypes.c_void_p
     advapi.OpenProcessToken.argtypes = (
@@ -190,9 +197,6 @@ def _windows_user_sid() -> str:
     kernel.CloseHandle.argtypes = (pointer,)
     kernel.LocalFree.argtypes = (pointer,)
 
-    class TokenUser(ctypes.Structure):
-        _fields_ = [("sid", pointer), ("attributes", wintypes.DWORD)]
-
     token = pointer()
     if not advapi.OpenProcessToken(
         kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)
@@ -200,11 +204,15 @@ def _windows_user_sid() -> str:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
         size = wintypes.DWORD()
-        advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+        advapi.GetTokenInformation(
+            token, information_class, None, 0, ctypes.byref(size)
+        )
         buffer = ctypes.create_string_buffer(size.value)
-        if not advapi.GetTokenInformation(token, 1, buffer, size, ctypes.byref(size)):
+        if not advapi.GetTokenInformation(
+            token, information_class, buffer, size, ctypes.byref(size)
+        ):
             raise ctypes.WinError(ctypes.get_last_error())
-        sid = ctypes.cast(buffer, ctypes.POINTER(TokenUser)).contents.sid
+        sid = ctypes.cast(buffer, ctypes.POINTER(pointer)).contents.value
         value = pointer()
         if not advapi.ConvertSidToStringSidW(sid, ctypes.byref(value)):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -216,8 +224,22 @@ def _windows_user_sid() -> str:
         kernel.CloseHandle(token)
 
 
+def _windows_user_sid() -> str:
+    return _windows_token_sid(1)
+
+
+def _windows_default_owner_sid() -> str:
+    return _windows_token_sid(4)
+
+
+def _windows_owner_is_trusted(
+    owner_sid: str, user_sid: str, default_owner_sid: str
+) -> bool:
+    return owner_sid == user_sid or (owner_sid == default_owner_sid == "S-1-5-32-544")
+
+
 def _windows_acl_private(handle: int, user_sid: str) -> None:
-    """Require current-user ownership and no other principal's write grant."""
+    """Require token ownership and no untrusted principal's write grant."""
     ctypes, wintypes, kernel, advapi = _windows_api()
     pointer = ctypes.c_void_p
     advapi.GetSecurityInfo.argtypes = (
@@ -271,9 +293,13 @@ def _windows_acl_private(handle: int, user_sid: str) -> None:
     if result:
         raise OSError(result, "Cannot inspect release-output ACL")
     try:
-        if sid_string(owner) != user_sid or not dacl:
+        default_owner = _windows_default_owner_sid()
+        if (
+            not _windows_owner_is_trusted(sid_string(owner), user_sid, default_owner)
+            or not dacl
+        ):
             raise PermissionError(
-                "Release output must be current-user-owned and private"
+                "Release output must be current-token-owned and private"
             )
         allowed = {user_sid, "S-1-5-18", "S-1-5-32-544", "S-1-3-0", "S-1-3-4"}
         writable = 0xD0000 | 0x10000000 | 0x40000000 | 0x00000156

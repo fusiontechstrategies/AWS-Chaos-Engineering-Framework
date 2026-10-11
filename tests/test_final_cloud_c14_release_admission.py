@@ -669,6 +669,17 @@ def test_release_download_rejects_real_shared_windows_acl(tmp_path, monkeypatch)
         )
 
 
+def test_windows_release_owner_accepts_only_user_or_active_admin_default():
+    trusted = admission.release_output._windows_owner_is_trusted
+    user = "S-1-5-21-1000"
+    admin = "S-1-5-32-544"
+    unrelated = "S-1-5-21-2000"
+    assert trusted(user, user, admin)
+    assert trusted(admin, user, admin)
+    assert not trusted(admin, user, unrelated)
+    assert not trusted(unrelated, user, unrelated)
+
+
 @pytest.mark.skipif(
     os.name != "nt", reason="Native Windows handle-relative publication"
 )
@@ -785,6 +796,19 @@ def test_release_output_posix_cleanup_survives_parent_rebind(tmp_path):
             parent.unlink()
         if moved.exists():
             moved.rename(parent)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="Native Darwin extended ACL admission"
+)
+def test_release_output_accepts_darwin_parent_without_extended_acl(tmp_path):
+    parent = tmp_path / "admitted"
+    parent.mkdir(mode=0o700)
+    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        admission.release_output._reject_darwin_extended_acl(fd)
+    finally:
+        os.close(fd)
 
 
 @pytest.mark.skipif(
