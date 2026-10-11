@@ -2,6 +2,22 @@
 
 ## Unreleased security follow-ups
 
+### Evidence report publication
+
+- Reports now keep the serialized temporary file descriptor open through
+  no-overwrite publication and compare the final file identity with that
+  descriptor. POSIX output directories must be owned by the effective user;
+  group- or other-writable non-sticky directories are refused. Report
+  permissions are set on the open descriptor, and a mismatched final link is
+  removed without reporting success.
+- On Windows, report publication creates a fresh private directory under the
+  user's profile with a protected access list from inception. The requested
+  output directory is not used for publication because it may retain open
+  writers from an earlier shared access list. A requested directory equal to
+  or containing the profile is refused. The actual path is returned and
+  logged. Ordinary path components and the temporary file's access list are
+  validated before linking evidence into place.
+
 ### Origin-hardened direct-library sessions
 
 - Direct library planning now requires an origin-hardened session.
