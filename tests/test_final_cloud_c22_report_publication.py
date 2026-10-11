@@ -117,23 +117,113 @@ def test_junction_report_directory_is_rejected_without_touching_existing_report(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows file ACL behavior")
+def test_windows_temporary_file_has_private_owner_at_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import msvcrt
+
+    def no_default_temporary_file(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Windows report creation used the default-owner tempfile")
+
+    monkeypatch.setattr(
+        framework.tempfile, "NamedTemporaryFile", no_default_temporary_file
+    )
+    requested = tmp_path / "report.json"
+    with framework._report_temporary_file(requested) as (temporary, handle):
+        framework._windows_private_report_acl(msvcrt.get_osfhandle(handle.fileno()))
+        assert temporary.exists()
+    temporary.unlink()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows exclusive file creation")
+def test_windows_temporary_file_retries_existing_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import uuid
+
+    first = uuid.UUID(int=1)
+    second = uuid.UUID(int=2)
+    names = iter((first, second))
+    monkeypatch.setattr(framework.uuid, "uuid4", lambda: next(names))
+    requested = tmp_path / "report.json"
+    existing = tmp_path / f".report.json.{first.hex}.tmp"
+    existing.write_bytes(b"preserve existing bytes")
+    with framework._report_temporary_file(requested) as (temporary, handle):
+        assert temporary.name == f".report.json.{second.hex}.tmp"
+        handle.write("trusted")
+    assert existing.read_bytes() == b"preserve existing bytes"
+    temporary.unlink()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CRT descriptor ownership")
+def test_windows_temporary_file_cleans_up_after_stream_construction_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failed_fdopen(fd: int, *args: object, **kwargs: object) -> None:
+        assert kwargs["closefd"] is False
+        os.close(fd)
+        raise MemoryError("stream construction failed")
+
+    def reject_yield() -> None:
+        raise AssertionError("File stream should not be yielded")
+
+    monkeypatch.setattr(framework.os, "fdopen", failed_fdopen)
+    with (
+        pytest.raises(MemoryError, match="stream construction failed"),
+        framework._report_temporary_file(tmp_path / "report.json"),
+    ):
+        reject_yield()
+    assert not list(tmp_path.glob(".report.json.*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CRT descriptor ownership")
+def test_windows_close_failure_propagates_inside_unrelated_exception_handler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    requested = tmp_path / "report.json"
+    real_close = os.close
+    failed_fds: list[int] = []
+
+    def failed_close(fd: int) -> None:
+        failed_fds.append(fd)
+        raise OSError("report descriptor close failed")
+
+    try:
+        try:
+            raise ValueError("unrelated caller error")
+        except ValueError:
+            assert sys.exc_info()[0] is ValueError
+            with monkeypatch.context() as patch:
+                patch.setattr(framework.os, "close", failed_close)
+                with pytest.raises(OSError, match="report descriptor close failed"):
+                    framework.atomic_write_json(requested, {"trusted": True})
+    finally:
+        for fd in failed_fds:
+            real_close(fd)
+    assert not framework._windows_report_locations[requested.absolute()].exists()
+    assert not requested.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file ACL behavior")
 def test_windows_shared_temporary_file_acl_prevents_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original = framework.tempfile.NamedTemporaryFile
+    original = framework._report_temporary_file
 
     @contextmanager
-    def shared_temporary(*args: object, **kwargs: object):
-        with original(*args, **kwargs) as handle:
+    def shared_temporary(path: Path):
+        with original(path) as (temporary, handle):
             subprocess.run(
-                ["icacls", handle.name, "/grant", "*S-1-5-11:M"],
+                ["icacls", str(temporary), "/grant", "*S-1-5-11:M"],
                 capture_output=True,
                 text=True,
                 check=True,
             )
-            yield handle
+            yield temporary, handle
 
-    monkeypatch.setattr(framework.tempfile, "NamedTemporaryFile", shared_temporary)
+    monkeypatch.setattr(framework, "_report_temporary_file", shared_temporary)
     report = tmp_path / "report.json"
     with pytest.raises(PermissionError, match="Unsafe shared report path ACL"):
         framework.atomic_write_json(report, {"trusted": True})
@@ -146,7 +236,7 @@ def test_windows_preexisting_directory_writer_fails_before_report_success(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, requested_access: int
 ) -> None:
     import ctypes
-    from ctypes import wintypes
+    import ctypes.wintypes as wintypes
 
     output = tmp_path / "shared"
     output.mkdir()
@@ -208,7 +298,7 @@ def test_windows_private_snapshot_does_not_reuse_a_previously_shared_directory(
     tmp_path: Path,
 ) -> None:
     import ctypes
-    from ctypes import wintypes
+    import ctypes.wintypes as wintypes
 
     output = tmp_path / "formerly-shared"
     output.mkdir()

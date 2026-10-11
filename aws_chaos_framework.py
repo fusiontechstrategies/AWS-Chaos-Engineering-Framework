@@ -2371,7 +2371,7 @@ def _windows_private_report_acl(
 ) -> None:
     """Reject Windows ACLs that let another local principal alter evidence."""
     import ctypes
-    from ctypes import wintypes
+    import ctypes.wintypes as wintypes
 
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -2538,7 +2538,7 @@ def _windows_private_report_acl(
                     raise OSError(status, "Could not secure report directory")
             finally:
                 kernel.LocalFree(replacement)
-            return _windows_private_report_acl(handle)
+            _windows_private_report_acl(handle)
     finally:
         kernel.LocalFree(descriptor)
 
@@ -2548,7 +2548,7 @@ def _open_windows_report_directory(
 ) -> list[int]:
     """Pin each path component against rename and reject reparse points."""
     import ctypes
-    from ctypes import wintypes
+    import ctypes.wintypes as wintypes
 
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = (
@@ -2612,10 +2612,64 @@ _windows_report_locations: dict[Path, Path] = {}
 _windows_report_locations_lock = threading.Lock()
 
 
+def _windows_current_user_sid() -> str:
+    """Read the process token's user SID for an explicitly owned report directory."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    pointer = ctypes.c_void_p
+    advapi.OpenProcessToken.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(pointer),
+    )
+    advapi.OpenProcessToken.restype = wintypes.BOOL
+    advapi.GetTokenInformation.argtypes = (
+        pointer,
+        wintypes.DWORD,
+        pointer,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi.GetTokenInformation.restype = wintypes.BOOL
+    advapi.ConvertSidToStringSidW.argtypes = (pointer, ctypes.POINTER(pointer))
+    advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (pointer,)
+    kernel.LocalFree.argtypes = (pointer,)
+
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("sid", pointer), ("attributes", wintypes.DWORD)]
+
+    token = pointer()
+    if not advapi.OpenProcessToken(
+        kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        length = wintypes.DWORD()
+        advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(length))
+        data = ctypes.create_string_buffer(length.value)
+        if not advapi.GetTokenInformation(token, 1, data, length, ctypes.byref(length)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        user_sid = ctypes.cast(data, ctypes.POINTER(_TokenUser)).contents.sid
+        allocated = pointer()
+        if not advapi.ConvertSidToStringSidW(user_sid, ctypes.byref(allocated)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return ctypes.wstring_at(allocated)
+        finally:
+            kernel.LocalFree(allocated)
+    finally:
+        kernel.CloseHandle(token)
+
+
 def _windows_private_report_path(requested: Path) -> Path:
     """Place Windows evidence in a new private namespace under the user profile."""
     import ctypes
-    from ctypes import wintypes
+    import ctypes.wintypes as wintypes
 
     home = Path.home().resolve(strict=True)
     requested_directory = requested.parent.resolve(strict=False)
@@ -2668,7 +2722,10 @@ def _windows_private_report_path(requested: Path) -> Path:
             kernel.CreateDirectoryW.restype = wintypes.BOOL
             kernel.LocalFree.argtypes = (ctypes.c_void_p,)
             descriptor = ctypes.c_void_p()
-            sddl = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+            sddl = (
+                f"O:{_windows_current_user_sid()}D:P"
+                "(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+            )
             if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl, 1, ctypes.byref(descriptor), None
             ):
@@ -2760,6 +2817,115 @@ def _remove_report_entry(path: Path, directory_fd: int | list[int]) -> None:
         os.unlink(path.name, dir_fd=directory_fd)
 
 
+@contextmanager
+def _report_temporary_file(path: Path):
+    """Create a temporary report with an explicit Windows owner and private ACL."""
+    prefix = f".{path.name}."
+    if os.name != "nt":
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=prefix,
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            yield Path(handle.name), handle
+        return
+
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import msvcrt
+
+    class _SecurityAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.DWORD),
+            ("descriptor", ctypes.c_void_p),
+            ("inherit_handle", wintypes.BOOL),
+        ]
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+    )
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    kernel.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_SecurityAttributes),
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.LocalFree.argtypes = (ctypes.c_void_p,)
+
+    descriptor = ctypes.c_void_p()
+    sddl = f"O:{_windows_current_user_sid()}D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+    if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, ctypes.byref(descriptor), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        attributes = _SecurityAttributes(
+            ctypes.sizeof(_SecurityAttributes), descriptor, False
+        )
+        for _ in range(3):
+            temporary = path.parent / f"{prefix}{uuid.uuid4().hex}.tmp"
+            raw_handle = kernel.CreateFileW(
+                str(temporary),
+                0xC0020000,
+                0x00000007,
+                ctypes.byref(attributes),
+                1,
+                0x80,
+                None,
+            )
+            if raw_handle != wintypes.HANDLE(-1).value:
+                break
+            error = ctypes.get_last_error()
+            if error not in {80, 183}:  # ERROR_FILE_EXISTS or ERROR_ALREADY_EXISTS
+                raise ctypes.WinError(error)
+        else:
+            raise FileExistsError("Could not reserve a temporary report file")
+    finally:
+        kernel.LocalFree(descriptor)
+
+    fd = None
+    opened = False
+    completed_normally = False
+    try:
+        fd = msvcrt.open_osfhandle(raw_handle, os.O_RDWR | os.O_NOINHERIT)
+        # The CRT owns the native handle after conversion; cleanup chooses fd.
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as stream:
+            opened = True
+            yield temporary, stream
+        completed_normally = True
+    finally:
+        cleanup_error = None
+        try:
+            if fd is not None:
+                os.close(fd)
+            elif raw_handle is not None:
+                kernel.CloseHandle(raw_handle)
+        except OSError as exc:
+            cleanup_error = exc
+        try:
+            if not opened:
+                temporary.unlink(missing_ok=True)
+        except OSError as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if cleanup_error is not None and completed_normally:
+            raise cleanup_error
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> Path:
     """Publish a report only while its serialized inode remains open and bound."""
     if os.name == "nt":
@@ -2773,15 +2939,7 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> Path:
     try:
         if path.exists():
             raise FileExistsError(f"Refusing to overwrite existing report: {path}")
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temp_path = Path(handle.name)
+        with _report_temporary_file(path) as (temp_path, handle):
             json.dump(payload, handle, indent=2, default=str, sort_keys=True)
             handle.write("\n")
             handle.flush()
@@ -2810,7 +2968,6 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> Path:
             ):
                 raise PermissionError("Published report identity changed")
         _remove_report_entry(temp_path, directory_fd)
-        temp_path = None
     except Exception:
         if published:
             try:
