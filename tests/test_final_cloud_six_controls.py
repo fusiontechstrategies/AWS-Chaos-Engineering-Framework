@@ -588,6 +588,7 @@ def endpoints_in(vpc: str) -> dict[str, Any]:
 def mount_target(**changes: Any) -> dict[str, Any]:
     target = {
         "MountTargetId": MOUNT_TARGET,
+        "NetworkInterfaceId": "eni-0123456789abcdef0",
         "FileSystemId": "fs-0123456789abcdef0",
         "SubnetId": SUBNET,
         "VpcId": VPC,
@@ -661,7 +662,13 @@ def test_pre_mutation_response_outside_scope_refuses_before_mutation(
     aws.read_overrides[(service, operation)] = [response]
     result = run_handler(kind, experiment)
     assert result.status == "failed"
-    assert "selected VPC" in " ".join(result.errors)
+    expected = (
+        "reviewed scope"
+        if kind == framework.ChaosType.EFS_MOUNT_TARGET_DELETE
+        and response["MountTargets"][0]["MountTargetId"] != MOUNT_TARGET
+        else "selected VPC"
+    )
+    assert expected in " ".join(result.errors)
     assert not result.affected_resources
     assert experiment.mutation_attempts == []
     assert mutation_calls(aws) == []
@@ -718,6 +725,7 @@ def test_efs_mount_target_admitted_only_when_its_subnet_resolves_to_the_vpc():
     result = run_handler(kind, experiment)
     assert result.status == "completed", result.errors
     assert mutation_calls(aws) == ["delete_mount_target"]
+    assert result.affected_resources == [MOUNT_TARGET, "eni-0123456789abcdef0"]
 
 
 def test_peering_rule_requires_both_endpoints_in_the_selected_vpc():

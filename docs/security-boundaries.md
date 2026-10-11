@@ -746,10 +746,13 @@ the instance `VpcId` or the current subnet NACL association's `VpcId`.
 endpoint inventory and `VpcId` checks remain as defence in depth. The reviewed `original_nacl_id` must also be in the discovered NACL
 set and equal the subnet's current NACL, because recovery re-associates the
 subnet with it. An
-`efs_mount_target_delete` target is admitted only when the exact mount-target
-response reports the selected `VpcId` and a discovered subnet; that relationship
-is only known when the handler reads the mount target, so it is enforced there,
-before the deletion, rather than at suite start.
+`efs_mount_target_delete` requires both the exact `mount_target_id` and its
+provider-created `network_interface_id` in the confirmed configuration and
+target allowlist. They consume two blast-radius slots. Immediately before
+deletion, the handler requires one matching mount-target response with the
+reviewed interface; a missing or changed child stops the write. Planning and
+result reports name both resources. Under `--vpc-id`, that same response must
+also report the selected `VpcId` and a discovered subnet.
 `vpc_peering_delete` needs both endpoints in the selected VPC. Reviewed
 endpoints must be distinct VPCs, so peering deletion is always refused under
 `--vpc-id`. Other live types that do not address a VPC resource, such as
