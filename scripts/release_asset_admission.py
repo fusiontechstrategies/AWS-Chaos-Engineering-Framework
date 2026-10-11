@@ -18,13 +18,21 @@ import json
 import os
 import re
 import stat
-import tempfile
 import time
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path, PureWindowsPath
+
+_output_path = Path(__file__).resolve().with_name("release_output.py")
+_output_spec = importlib.util.spec_from_file_location(
+    "trusted_release_output", _output_path
+)
+if _output_spec is None or _output_spec.loader is None:
+    raise ImportError("Trusted release-output helper is unavailable")
+release_output = importlib.util.module_from_spec(_output_spec)
+_output_spec.loader.exec_module(release_output)
 
 PROJECT_SLUG = "AWS-Chaos-Engineering-Framework"
 ARCHIVE_NAME = "aws_chaos_engineering_framework"
@@ -462,9 +470,20 @@ def download(
     token = os.environ.get("GH_TOKEN")
     if not token:
         raise AdmissionError("GitHub release read credential is missing")
-    output = Path(output)
-    if output.exists() or output.is_symlink() or not output.parent.is_dir():
-        raise AdmissionError("Release output must be new inside an existing directory")
+    try:
+        with release_output.OwnedOutput(output) as publication:
+            return _download_admitted(repository, tag, publication, selected, token)
+    except FileExistsError:
+        raise AdmissionError("Release output must be new") from None
+
+
+def _download_admitted(
+    repository: str,
+    tag: str,
+    publication: release_output.OwnedOutput,
+    selected: list[str],
+    token: str,
+) -> dict[str, dict]:
     opener = urllib.request.build_opener(NoRedirect())
     deadline = time.monotonic() + TOTAL_SECONDS
     api = f"https://api.github.com/repos/{repository}/releases"
@@ -475,23 +494,14 @@ def download(
     ) as response:
         metadata = _strict_json(stream(response, METADATA_BYTES, deadline))
     admitted = admit_release_metadata(metadata, tag)
-    private = Path(tempfile.mkdtemp(prefix=".release-assets-", dir=output.parent))
-    created: list[Path] = []
+    private = publication.create_private(".release-assets-")
+    created: list[str] = []
     results: dict[str, dict] = {}
     try:
         for name in selected:
             record = admitted[name]
-            path = private / name
-            descriptor = os.open(
-                path,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_BINARY", 0),
-                0o600,
-            )
-            created.append(path)
+            descriptor = publication.open_member(private, name)
+            created.append(name)
             digest = hashlib.sha256()
             with os.fdopen(descriptor, "wb") as sink:
                 with _asset_response(
@@ -500,29 +510,18 @@ def download(
                     stream(response, record["size"], deadline, sink, digest)
                 sink.flush()
                 os.fsync(sink.fileno())
-            size = os.lstat(path).st_size
+                size = os.fstat(sink.fileno()).st_size
             if size != record["size"]:
                 raise AdmissionError("Release asset length differs from its metadata")
             if record["sha256"] is not None and digest.hexdigest() != record["sha256"]:
                 raise AdmissionError("Release asset digest differs from its metadata")
             results[name] = {"bytes": size, "sha256": digest.hexdigest()}
-        # The output appears only after every selected asset was admitted.
-        output.mkdir(mode=0o700)
-        moved: list[Path] = []
-        try:
-            for path in created:
-                os.rename(path, output / path.name)
-                moved.append(output / path.name)
-        except BaseException:
-            for path in moved:
-                path.unlink(missing_ok=True)
-            output.rmdir()
-            raise
+        # A complete private directory appears at the final name in one
+        # no-replace operation. No member is written after publication.
+        publication.publish_private(private)
         created.clear()
     finally:
-        for path in created:
-            path.unlink(missing_ok=True)
-        private.rmdir()
+        publication.cleanup_private(private, created)
     return results
 
 

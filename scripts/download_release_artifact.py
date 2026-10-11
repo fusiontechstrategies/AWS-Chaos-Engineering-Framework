@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -13,7 +14,18 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+import zlib
 from pathlib import Path
+
+_output_path = Path(__file__).resolve().with_name("release_output.py")
+_output_spec = importlib.util.spec_from_file_location(
+    "trusted_release_output", _output_path
+)
+if _output_spec is None or _output_spec.loader is None:
+    raise ImportError("Trusted release-output helper is unavailable")
+release_output = importlib.util.module_from_spec(_output_spec)
+_output_spec.loader.exec_module(release_output)
 
 _path = Path(__file__).resolve().with_name("prepare_release.py")
 _spec = importlib.util.spec_from_file_location("trusted_prepare_release", _path)
@@ -86,33 +98,56 @@ def _request(url: str, token: str | None = None):
     return urllib.request.Request(url, headers=headers)
 
 
+def _admit_archive(archive) -> dict[str, bytes]:
+    members = archive.infolist()
+    if len(members) != 6:
+        raise ValueError("release artifact must contain exactly six leaves")
+    names, portable = set(), set()
+    for member in members:
+        if any(character in member.filename for character in ':<>"|?*'):
+            raise ValueError("release artifact leaf is not portable")
+        parts = release.archive_parts(member.filename)
+        mode = member.external_attr >> 16
+        if (
+            len(parts) != 1
+            or member.is_dir()
+            or member.external_attr & 0x10
+            or (stat.S_IFMT(mode) not in {0, stat.S_IFREG})
+        ):
+            raise ValueError("release artifact contains a nonregular or nested leaf")
+        release.record_portable_name(member.filename, names, portable)
+    budget = archive_budget.MemberBudget()
+    return {
+        member.filename: archive_budget.read_zip_member(archive, member, budget)
+        for member in members
+    }
+
+
 def admit_outer_archive(path: Path) -> dict[str, bytes]:
     """Preflight all six flat regular leaves, then read under shared budgets."""
     with archive_budget.open_zip(path, max_members=6) as archive:
-        members = archive.infolist()
-        if len(members) != 6:
-            raise ValueError("release artifact must contain exactly six leaves")
-        names, portable = set(), set()
-        for member in members:
-            if any(character in member.filename for character in ':<>"|?*'):
-                raise ValueError("release artifact leaf is not portable")
-            parts = release.archive_parts(member.filename)
-            mode = member.external_attr >> 16
-            if (
-                len(parts) != 1
-                or member.is_dir()
-                or member.external_attr & 0x10
-                or (stat.S_IFMT(mode) not in {0, stat.S_IFREG})
-            ):
-                raise ValueError(
-                    "release artifact contains a nonregular or nested leaf"
-                )
-            release.record_portable_name(member.filename, names, portable)
-        budget = archive_budget.MemberBudget()
-        return {
-            member.filename: archive_budget.read_zip_member(archive, member, budget)
-            for member in members
-        }
+        return _admit_archive(archive)
+
+
+def _admit_outer_handle(raw) -> dict[str, bytes]:
+    """Admit a bounded temporary file without re-resolving a pathname."""
+    try:
+        size = archive_budget.bounded_size(raw)
+        archive_budget.zip_preflight(raw, size, max_members=6)
+        raw.seek(0)
+        with zipfile.ZipFile(raw) as archive:
+            return _admit_archive(archive)
+    except archive_budget.ArchiveBudgetError as error:
+        raise ValueError(str(error)) from error
+    except (
+        OSError,
+        EOFError,
+        UnicodeError,
+        zipfile.BadZipFile,
+        zlib.error,
+        OverflowError,
+    ) as error:
+        raise ValueError("ZIP input is malformed or unreadable") from error
 
 
 def download(
@@ -134,10 +169,30 @@ def download(
     token = os.environ.get("GH_TOKEN")
     if not token:
         raise ValueError("GitHub artifact read credential is missing")
-    if output.exists() or output.is_symlink() or not output.parent.is_dir():
-        raise ValueError(
-            "artifact output must be new inside an existing owned directory"
-        )
+    try:
+        with release_output.OwnedOutput(output) as publication:
+            return _download_admitted(
+                repository,
+                artifact_id,
+                run_id,
+                expected_digest,
+                expected_name,
+                token,
+                publication,
+            )
+    except FileExistsError:
+        raise ValueError("artifact output must be new") from None
+
+
+def _download_admitted(
+    repository: str,
+    artifact_id: int,
+    run_id: int,
+    expected_digest: str | None,
+    expected_name: str,
+    token: str,
+    publication: release_output.OwnedOutput,
+) -> dict:
     opener = urllib.request.build_opener(NoRedirect())
     endpoint = (
         f"https://api.github.com/repos/{repository}/actions/artifacts/{artifact_id}"
@@ -188,39 +243,38 @@ def download(
     # The authenticated API chooses storage. Its credential is never forwarded,
     # and a second redirect is not followed by this opener.
     storage = _request(location)
-    with tempfile.TemporaryDirectory(
-        prefix=".bounded-artifact-", dir=output.parent
-    ) as directory:
-        raw = Path(directory) / "artifact.zip"
-        with raw.open("xb") as sink:
-            with opener.open(storage, timeout=READ_TIMEOUT_SECONDS) as response:
-                _read(response, archive_budget.MAX_ARCHIVE_BYTES, deadline, sink)
-            sink.flush()
-            os.fsync(sink.fileno())
-        actual = release.sha256_file(raw)
+    with tempfile.TemporaryFile() as raw:
+        with opener.open(storage, timeout=READ_TIMEOUT_SECONDS) as response:
+            _read(response, archive_budget.MAX_ARCHIVE_BYTES, deadline, raw)
+        raw.flush()
+        os.fsync(raw.fileno())
+        raw.seek(0)
+        hasher = hashlib.sha256()
+        while chunk := raw.read(1024 * 1024):
+            hasher.update(chunk)
+        actual = hasher.hexdigest()
         if digest != "sha256:" + actual:
             raise ValueError(
                 "raw artifact ZIP digest does not match immutable metadata"
             )
-        values = admit_outer_archive(raw)
-    # No output directory or member is created until all admission/decompression
-    # and integrity checks succeed. No-replace creation preserves collisions.
-    output.mkdir(mode=0o700)
-    created = []
+        raw.seek(0)
+        values = _admit_outer_handle(raw)
+    # Admit all bytes, then populate a private sibling before one atomic,
+    # no-replace publication. No member is written through the final name.
+    private = publication.create_private(".release-output-")
+    created: list[str] = []
     try:
         for name, value in values.items():
-            path = output / name
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            created.append(path)
+            fd = publication.open_member(private, name)
+            created.append(name)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(value)
                 handle.flush()
                 os.fsync(handle.fileno())
-    except BaseException:
-        for path in created:
-            path.unlink()
-        output.rmdir()
-        raise
+        publication.publish_private(private)
+        created.clear()
+    finally:
+        publication.cleanup_private(private, created)
     return {
         "artifact_id": artifact_id,
         "run_id": run_id,

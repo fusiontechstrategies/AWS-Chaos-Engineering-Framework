@@ -2,6 +2,16 @@
 
 ## Unreleased security follow-ups
 
+### Release download output publication
+
+- Both release download helpers reject shared or reparse-point output parents
+  before transport work, stage every admitted asset in a private sibling, and
+  publish the complete directory with an atomic no-replace operation. No asset
+  write follows the final output pathname after publication. Windows uses
+  retained directory handles for stage creation, member writes, cleanup and
+  publication; the outer Actions artifact ZIP is admitted from a bounded
+  temporary file handle.
+
 ### Evidence report publication
 
 - Reports now keep the serialized temporary file descriptor open through

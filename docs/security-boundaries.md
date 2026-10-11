@@ -442,7 +442,14 @@ tagged standalone source) before distribution checks, provenance and payload
 capture, and the protected job downloads only `release-evidence.json`, after
 admitting the whole release by size, before attestation. No `gh release
 download`, `sha256sum --check` or inline evidence parsing remains in the
-workflow. The helper creates each output directory and refuses an existing one.
+workflow. Both release download helpers require a current-user-owned output
+parent with no other-principal write access and reject reparse-point components
+before network or staging work. They pin the parent, fill a private sibling with
+all admitted files, and publish that complete directory atomically without
+replacing an existing output entry. No member write follows the final output
+pathname. Windows acquisition, member creation, cleanup and publication use
+retained directory handles and single-component relative operations; the
+Actions artifact ZIP stays in a bounded temporary file handle before admission.
 
 ## Destructive-call and transition evidence
 

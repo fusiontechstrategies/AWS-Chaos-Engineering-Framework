@@ -80,6 +80,7 @@ APPROVED_SOURCE_PATHS = frozenset(
         "scripts/prepare_release.py",
         "scripts/publish_payload.py",
         "scripts/release_asset_admission.py",
+        "scripts/release_output.py",
         "scripts/verify_distribution.py",
         "scripts/verify_publish_trust.py",
         "scripts/verify_release_handoff.py",
