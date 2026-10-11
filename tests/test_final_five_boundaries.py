@@ -4,7 +4,10 @@ import copy
 import hashlib
 import io
 import json
+import os
 import stat
+import subprocess
+import sys
 import urllib.error
 import zipfile
 from pathlib import Path
@@ -379,6 +382,95 @@ def test_mock_download_binds_identity_digest_and_preserves_output(
         for request in calls
         if request.full_url.startswith("https://api.github.com/")
     )
+
+
+def test_artifact_download_rejects_shared_parent_before_transport(
+    tmp_path, monkeypatch
+):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("GH_TOKEN", "synthetic-artifact-read-token")
+    monkeypatch.setattr(
+        downloader.urllib.request,
+        "build_opener",
+        lambda *_: pytest.fail("Transport started before parent admission"),
+    )
+    if os.name == "nt":
+
+        def reject_shared_acl(_handle, _user_sid, **_kwargs):
+            raise PermissionError("shared parent")
+
+        monkeypatch.setattr(
+            downloader.release_output, "_windows_acl_private", reject_shared_acl
+        )
+    else:
+        shared.chmod(0o777)
+    try:
+        with pytest.raises(PermissionError):
+            downloader.download("owner/repo", 12, 34, shared / "release-assets")
+        assert list(shared.iterdir()) == []
+    finally:
+        if os.name != "nt":
+            shared.chmod(0o700)
+
+
+def test_artifact_download_refuses_rebound_output_before_publication(
+    tmp_path, monkeypatch
+):
+    value = outer_zip(tmp_path).read_bytes()
+    digest = "sha256:" + hashlib.sha256(value).hexdigest()
+    metadata = {
+        "id": 12,
+        "workflow_run": {"id": 34},
+        "expired": False,
+        "name": "release-assets",
+        "size_in_bytes": len(value),
+        "digest": digest,
+    }
+
+    class Opener:
+        def open(self, request, timeout):
+            if request.full_url.endswith("/12"):
+                return Response(json.dumps(metadata).encode())
+            if request.full_url.endswith("/zip"):
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    302,
+                    "storage",
+                    {"Location": "https://storage.example/artifact"},
+                    Response(b""),
+                )
+            return Response(value)
+
+    monkeypatch.setenv("GH_TOKEN", "synthetic-artifact-read-token")
+    monkeypatch.setattr(downloader.urllib.request, "build_opener", lambda *_: Opener())
+    target = tmp_path / "target"
+    target.mkdir()
+    marker = target / "leaf-0.txt"
+    marker.write_bytes(b"existing target artifact")
+    output = tmp_path / "release-assets"
+    name = "_windows_rename_relative" if os.name == "nt" else "_rename_no_replace"
+    original = getattr(downloader.release_output, name)
+
+    def inject_at_native_publication(*args):
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).symlink_to(sys.argv[2], target_is_directory=True)",
+                str(output),
+                str(target),
+            ],
+            check=True,
+        )
+        original(*args)
+
+    monkeypatch.setattr(downloader.release_output, name, inject_at_native_publication)
+    with pytest.raises(ValueError, match="must be new"):
+        downloader.download("owner/repo", 12, 34, output)
+    assert list(target.iterdir()) == [marker]
+    assert marker.read_bytes() == b"existing target artifact"
+    assert output.is_symlink()
 
 
 def test_transport_actual_byte_and_deadline_budgets_are_enforced(monkeypatch):

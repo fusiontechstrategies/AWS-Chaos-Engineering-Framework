@@ -620,6 +620,248 @@ def test_declared_length_and_existing_output_are_refused(tmp_path, monkeypatch):
     assert list(output.iterdir()) == []
 
 
+def test_release_download_rejects_shared_parent_before_transport(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    transport = Transport(metadata())
+    install(monkeypatch, transport)
+    if os.name == "nt":
+
+        def reject_shared_acl(_handle, _user_sid, **_kwargs):
+            raise PermissionError("shared parent")
+
+        monkeypatch.setattr(
+            admission.release_output, "_windows_acl_private", reject_shared_acl
+        )
+    else:
+        shared.chmod(0o777)
+    try:
+        with pytest.raises(PermissionError):
+            admission.download("owner/repo", TAG, shared / "release-assets")
+        assert transport.requests == []
+        assert list(shared.iterdir()) == []
+    finally:
+        if os.name != "nt":
+            shared.chmod(0o700)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Native Windows ACL admission")
+def test_release_download_rejects_real_shared_windows_acl(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    subprocess.run(
+        ["icacls", str(shared), "/grant", "*S-1-5-11:(M)"],
+        check=True,
+        capture_output=True,
+    )
+    transport = Transport(metadata())
+    install(monkeypatch, transport)
+    try:
+        with pytest.raises(PermissionError):
+            admission.download("owner/repo", TAG, shared / "release-assets")
+        assert transport.requests == []
+        assert list(shared.iterdir()) == []
+    finally:
+        subprocess.run(
+            ["icacls", str(shared), "/remove:g", "*S-1-5-11"],
+            check=True,
+            capture_output=True,
+        )
+
+
+def test_windows_release_owner_accepts_only_user_or_active_admin_default():
+    trusted = admission.release_output._windows_owner_is_trusted
+    user = "S-1-5-21-1000"
+    admin = "S-1-5-32-544"
+    unrelated = "S-1-5-21-2000"
+    assert trusted(user, user, admin)
+    assert trusted(admin, user, admin)
+    assert not trusted(admin, user, unrelated)
+    assert not trusted(unrelated, user, unrelated)
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="Native Windows handle-relative publication"
+)
+def test_release_output_stays_bound_after_parent_name_rebind(tmp_path):
+    admitted = tmp_path / "admitted"
+    admitted.mkdir()
+    moved = tmp_path / "admitted-moved"
+    target = tmp_path / "target"
+    target.mkdir()
+    marker = target / "marker"
+    marker.write_bytes(b"existing target bytes")
+    try:
+        with admission.release_output.OwnedOutput(
+            admitted / "release-assets"
+        ) as output:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import pathlib,sys; "
+                        "pathlib.Path(sys.argv[1]).rename(sys.argv[2]); "
+                        "pathlib.Path(sys.argv[1]).symlink_to(sys.argv[3], target_is_directory=True)"
+                    ),
+                    str(admitted),
+                    str(moved),
+                    str(target),
+                ],
+                check=True,
+            )
+            private = output.create_private(".release-assets-")
+            fd = output.open_member(private, "fixed.txt")
+            with os.fdopen(fd, "wb") as sink:
+                sink.write(b"trusted bytes")
+            output.publish_private(private)
+        assert marker.read_bytes() == b"existing target bytes"
+        assert list(target.iterdir()) == [marker]
+    finally:
+        if admitted.is_symlink():
+            admitted.unlink()
+        if moved.exists():
+            moved.rename(admitted)
+    assert (admitted / "release-assets" / "fixed.txt").read_bytes() == b"trusted bytes"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Native Windows UTF-16 path admission")
+def test_release_output_accepts_supplementary_windows_parent_name(tmp_path):
+    parent = tmp_path / "admitted-\U0001f600"
+    parent.mkdir()
+    with admission.release_output.OwnedOutput(parent / "release-assets") as output:
+        private = output.create_private(".release-assets-")
+        fd = output.open_member(private, "fixed.txt")
+        with os.fdopen(fd, "wb") as sink:
+            sink.write(b"trusted bytes")
+        output.publish_private(private)
+    assert (parent / "release-assets" / "fixed.txt").read_bytes() == b"trusted bytes"
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="Native POSIX descriptor-relative output"
+)
+def test_release_output_posix_stage_and_publication_survive_parent_rebind(tmp_path):
+    parent = tmp_path / "admitted"
+    parent.mkdir()
+    moved = tmp_path / "admitted-moved"
+    target = tmp_path / "target"
+    target.mkdir()
+    marker = target / "marker"
+    marker.write_bytes(b"existing target bytes")
+    try:
+        with admission.release_output.OwnedOutput(parent / "release-assets") as output:
+            parent.rename(moved)
+            parent.symlink_to(target, target_is_directory=True)
+            private = output.create_private(".release-assets-")
+            fd = output.open_member(private, "fixed.txt")
+            with os.fdopen(fd, "wb") as sink:
+                sink.write(b"trusted bytes")
+            output.publish_private(private)
+        assert list(target.iterdir()) == [marker]
+        assert marker.read_bytes() == b"existing target bytes"
+    finally:
+        if parent.is_symlink():
+            parent.unlink()
+        if moved.exists():
+            moved.rename(parent)
+    assert (parent / "release-assets" / "fixed.txt").read_bytes() == b"trusted bytes"
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="Native POSIX descriptor-relative cleanup"
+)
+def test_release_output_posix_cleanup_survives_parent_rebind(tmp_path):
+    parent = tmp_path / "admitted"
+    parent.mkdir()
+    moved = tmp_path / "admitted-moved"
+    target = tmp_path / "target"
+    target.mkdir()
+    marker = target / "fixed.txt"
+    marker.write_bytes(b"existing target bytes")
+    try:
+        with admission.release_output.OwnedOutput(parent / "release-assets") as output:
+            private = output.create_private(".release-assets-")
+            fd = output.open_member(private, "fixed.txt")
+            with os.fdopen(fd, "wb") as sink:
+                sink.write(b"trusted bytes")
+            parent.rename(moved)
+            parent.symlink_to(target, target_is_directory=True)
+            output.cleanup_private(private, ["fixed.txt"])
+        assert list(target.iterdir()) == [marker]
+        assert marker.read_bytes() == b"existing target bytes"
+        assert not (moved / private.name).exists()
+    finally:
+        if parent.is_symlink():
+            parent.unlink()
+        if moved.exists():
+            moved.rename(parent)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="Native Darwin extended ACL admission"
+)
+def test_release_output_accepts_darwin_parent_without_extended_acl(tmp_path):
+    parent = tmp_path / "admitted"
+    parent.mkdir(mode=0o700)
+    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        admission.release_output._reject_darwin_extended_acl(fd)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="Native Darwin extended ACL admission"
+)
+def test_release_output_rejects_darwin_extended_parent_acl(tmp_path):
+    parent = tmp_path / "admitted"
+    parent.mkdir(mode=0o700)
+    subprocess.run(
+        ["chmod", "+a", "everyone allow add_file,delete_child", str(parent)],
+        check=True,
+        capture_output=True,
+    )
+    with (
+        pytest.raises(PermissionError, match="extended ACL"),
+        admission.release_output.OwnedOutput(parent / "release-assets"),
+    ):
+        pass
+
+
+def test_release_download_refuses_rebound_output_before_publication(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "target"
+    target.mkdir()
+    marker = target / EVIDENCE
+    marker.write_bytes(b"existing target asset")
+    output = tmp_path / "release-assets"
+    install(monkeypatch, Transport(metadata()))
+    name = "_windows_rename_relative" if os.name == "nt" else "_rename_no_replace"
+    original = getattr(admission.release_output, name)
+
+    def inject_at_native_publication(*args):
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).symlink_to(sys.argv[2], target_is_directory=True)",
+                str(output),
+                str(target),
+            ],
+            check=True,
+        )
+        original(*args)
+
+    monkeypatch.setattr(admission.release_output, name, inject_at_native_publication)
+    with pytest.raises(admission.AdmissionError, match="must be new"):
+        admission.download("owner/repo", TAG, output)
+    assert list(target.iterdir()) == [marker]
+    assert marker.read_bytes() == b"existing target asset"
+    assert output.is_symlink()
+
+
 def test_publish_payload_bounds_evidence_and_package_reads(tmp_path, monkeypatch):
     root = tmp_path / "release-assets"
     root.mkdir()
