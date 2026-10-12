@@ -88,6 +88,50 @@ def test_shared_nonsticky_report_directory_is_rejected_or_secured(
         assert not report.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ancestor permissions")
+def test_private_report_leaf_rejects_nonsticky_writable_ancestor(
+    tmp_path: Path,
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    private = shared / "private"
+    private.mkdir(mode=0o700)
+    shared.chmod(0o777)
+    try:
+        with pytest.raises(PermissionError, match="Unsafe report ancestor"):
+            framework.atomic_write_json(private / "report.json", {"trusted": True})
+        assert not (private / "report.json").exists()
+    finally:
+        shared.chmod(0o700)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ancestor permissions")
+def test_private_and_sticky_report_ancestors_still_publish(tmp_path: Path) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    sticky = tmp_path / "sticky"
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    nested = sticky / "owned"
+    nested.mkdir(mode=0o700)
+    for parent in (private, nested):
+        path = framework.atomic_write_json(parent / "report.json", {"trusted": True})
+        assert json.loads(path.read_text(encoding="utf-8")) == {"trusted": True}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ancestor traversal")
+def test_report_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    owned = tmp_path / "owned"
+    owned.mkdir(mode=0o700)
+    leaf = owned / "leaf"
+    leaf.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(owned, target_is_directory=True)
+    with pytest.raises(OSError):
+        framework.atomic_write_json(link / "leaf" / "report.json", {"trusted": True})
+    assert not (leaf / "report.json").exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
 def test_junction_report_directory_is_rejected_without_touching_existing_report(
     tmp_path: Path,

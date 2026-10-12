@@ -591,8 +591,28 @@ def test_extension_recovery_requires_original_post_state(action):
     assert not item.rollback_verified
 
 
+@pytest.mark.parametrize(
+    ("caller_arn", "expected_arn", "approved"),
+    [
+        (
+            f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ChaosOperator",
+            f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ChaosOperator",
+            True,
+        ),
+        (
+            f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/OtherOperator",
+            f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ChaosOperator",
+            False,
+        ),
+        (
+            f"arn:aws-us-gov:sts::{ACCOUNT_ID}:federated-user/FederatedOperator",
+            f"arn:aws-us-gov:sts::{ACCOUNT_ID}:federated-user/FederatedOperator",
+            True,
+        ),
+    ],
+)
 def test_constructor_live_token_matches_offline_token_without_config_mutation(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caller_arn, expected_arn, approved
 ):
     from types import SimpleNamespace
 
@@ -615,7 +635,7 @@ def test_constructor_live_token_matches_offline_token_without_config_mutation(
     identity = SimpleNamespace(
         get_caller_identity=lambda: {
             "Account": ACCOUNT_ID,
-            "Arn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ChaosOperator",
+            "Arn": caller_arn,
         },
         meta=fake_client_meta("sts"),
     )
@@ -631,15 +651,33 @@ def test_constructor_live_token_matches_offline_token_without_config_mutation(
     monkeypatch.setattr(framework.boto3, "Session", lambda **kwargs: session)
     monkeypatch.setattr(framework.atexit, "register", lambda *args: None)
     monkeypatch.setattr(framework.signal, "signal", lambda *args: None)
-    item = framework.ChaosOrchestrator(
-        str(path),
-        live=True,
-        profile="test",
-        seed=7,
-        output_dir=str(tmp_path / "reports"),
-    )
+
+    def construct():
+        return framework.ChaosOrchestrator(
+            str(path),
+            live=True,
+            profile="test",
+            expected_principal_arn=expected_arn,
+            seed=7,
+            output_dir=str(tmp_path / "reports"),
+        )
+
+    if not approved:
+        with pytest.raises(
+            framework.SafetyViolation, match="differs from live approval"
+        ):
+            construct()
+        assert not aws.calls
+        return
+    item = construct()
     suite = next(iter(config["experiment_suites"]))
-    scope = {"profile": "test", "role_arn": None, "vpc_id": None, "seed": 7}
+    scope = {
+        "profile": "test",
+        "role_arn": None,
+        "expected_principal_arn": expected_arn,
+        "vpc_id": None,
+        "seed": 7,
+    }
     token = framework.confirmation_token(config, suite, scope)
     assert item.expected_confirmation(suite, False) == token
     assert "dry_run" not in item.config["global"]
@@ -647,11 +685,43 @@ def test_constructor_live_token_matches_offline_token_without_config_mutation(
         ("vpc_id", "vpc-0123456789abcdef0"),
         ("seed", 8),
         ("role_arn", f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/another-approved-role"),
+        (
+            "expected_principal_arn",
+            f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/OtherOperator",
+        ),
         ("profile", "other"),
     ):
         assert (
             framework.confirmation_token(config, suite, {**scope, key: value}) != token
         )
+    if expected_arn.endswith(":role/ChaosOperator"):
+        legacy_dir = tmp_path / "legacy-positional"
+        plan = framework.ChaosOrchestrator(
+            str(path), None, False, False, "test", None, str(legacy_dir)
+        )
+        assert plan.output_dir == legacy_dir
+
+
+def test_profile_principal_change_invalidates_live_approval() -> None:
+    account = ACCOUNT_ID
+    intended = f"arn:aws-us-gov:iam::{account}:role/team/ChaosOperator"
+    actual = f"arn:aws-us-gov:sts::{account}:assumed-role/ChaosOperator/session-1"
+    changed = f"arn:aws-us-gov:sts::{account}:assumed-role/OtherOperator/session-2"
+    expected = framework.canonical_approval_principal(intended)
+    framework.require_approved_principal(expected, actual)
+    with pytest.raises(framework.SafetyViolation, match="differs from live approval"):
+        framework.require_approved_principal(expected, changed)
+    assert framework.canonical_approval_principal(actual) == expected
+    assert framework.canonical_approval_principal(changed) != expected
+    federated = f"arn:aws-us-gov:sts::{account}:federated-user/OperatorA"
+    assert framework.canonical_approval_principal(federated) == federated
+    framework.require_approved_principal(federated, federated)
+    with pytest.raises(framework.SafetyViolation, match="differs from live approval"):
+        framework.require_approved_principal(
+            federated, f"arn:aws-us-gov:sts::{account}:federated-user/OperatorB"
+        )
+    with pytest.raises(framework.SafetyViolation, match="KMS grant principal"):
+        framework.grant_principal_identity(federated)
 
 
 @pytest.mark.parametrize(

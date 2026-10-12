@@ -244,6 +244,7 @@ def profile_orchestrator(tmp_path):
         live_config(tmp_path, [{"type": "ec2_reboot", **values}], PROFILE_REGION),
         live=True,
         profile=PROFILE,
+        expected_principal_arn=f"arn:aws:iam::{ACCOUNT_ID}:role/ChaosOperator",
         output_dir=str(tmp_path / "reports"),
     )
     return orchestrator, values
@@ -315,6 +316,7 @@ def test_live_admission_without_resolvable_credentials_is_refused(tmp_path):
         framework.ChaosOrchestrator(
             live_config(tmp_path, [{"type": "ec2_reboot", "instance_ids": ["i-1"]}]),
             live=True,
+            expected_principal_arn=f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ChaosOperator",
             output_dir=str(tmp_path / "reports"),
         )
 
