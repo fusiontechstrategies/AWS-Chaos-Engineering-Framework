@@ -2,6 +2,15 @@
 
 ## Unreleased security follow-ups
 
+### Report path and live caller binding
+
+- POSIX report publication checks every named ancestor from the root, rejects
+  rebinding-capable directory chains, and revalidates the pathname before
+  announcing it.
+- Live approval binds the canonical expected AWS principal into the token and
+  execution grant. A changed same-account profile caller is refused before a
+  mutation; explicit roles supply their own expected principal.
+
 ### Credential origins, read models and KMS grants
 
 - Credential resolution now rejects proxy configuration before plaintext

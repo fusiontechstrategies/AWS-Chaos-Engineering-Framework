@@ -3281,6 +3281,33 @@ def grant_principal_identity(value: Any) -> tuple[str, str, str, str]:
     raise SafetyViolation("KMS grant principal is missing or malformed")
 
 
+def canonical_approval_principal(value: Any) -> str:
+    """Bind IAM/assumed-role callers and exact STS federated-user callers."""
+    if isinstance(value, str):
+        parts = value.split(":", 5)
+        if (
+            len(parts) == 6
+            and parts[0] == "arn"
+            and parts[1] in {"aws", "aws-us-gov", "aws-cn"}
+            and parts[2] == "sts"
+            and parts[3] == ""
+            and ACCOUNT_ID_PATTERN.fullmatch(parts[4])
+            and parts[5].startswith("federated-user/")
+        ):
+            name = parts[5].removeprefix("federated-user/")
+            if name and re.fullmatch(r"[A-Za-z0-9+=,.@_-]+", name):
+                return value
+    partition, account, kind, name = grant_principal_identity(value)
+    resource = "root" if kind == "root" else f"{kind}/{name}"
+    return f"arn:{partition}:iam::{account}:{resource}"
+
+
+def require_approved_principal(expected: str, actual: str | None) -> None:
+    """Refuse a live caller different from the principal in the reviewed token."""
+    if not actual or canonical_approval_principal(actual) != expected:
+        raise SafetyViolation("Active AWS principal differs from live approval")
+
+
 class PrivacyFormatter(logging.Formatter):
     """Formatter that redacts AWS identities and selected target values."""
 
@@ -3784,6 +3811,50 @@ def _windows_private_report_path(requested: Path) -> Path:
                 close_handle(handle)
 
 
+def _posix_report_ancestor_chain(parent: Path) -> tuple[tuple[int, int], ...]:
+    """Walk named ancestors from /, rejecting any chain another user can rebind."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current = os.open("/", flags)
+    identities: list[tuple[int, int]] = []
+    try:
+        for part in ("/", *parent.absolute().parts[1:]):
+            if part != "/":
+                child = os.open(part, flags, dir_fd=current)
+                try:
+                    actual = os.fstat(child)
+                    named = os.stat(part, dir_fd=current, follow_symlinks=False)
+                    if (actual.st_dev, actual.st_ino) != (
+                        named.st_dev,
+                        named.st_ino,
+                    ):
+                        raise PermissionError(
+                            "Report ancestor changed during traversal"
+                        )
+                except Exception:
+                    os.close(child)
+                    raise
+                os.close(current)
+                current = child
+            actual = os.fstat(current)
+            if (
+                not stat.S_ISDIR(actual.st_mode)
+                or actual.st_uid
+                not in {
+                    0,
+                    os.geteuid(),
+                }
+                or (
+                    actual.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    and not actual.st_mode & stat.S_ISVTX
+                )
+            ):
+                raise PermissionError(f"Unsafe report ancestor: {parent}")
+            identities.append((actual.st_dev, actual.st_ino))
+        return tuple(identities)
+    finally:
+        os.close(current)
+
+
 def _open_report_directory(parent: Path) -> int | list[int]:
     """Pin and validate a report directory before publishing evidence into it."""
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -3960,6 +4031,14 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> Path:
     temp_path: Path | None = None
     published = False
     try:
+        ancestor_chain = None
+        if os.name == "posix":
+            ancestor_chain = _posix_report_ancestor_chain(path.parent)
+            opened = os.fstat(directory_fd)
+            if ancestor_chain[-1] != (opened.st_dev, opened.st_ino):
+                raise PermissionError(
+                    "Report directory changed during ancestor traversal"
+                )
         if path.exists():
             raise FileExistsError(f"Refusing to overwrite existing report: {path}")
         with _report_temporary_file(path) as (temp_path, handle):
@@ -3991,6 +4070,16 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> Path:
             ):
                 raise PermissionError("Published report identity changed")
         _remove_report_entry(temp_path, directory_fd)
+        if ancestor_chain is not None:
+            if _posix_report_ancestor_chain(path.parent) != ancestor_chain:
+                raise PermissionError("Report ancestor changed before announcement")
+            named_final = os.stat(path, follow_symlinks=False)
+            if (named_final.st_dev, named_final.st_ino, named_final.st_size) != (
+                trusted.st_dev,
+                trusted.st_ino,
+                trusted.st_size,
+            ):
+                raise PermissionError("Published report pathname changed")
     except Exception:
         if published:
             try:
@@ -4695,6 +4784,7 @@ class _ExecutionGrant:
     region: str
     controller: Any
     targets: frozenset[str]
+    expected_principal_arn: str
     # The selected --vpc-id and its discovered (resource type, ID) inventory.
     vpc_id: str | None = None
     vpc_inventory: frozenset[tuple[str, str]] = frozenset()
@@ -12894,6 +12984,8 @@ class ChaosOrchestrator:
         allow_unbounded_fis_targets: bool = False,
         allow_live_without_safety_alarms: bool = False,
         seed: int | None = None,
+        *,
+        expected_principal_arn: str | None = None,
     ):
         if live and dry_run_flag:
             raise ConfigurationError("--live and --dry-run cannot be used together")
@@ -12916,8 +13008,8 @@ class ChaosOrchestrator:
 
         requested_role = role_arn or global_config.get("role_arn")
         if requested_role:
-            # Cover CLI precedence before making any STS request or forwarding
-            # the configured ExternalId to a different account or partition.
+            # Preserve configuration validation before canonicalizing an
+            # explicit role or opening any AWS session.
             effective_config = copy.deepcopy(self.config)
             effective_config["global"]["role_arn"] = requested_role
             validate_config_data(effective_config)
@@ -12927,6 +13019,20 @@ class ChaosOrchestrator:
                 raise ConfigurationError(
                     "Role assumption requires a configured account ID"
                 )
+        principal_input = expected_principal_arn or requested_role
+        if self.live and not principal_input:
+            raise SafetyViolation(
+                "Live approval requires an exact expected AWS principal ARN or explicit role"
+            )
+        self.expected_principal_arn = (
+            canonical_approval_principal(principal_input) if principal_input else None
+        )
+        if (
+            requested_role
+            and self.expected_principal_arn
+            != canonical_approval_principal(requested_role)
+        ):
+            raise SafetyViolation("Expected principal differs from requested role")
         # Harden before anything can resolve credentials or tokens: the profile's
         # provider chain (assume-role, web identity, SSO, SSO-OIDC) creates its
         # own SDK clients from this session.
@@ -12940,6 +13046,7 @@ class ChaosOrchestrator:
         self.approval_scope = {
             "profile": profile,
             "role_arn": requested_role,
+            "expected_principal_arn": self.expected_principal_arn,
             "vpc_id": vpc_id,
             "seed": seed,
         }
@@ -13035,6 +13142,7 @@ class ChaosOrchestrator:
                 raise SafetyViolation(
                     "The active AWS identity partition does not match the configured region"
                 )
+            require_approved_principal(self.expected_principal_arn, self.caller_arn)
             owner = _checked_origin_session(self.session)
             credentials = (
                 owner.get_credentials()
@@ -14380,6 +14488,7 @@ class ChaosOrchestrator:
                 account_id=self.expected_account,
                 dry_run=False,
                 operator_principal_arn=self.operator_principal_arn,
+                expected_principal_arn=self.expected_principal_arn,
                 active_access_key_id=self.active_access_key_id,
             )
             self._authorize_live_creation(experiment_type, runtime)
@@ -14391,6 +14500,7 @@ class ChaosOrchestrator:
                 self.region,
                 self.safety_controller,
                 frozenset(self._target_values(runtime)),
+                self.expected_principal_arn,
                 vpc_id,
                 frozenset(
                     (resource_type, value)
@@ -14430,10 +14540,12 @@ class ChaosOrchestrator:
             or self.safety_controller.expected_account != self.expected_account
             or self.safety_controller.region != self.region
             or not self.caller_arn
+            or not self.expected_principal_arn
         ):
             raise SafetyViolation(
                 "Live creation requires authenticated orchestrator identity"
             )
+        require_approved_principal(self.expected_principal_arn, self.caller_arn)
         irreversible = any(
             experiment_metadata(ChaosType(item["type"])).risk == RiskLevel.IRREVERSIBLE
             for item in entries
@@ -14460,6 +14572,7 @@ class ChaosOrchestrator:
                 account_id=self.expected_account,
                 dry_run=False,
                 operator_principal_arn=self.operator_principal_arn,
+                expected_principal_arn=self.expected_principal_arn,
                 active_access_key_id=self.active_access_key_id,
             )
             candidates.append(_canonical_execution_data(reviewed))
@@ -15631,12 +15744,22 @@ def confirmation_token(
         for key, value in reviewed.get("safety", {}).items()
         if not key.startswith("_runtime_")
     }
-    reviewed["execution_scope"] = execution_scope or {
-        "profile": None,
-        "role_arn": global_config.get("role_arn"),
-        "vpc_id": None,
-        "seed": None,
-    }
+    approval_scope = (
+        copy.deepcopy(execution_scope)
+        if execution_scope is not None
+        else {
+            "profile": None,
+            "role_arn": global_config.get("role_arn"),
+            "vpc_id": None,
+            "seed": None,
+        }
+    )
+    principal_input = approval_scope.get("expected_principal_arn") or effective_role
+    if principal_input:
+        approval_scope["expected_principal_arn"] = canonical_approval_principal(
+            principal_input
+        )
+    reviewed["execution_scope"] = approval_scope
     digest = hashlib.sha256(
         json.dumps(
             reviewed, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -15743,6 +15866,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", help="AWS shared configuration profile")
     parser.add_argument("--role-arn", help="AWS IAM role to assume for the run")
     parser.add_argument(
+        "--expected-principal-arn",
+        help="Exact reviewed AWS caller ARN for profile-based live approval",
+    )
+    parser.add_argument(
         "--output-dir",
         default="chaos-reports",
         help="JSON report directory on POSIX; Windows uses a fresh private directory under the user profile",
@@ -15813,6 +15940,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         validate_config_data(config)
         if args.show_live_token:
+            role = args.role_arn or config["global"].get("role_arn")
+            principal_input = args.expected_principal_arn or role
+            if not principal_input:
+                raise ConfigurationError(
+                    "A live token requires --expected-principal-arn or an explicit role"
+                )
+            expected_principal = canonical_approval_principal(principal_input)
+            if role and expected_principal != canonical_approval_principal(role):
+                raise ConfigurationError(
+                    "Expected principal differs from requested role"
+                )
             print(
                 safe_display(
                     confirmation_token(
@@ -15822,6 +15960,7 @@ def main(argv: list[str] | None = None) -> int:
                             "profile": args.profile,
                             "role_arn": args.role_arn
                             or config["global"].get("role_arn"),
+                            "expected_principal_arn": expected_principal,
                             "vpc_id": args.vpc_id,
                             "seed": args.seed,
                         },
@@ -15864,6 +16003,7 @@ def main(argv: list[str] | None = None) -> int:
                 live=args.live,
                 profile=args.profile,
                 role_arn=args.role_arn,
+                expected_principal_arn=args.expected_principal_arn,
                 output_dir=args.output_dir,
                 confirmation=args.confirm,
                 allow_irreversible=args.allow_irreversible,

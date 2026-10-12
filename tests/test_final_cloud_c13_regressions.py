@@ -225,7 +225,11 @@ def live_orchestrator(tmp_path, *, live: bool = True, role: bool = False):
         config["global"]["external_id"] = "synthetic-external-id"
         Path(path).write_text(framework.yaml.safe_dump(config), encoding="utf-8")
     orchestrator = framework.ChaosOrchestrator(
-        path, live=live, profile=PROFILE, output_dir=str(tmp_path / "reports")
+        path,
+        live=live,
+        profile=PROFILE,
+        expected_principal_arn=ROLE_ARN,
+        output_dir=str(tmp_path / "reports"),
     )
     return orchestrator, values
 

@@ -190,6 +190,11 @@ The live confirmation token includes SHA-256 of the complete reviewed configurat
 including experiment parameters, target allowlist, alarms, duration and safety
 limits. Editing any of these invalidates the token. Runtime-only approval flags
 are excluded because they are supplied by the CLI independently.
+The token also binds a canonical AWS caller principal. Profile-based live runs
+require `--expected-principal-arn` when printing the token and when starting the
+run; an explicit role supplies that principal automatically. Before creating
+any execution grant, the live STS caller must match the token-bound principal,
+including canonical IAM role and assumed-role session forms.
 
 SG rules, NACL rule/protocol/CIDR/direction, RDS parameter arrays, Lambda environment
 changes, ELB descriptors, CloudFront invalidation paths and WAF IP-set scope/CIDRs

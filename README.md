@@ -114,12 +114,17 @@ python .\aws_chaos_framework.py `
   --config .\chaos.yaml `
   --suite tagged_ec2_recovery `
   --profile chaos-test `
+  --expected-principal-arn arn:aws:iam::123456789012:role/ChaosOperator `
   --show-live-token
 ```
 
 Materialize discovery placeholders into explicit resource IDs before generating
 this token. Add those IDs to the exact target allowlist. Use the same profile,
 role, VPC and seed options when generating the token and running the suite.
+For a profile-based run, supply the exact reviewed caller ARN with
+`--expected-principal-arn` both times. An explicit role supplies that identity
+automatically. Live startup checks the canonical STS caller against the
+principal bound into the token.
 
 Then provide that exact token with `--live`:
 
@@ -128,6 +133,7 @@ python .\aws_chaos_framework.py `
   --config .\chaos.yaml `
   --suite tagged_ec2_recovery `
   --profile chaos-test `
+  --expected-principal-arn arn:aws:iam::123456789012:role/ChaosOperator `
   --live `
   --confirm "<paste the complete token including its SHA256 digest>"
 ```
@@ -165,7 +171,7 @@ EC2 termination is planning only: AWS cannot bind a termination request to the r
 ## Evidence and privacy
 
 Each suite creates an atomic JSON report in `chaos-reports/` unless another output directory is selected. Reports include mode, framework version, action status, duration, mutation attempts, rollback attempts, and recovery outcomes.
-On POSIX systems, report output requires a directory owned by the current user and rejects shared group- or other-writable directories without sticky-bit protection. Report publication verifies that the final file is the exact private temporary file written by the framework; a changed file identity fails without announcing a saved report.
+On POSIX systems, report output requires a directory owned by the current user. Every ancestor must be owned by that user or root, with no writable non-sticky or symlinked component. Publication rechecks the named chain and the exact private report inode before returning its path.
 On Windows, reports are stored in a fresh private directory directly under the user's profile. The chosen `--output-dir` is not used as a publication path on Windows, because a previously shared directory may retain open writer handles even after its access list is narrowed. A requested directory equal to or containing the profile is refused because it would overlap the private publication anchor. The actual report path is returned and logged. The framework creates the private directory with a protected access list from inception, rejects reparse points in its path, and checks the temporary file's access list before publication.
 
 By default, reports omit AWS identity and resource identifiers. These fields can be enabled separately:

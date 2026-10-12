@@ -1114,6 +1114,7 @@ def make_orchestrator(
         orchestrator = framework.ChaosOrchestrator(
             str(config_path),
             live=not dry_run,
+            expected_principal_arn=principal,
             allow_irreversible=True,
             output_dir=str(Path(fixture.name) / "reports"),
         )
