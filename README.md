@@ -252,8 +252,21 @@ pass it on:
 constructor raise `SafetyViolation` for a boto3 session that
 `harden_session_origin` has not marked, before any credential or token is
 resolved, and `harden_session_origin` refuses a session whose credential or
-token provider was already initialized. A session object without a botocore
-core (a test double) remains accepted.
+token provider was already initialized. A wrapper is admitted only when its
+client and credential methods are bound directly to the same hardened boto3
+session. Test doubles use the internal provider-free class with a fixed client
+map and static credentials; it does not accept client factories.
+
+Credential resolution refuses HTTP, HTTPS or all-protocol proxy settings,
+including system-discovered proxies and Botocore's default client configuration,
+before metadata or container token requests. Customer service models in
+`AWS_DATA_PATH` or `~/.aws/models` are not used; reviewed read operations are
+bound to packaged Botocore wire metadata and rechecked when saved callables or
+paginator pages dispatch.
+KMS grant revocation requires approved grantee and retiring principal ARNs in
+the experiment configuration and refuses grants held by the operator or a
+recovery identity. Global recovery identities remain protected even when an
+experiment overrides their configuration fields.
 
 Direct handler calls redact their own targets without the CLI. Each public
 handler call registers the identifiers bound by the experiment configuration

@@ -15,6 +15,7 @@ from test_aws_chaos_framework import (
     make_experiment,
     planning_only_experiment,
     prepare_lambda_memory,
+    provider_free_session,
 )
 
 import aws_chaos_framework as framework
@@ -40,10 +41,11 @@ def raw_owner(config, controller):
     clients = (
         controller.aws
         if isinstance(controller, FakeSafetyController)
-        else SimpleNamespace(
+        else provider_free_session(
             client=lambda service: controller.session.client(
                 service, region_name=config.get("region", REGION)
-            )
+            ),
+            services=(*framework.READ_ONLY_OPERATIONS, "ssm"),
         )
     )
     return make_experiment(
@@ -620,7 +622,7 @@ def test_constructor_live_token_matches_offline_token_without_config_mutation(
     frozen = SimpleNamespace(
         access_key="ASIA" + "Z" * 16, secret_key="synthetic", token="synthetic"
     )
-    session = SimpleNamespace(
+    session = provider_free_session(
         client=lambda service, **kwargs: (
             identity if service == "sts" else aws.client(service)
         ),
@@ -1178,17 +1180,17 @@ def test_ec2_termination_has_no_live_authority_in_token_handler_or_sdk():
 
 # Native botocore controls use synthetic credentials and Stubber, never transport.
 def native_target_experiment(kind, values):
-    session = framework.boto3.Session(
-        aws_access_key_id="synthetic",
-        aws_secret_access_key="synthetic",
-        region_name=REGION,
+    session = framework.harden_session_origin(
+        framework.boto3.Session(
+            aws_access_key_id="synthetic",
+            aws_secret_access_key="synthetic",
+            region_name=REGION,
+        )
     )
     return make_experiment(
         kind,
         values,
-        SimpleNamespace(
-            client=lambda service: session.client(service, region_name=REGION)
-        ),
+        session,
         dry_run=False,
     )
 
@@ -1206,8 +1208,10 @@ def test_native_ecr_digest_deletion_cannot_obtain_live_approval():
         "repository_name": "reviewed-repo",
         "image_ids": [{"imageDigest": DIGEST}],
     }
-    raw = framework.boto3.Session(
-        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    raw = framework.harden_session_origin(
+        framework.boto3.Session(
+            aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+        )
     ).client("ecr", region_name=REGION)
     with Stubber(raw) as stub:
         # No response is queued: any native request would fail the stub.
@@ -1217,7 +1221,7 @@ def test_native_ecr_digest_deletion_cannot_obtain_live_approval():
             make_experiment(
                 framework.ChaosType.ECR_IMAGE_DELETE,
                 values,
-                SimpleNamespace(client=lambda service: raw),
+                provider_free_session(client=lambda service: raw),
                 dry_run=False,
             )
         stub.assert_no_pending_responses()
@@ -1248,7 +1252,12 @@ def test_native_kms_grant_key_identity_before_dispatch(attack):
         "foreign_account": key.replace(ACCOUNT_ID, "999900001111"),
         "foreign_region": key.replace(REGION, "us-gov-east-1"),
     }.get(attack, key)
-    values = {"key_id": supplied, "grant_id": "1" * 64}
+    values = {
+        "key_id": supplied,
+        "grant_id": "1" * 64,
+        "grantee_principal_arn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ReviewedGrantee",
+        "retiring_principal_arn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ReviewedRetirer",
+    }
     if attack in {"alias", "bare_id", "alias_arn", "foreign_account", "foreign_region"}:
         # These identities cannot obtain public live approval. The same cases
         # now stop before a client can perform the formerly tested lookup.
@@ -1270,6 +1279,8 @@ def test_native_kms_grant_key_identity_before_dispatch(attack):
                 if attack != "wrong_key_response"
                 else key.replace(ACCOUNT_ID, "999900001111"),
                 "GrantId": values["grant_id"],
+                "GranteePrincipal": values["grantee_principal_arn"],
+                "RetiringPrincipal": values["retiring_principal_arn"],
             }
             stub.add_response(
                 "list_grants",
@@ -1281,10 +1292,10 @@ def test_native_kms_grant_key_identity_before_dispatch(attack):
                 "revoke_grant", {}, {"KeyId": key, "GrantId": values["grant_id"]}
             )
         result = item.revoke_grant(**values)
+        assert result.status == ("completed" if attack == "valid" else "failed"), (
+            result.errors
+        )
         stub.assert_no_pending_responses()
-    assert result.status == ("completed" if attack == "valid" else "failed"), (
-        result.errors
-    )
     assert bool(item.mutation_attempts) == (attack == "valid")
 
 
@@ -1352,8 +1363,9 @@ def test_native_cloudfront_canonical_child_admission(attack):
     item = make_experiment(
         kind,
         {"region": "us-east-1", **values},
-        SimpleNamespace(
-            client=lambda service: session.client(service, region_name="us-east-1")
+        provider_free_session(
+            client=lambda service: session.client(service, region_name="us-east-1"),
+            services=("cloudfront",),
         ),
         dry_run=False,
     )
@@ -1423,8 +1435,9 @@ def test_native_waf_canonical_children_and_scope_before_mutation(attack):
     item = make_experiment(
         kind,
         values,
-        SimpleNamespace(
-            client=lambda service: session.client(service, region_name=REGION)
+        provider_free_session(
+            client=lambda service: session.client(service, region_name=REGION),
+            services=("wafv2",),
         ),
         dry_run=False,
     )
@@ -1492,7 +1505,11 @@ def test_native_raw_protected_requests_have_no_handler_authority(
             "revoke_grant",
             framework.ChaosType.KMS_GRANT_REVOKE,
             {"KeyId": key, "GrantId": "1" * 64},
-            {"key_id": key, "grant_id": "1" * 64},
+            {
+                **action_configs()[framework.ChaosType.KMS_GRANT_REVOKE],
+                "key_id": key,
+                "grant_id": "1" * 64,
+            },
         ),
         "ecr": (
             "batch_delete_image",
@@ -1538,11 +1555,11 @@ def test_native_raw_protected_requests_have_no_handler_authority(
         ),
     }
     operation, kind, request, values = cases[service]
-    raw = framework.boto3.Session(
-        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    raw = framework.harden_session_origin(
+        framework.boto3.Session(
+            aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+        )
     ).client(service, region_name=region)
-    from types import SimpleNamespace
-
     safety = framework.SafetyController(
         {
             "target_allowlist": sorted(
@@ -1554,7 +1571,7 @@ def test_native_raw_protected_requests_have_no_handler_authority(
             else [],
             "max_blast_radius": 100,
         },
-        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        provider_free_session(client=lambda *args, **kwargs: raw),
         region,
         True,
         ACCOUNT_ID,
@@ -1571,7 +1588,7 @@ def test_native_raw_protected_requests_have_no_handler_authority(
                 make_experiment(
                     kind,
                     {**values, "region": region},
-                    SimpleNamespace(client=lambda service: raw),
+                    provider_free_session(client=lambda service: raw),
                     dry_run=False,
                 )
             stub.assert_no_pending_responses()
@@ -1579,7 +1596,7 @@ def test_native_raw_protected_requests_have_no_handler_authority(
     owner = make_experiment(
         kind,
         {**values, "region": region},
-        SimpleNamespace(client=lambda service: raw),
+        provider_free_session(client=lambda service: raw),
         dry_run=False,
     )
     owner.safety_controller.config.update(safety.config)
@@ -1619,14 +1636,17 @@ def test_native_elb_cognito_snapshot_is_restorable_before_fault(attack):
             "TargetGroupArn": f"arn:aws-us-gov:elasticloadbalancing:{REGION}:{ACCOUNT_ID}:targetgroup/reviewed/123",
         },
     ]
-    session = framework.boto3.Session(
-        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    session = framework.harden_session_origin(
+        framework.boto3.Session(
+            aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+        )
     )
     item = make_experiment(
         framework.ChaosType.ELB_LISTENER_RULE_MODIFY,
         {"rule_arn": rule},
-        SimpleNamespace(
-            client=lambda service: session.client(service, region_name=REGION)
+        provider_free_session(
+            client=lambda service: session.client(service, region_name=REGION),
+            services=("elbv2",),
         ),
         dry_run=True,
     )
@@ -1698,8 +1718,6 @@ def test_lambda_recovery_preserves_opaque_arn_values():
     "attack", ["opaque", "foreign_function", "foreign_role", "oversized"]
 )
 def test_native_lambda_application_text_does_not_erase_identity_checks(attack):
-    from types import SimpleNamespace
-
     from botocore.stub import Stubber
 
     function = f"arn:aws-us-gov:lambda:{REGION}:{ACCOUNT_ID}:function:reviewed"
@@ -1715,12 +1733,14 @@ def test_native_lambda_application_text_does_not_erase_identity_checks(attack):
         request["Environment"]["Variables"]["OPAQUE"] = "x" * (
             framework.MAX_CONFIG_BYTES + 1
         )
-    raw = framework.boto3.Session(
-        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    raw = framework.harden_session_origin(
+        framework.boto3.Session(
+            aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+        )
     ).client("lambda", region_name=REGION)
     safety = framework.SafetyController(
         {},
-        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        provider_free_session(client=lambda *args, **kwargs: raw),
         REGION,
         True,
         ACCOUNT_ID,
@@ -1753,7 +1773,11 @@ def test_native_protected_dispatch_ticket_is_single_use_exact_and_thread_local(a
     from botocore.stub import Stubber
 
     key = f"arn:aws-us-gov:kms:{REGION}:{ACCOUNT_ID}:key/01234567-89ab-cdef-0123-456789abcdef"
-    values = {"key_id": key, "grant_id": "1" * 64}
+    values = {
+        **action_configs()[framework.ChaosType.KMS_GRANT_REVOKE],
+        "key_id": key,
+        "grant_id": "1" * 64,
+    }
     owner = native_target_experiment(framework.ChaosType.KMS_GRANT_REVOKE, values)
     owner.safety_controller.check_safety_conditions = lambda: (True, [])
     request = {"KeyId": key, "GrantId": values["grant_id"]}
@@ -1852,8 +1876,6 @@ def test_sdk_request_budget_covers_root_keys_and_aggregate_text(attack):
     ],
 )
 def test_native_sns_firehose_role_reference_is_narrow_and_owner_bound(attack):
-    from types import SimpleNamespace
-
     from botocore.stub import Stubber
 
     topic = f"arn:aws-us-gov:sns:{REGION}:{ACCOUNT_ID}:reviewed"
@@ -1889,12 +1911,14 @@ def test_native_sns_firehose_role_reference_is_narrow_and_owner_bound(attack):
         )
     elif attack == "endpoint_account":
         request["Endpoint"] = request["Endpoint"].replace(ACCOUNT_ID, "999900001111")
-    raw = framework.boto3.Session(
-        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    raw = framework.harden_session_origin(
+        framework.boto3.Session(
+            aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+        )
     ).client("sns", region_name=REGION)
     safety = framework.SafetyController(
         {},
-        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        provider_free_session(client=lambda *args, **kwargs: raw),
         REGION,
         True,
         ACCOUNT_ID,
@@ -1995,14 +2019,16 @@ def test_native_sns_snapshot_admission_precedes_irreversible_fault(protocol, att
         request["Attributes"] = {"SubscriptionRoleArn": details["SubscriptionRoleArn"]}
     # Former live unsubscribe/subscribe success is withdrawn and unexecuted.
     refused_aws = assert_sns_subscription_live_refuses_without_effects(subscription)
-    session = framework.boto3.Session(
-        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+    session = framework.harden_session_origin(
+        framework.boto3.Session(
+            aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
+        )
     )
     raw = session.client("sns", region_name=REGION)
     owner = make_experiment(
         framework.ChaosType.SNS_SUBSCRIPTION_DELETE,
         {"subscription_arn": subscription},
-        SimpleNamespace(client=lambda service: raw),
+        provider_free_session(client=lambda service: raw),
         dry_run=True,
     )
     with Stubber(raw) as stub:

@@ -15,6 +15,7 @@ from test_aws_chaos_framework import (
     make_experiment,
     make_orchestrator,
     prepare_lambda_memory,
+    provider_free_session,
 )
 
 import aws_chaos_framework as f
@@ -45,7 +46,9 @@ def test_later_orchestrator_signal_stops_earlier_controller_and_keeps_rollback(
     )
     monkeypatch.setattr(f.atexit, "register", lambda *args: None)
     aws = FakeAWS(reject_writes=False)
-    session = SimpleNamespace(client=lambda service, **kwargs: aws.client(service))
+    session = provider_free_session(
+        client=lambda service, **kwargs: aws.client(service)
+    )
     monkeypatch.setattr(f.boto3, "Session", lambda **kwargs: session)
     cfg = config_for(f.ChaosType.EC2_REBOOT, instance_ids=[INSTANCE_ID])
     path = tmp_path / "config.yaml"
@@ -312,7 +315,7 @@ def test_guardduty_active_old_finding_in_later_detector_and_page_blocks():
     )
     safety = f.SafetyController(
         {"fail_closed": True},
-        SimpleNamespace(client=lambda *args, **kwargs: client),
+        provider_free_session(client=lambda *args, **kwargs: client),
         REGION,
         True,
     )
@@ -357,7 +360,7 @@ def test_securityhub_notified_blocks_but_resolved_suppressed_archived_do_not(
     )
     safety = f.SafetyController(
         {"fail_closed": True},
-        SimpleNamespace(client=lambda *args, **kwargs: client),
+        provider_free_session(client=lambda *args, **kwargs: client),
         REGION,
         True,
     )
@@ -371,7 +374,7 @@ def test_security_pages_cycle_fails_closed():
     )
     safety = f.SafetyController(
         {"fail_closed": True},
-        SimpleNamespace(client=lambda *args, **kwargs: client),
+        provider_free_session(client=lambda *args, **kwargs: client),
         REGION,
         True,
     )
@@ -626,7 +629,9 @@ def test_live_preflight_and_duration_failure_latch_every_controller(path, raises
 @pytest.mark.parametrize("method", ["vpc", "peering_deleted", "peering_not_found"])
 def test_stop_during_terminal_read_cannot_complete_forward_wait(method):
     aws = FakeAWS(reject_writes=False)
-    session = SimpleNamespace(client=lambda service, **kwargs: aws.client(service))
+    session = provider_free_session(
+        client=lambda service, **kwargs: aws.client(service)
+    )
     safety = f.SafetyController({}, session, REGION, True)
     safety.check_safety_conditions = lambda: (True, [])
     if method == "vpc":
