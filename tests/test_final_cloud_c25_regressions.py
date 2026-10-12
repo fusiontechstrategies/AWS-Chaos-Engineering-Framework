@@ -515,10 +515,11 @@ def test_provider_free_injection_refuses_dynamic_session_factory():
 
 def test_provider_free_adapter_cannot_be_subclassed_or_shadowed():
     with pytest.raises(TypeError, match="cannot be subclassed"):
-
-        class DelegatingSession(framework._ProviderFreeSession):
-            def get_credentials(self):
-                return synthetic_session().get_credentials()
+        type(
+            "DelegatingSession",
+            (framework._ProviderFreeSession,),
+            {"get_credentials": lambda self: synthetic_session().get_credentials()},
+        )
 
     fake = framework._ProviderFreeSession({"sts": FakeAWS().client("sts")})
     with pytest.raises(AttributeError):

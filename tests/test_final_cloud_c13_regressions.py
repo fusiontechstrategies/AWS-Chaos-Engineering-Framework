@@ -1151,7 +1151,15 @@ def test_provider_client_routed_off_origin_is_refused_before_sending(
     monkeypatch.setenv("AWS_DATA_PATH", str(data_path))
     orchestrator, _values = live_orchestrator(tmp_path)
     assert orchestrator.actual_account == ACCOUNT_ID
-    assert sent and all("amazonaws.com" in host for _, host in provider_hosts(sent))
+    allowed_hosts = (
+        "sts.us-east-1.amazonaws.com",
+        f"portal.sso.{SSO_REGION}.amazonaws.com",
+        f"oidc.{SSO_REGION}.amazonaws.com",
+    )
+    assert sent and all(
+        any(host == expected for expected in allowed_hosts)
+        for _, host in provider_hosts(sent)
+    )
 
 
 def test_hardened_session_binds_every_created_client(tmp_path, monkeypatch):
