@@ -12,7 +12,6 @@ import io
 import os
 import re
 import stat
-import tempfile
 import time
 import unicodedata
 import zipfile
@@ -245,14 +244,14 @@ def normalize_wheel(path: Path, source_date_epoch: int) -> str:
             values[name] = normalize_generated_text(name, values[name])
     values[record_name] = build_record(values, record_name)
 
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    os.close(descriptor)
-    temporary_path = Path(temporary_name)
-    try:
+    with archive_budget.pinned_staging(path) as (
+        staged_file,
+        temporary_path,
+        owner,
+        private,
+    ):
         with zipfile.ZipFile(
-            temporary_path, mode="w", compression=zipfile.ZIP_STORED
+            staged_file, mode="w", compression=zipfile.ZIP_STORED
         ) as output:
             for name in sorted(values):
                 member = zipfile.ZipInfo(name, timestamp)
@@ -263,12 +262,35 @@ def normalize_wheel(path: Path, source_date_epoch: int) -> str:
                 member.extra = b""
                 member.comment = b""
                 output.writestr(member, values[name])
-        verify_normalized(temporary_path, values, timestamp)
-        temporary_path.replace(path)
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
-    return archive_budget.file_digest(path)
+        staged_file.flush()
+        os.fsync(staged_file.fileno())
+        staged_identity = os.fstat(staged_file.fileno())
+        current_identity = archive_budget.stage_stat(temporary_path, owner, private)
+        require(
+            stat.S_ISREG(current_identity.st_mode)
+            and (current_identity.st_dev, current_identity.st_ino)
+            == (staged_identity.st_dev, staged_identity.st_ino),
+            "Normalized wheel staging file changed",
+        )
+        retained = archive_budget.RetainedStage(staged_file)
+        verify_normalized(retained, values, timestamp)
+        digest = archive_budget.file_digest(retained)
+        staged_file.close()
+        current_identity = archive_budget.stage_stat(temporary_path, owner, private)
+        require(
+            stat.S_ISREG(current_identity.st_mode)
+            and (current_identity.st_dev, current_identity.st_ino)
+            == (staged_identity.st_dev, staged_identity.st_ino),
+            "Normalized wheel staging file changed",
+        )
+        archive_budget.replace_staged(
+            temporary_path,
+            path,
+            owner,
+            private,
+            (staged_identity.st_dev, staged_identity.st_ino),
+        )
+    return digest
 
 
 def main() -> int:

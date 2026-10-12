@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import os
 import re
+import stat
 import struct
 import tarfile
 import tempfile
@@ -167,12 +168,12 @@ def normalize_sdist(path: Path, source_date_epoch: int) -> str:
     ]
     expected_identity = sorted(member_identity(normalized_inputs))
 
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    os.close(descriptor)
-    temporary_path = Path(temporary_name)
-    try:
+    with archive_budget.pinned_staging(path) as (
+        compressed,
+        temporary_path,
+        owner,
+        private,
+    ):
         with tempfile.TemporaryFile() as raw_tar:
             with tarfile.open(
                 fileobj=raw_tar, mode="w", format=tarfile.PAX_FORMAT
@@ -198,18 +199,39 @@ def normalize_sdist(path: Path, source_date_epoch: int) -> str:
                         normalized.mode = 0o644
                         normalized.size = len(value)
                         output.addfile(normalized, BytesIO(value))
-            with temporary_path.open("wb") as compressed:
-                write_stored_gzip(raw_tar, compressed, source_date_epoch)
-        normalized_members = read_members(temporary_path)
+            write_stored_gzip(raw_tar, compressed, source_date_epoch)
+            compressed.flush()
+            os.fsync(compressed.fileno())
+            staged_identity = os.fstat(compressed.fileno())
+        current_identity = archive_budget.stage_stat(temporary_path, owner, private)
+        require(
+            stat.S_ISREG(current_identity.st_mode)
+            and (current_identity.st_dev, current_identity.st_ino)
+            == (staged_identity.st_dev, staged_identity.st_ino),
+            "Normalized sdist staging file changed",
+        )
+        retained = archive_budget.RetainedStage(compressed)
+        normalized_members = read_members(retained)
         require(
             member_identity(normalized_members) == expected_identity,
             "Normalized archive changed names or file contents",
         )
-        temporary_path.replace(path)
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
-    digest = archive_budget.file_digest(path)
+        digest = archive_budget.file_digest(retained)
+        compressed.close()
+        current_identity = archive_budget.stage_stat(temporary_path, owner, private)
+        require(
+            stat.S_ISREG(current_identity.st_mode)
+            and (current_identity.st_dev, current_identity.st_ino)
+            == (staged_identity.st_dev, staged_identity.st_ino),
+            "Normalized sdist staging file changed",
+        )
+        archive_budget.replace_staged(
+            temporary_path,
+            path,
+            owner,
+            private,
+            (staged_identity.st_dev, staged_identity.st_ino),
+        )
     return digest
 
 

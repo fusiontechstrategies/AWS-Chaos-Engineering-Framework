@@ -1,8 +1,12 @@
 """Offline adversarial regressions for the fb87be0 runtime scan findings."""
 
 import copy
+import os
 import subprocess
 import sys
+import time
+import tracemalloc
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from unittest.mock import patch
 
@@ -986,3 +990,221 @@ def test_nacl_conditional_association_recovery_never_reverses_external_change(at
     assert not writes(aws)
     if attack == "unconfirmed_forward":
         assert aws.calls == before
+
+
+def test_yaml_composition_rejects_deep_and_high_node_inputs_before_construction(
+    tmp_path,
+):
+    path = tmp_path / "bounded.yaml"
+    deep = "\n".join("  " * depth + "child:" for depth in range(70)) + "\n"
+    broad = "root:\n" + "  - [" + ", ".join(["x"] * 100) + "]\n"
+    path.write_text(deep, encoding="utf-8")
+    assert path.stat().st_size < framework.MAX_CONFIG_BYTES
+    with pytest.raises(framework.ConfigurationError, match="nesting exceeds"):
+        framework.load_yaml_config(str(path))
+    path.write_text("root:\n" + broad.split("\n", 1)[1] * 101, encoding="utf-8")
+    assert path.stat().st_size < framework.MAX_CONFIG_BYTES
+    tracemalloc.start()
+    started = time.perf_counter()
+    try:
+        with pytest.raises(framework.ConfigurationError, match="node count exceeds"):
+            framework.load_yaml_config(str(path))
+        elapsed = time.perf_counter() - started
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert elapsed < 20
+    assert peak < 128 * 1024 * 1024
+
+
+def test_yaml_composition_accepts_documented_width_and_rejects_scalar_budgets(tmp_path):
+    path = tmp_path / "bounded.yaml"
+    items = ["x"] * framework.MAX_CONFIG_COLLECTION_WIDTH
+    path.write_text("root: [" + ", ".join(items) + "]\n", encoding="utf-8")
+    assert framework.load_yaml_config(str(path))["root"] == items
+    for scalar, message in (
+        ("x" * (framework.MAX_CONFIG_SCALAR_CHARS + 1), "scalar exceeds"),
+        ("9" * (framework.MAX_CONFIG_NUMERIC_CHARS + 1), "number exceeds"),
+        ("! " + "9" * (framework.MAX_CONFIG_NUMERIC_CHARS + 1), "number exceeds"),
+        ("!!int " + "9" * (framework.MAX_CONFIG_NUMERIC_CHARS + 1), "number exceeds"),
+    ):
+        path.write_text("root: " + scalar + "\n", encoding="utf-8")
+        with pytest.raises(framework.ConfigurationError, match=message):
+            framework.load_yaml_config(str(path))
+
+
+def test_yaml_composition_accepts_maximum_node_count_and_supported_depth(tmp_path):
+    path = tmp_path / "bounded.yaml"
+    groups = ["  - [" + ", ".join(["x"] * 100) + "]\n"] * 98
+    groups.append("  - [" + ", ".join(["x"] * 98) + "]\n")
+    path.write_text("root:\n" + "".join(groups), encoding="utf-8")
+    assert path.stat().st_size < framework.MAX_CONFIG_BYTES
+    assert (
+        sum(len(group) for group in framework.load_yaml_config(str(path))["root"])
+        == 9898
+    )
+    nested = "\n".join("  " * depth + f"key{depth}:" for depth in range(62))
+    path.write_text(nested + "\n" + "  " * 62 + "leaf: 1\n", encoding="utf-8")
+    assert isinstance(framework.load_yaml_config(str(path)), dict)
+
+
+def test_yaml_composition_accepts_mapping_scalar_and_numeric_maxima(tmp_path):
+    path = tmp_path / "bounded.yaml"
+    entries = [
+        f"key{index}: x" for index in range(framework.MAX_CONFIG_COLLECTION_WIDTH)
+    ]
+    path.write_text("\n".join(entries) + "\n", encoding="utf-8")
+    assert len(framework.load_yaml_config(str(path))) == len(entries)
+    scalar = "x" * framework.MAX_CONFIG_SCALAR_CHARS
+    path.write_text("root: " + scalar + "\n", encoding="utf-8")
+    assert framework.load_yaml_config(str(path))["root"] == scalar
+    number = "9" * framework.MAX_CONFIG_NUMERIC_CHARS
+    path.write_text("root: " + number + "\n", encoding="utf-8")
+    assert framework.load_yaml_config(str(path))["root"] == int(number)
+
+
+@pytest.mark.parametrize("scalar", ("!!int _", "!!int __", "!!float _"))
+def test_yaml_malformed_numeric_constructor_is_source_free(tmp_path, scalar):
+    path = tmp_path / "bounded.yaml"
+    path.write_text("root: " + scalar + "\n", encoding="utf-8")
+    with pytest.raises(framework.ConfigurationError) as captured:
+        framework.load_yaml_config(str(path))
+    assert "Invalid YAML configuration" in str(captured.value)
+    assert "root:" not in str(captured.value)
+    assert captured.value.__cause__ is None
+
+
+def test_config_bounded_reader_uses_only_retained_descriptor(tmp_path):
+    original = tmp_path / "original.yaml"
+    selected = tmp_path / "selected.yaml"
+    original.write_bytes(b"root: original\n")
+    selected.write_bytes(b"root: replacement\n")
+
+    @contextmanager
+    def original_descriptor(_path):
+        descriptor = os.open(original, os.O_RDONLY)
+        try:
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    with patch.object(framework, "_config_descriptor", original_descriptor):
+        assert framework._read_config_bytes(selected) == b"root: original\n"
+
+
+def test_config_path_replacement_after_open_reads_original_or_fails_closed(tmp_path):
+    selected = tmp_path / "selected.yaml"
+    replacement = tmp_path / "replacement.yaml"
+    selected.write_text("root: original\n", encoding="utf-8")
+    replacement.write_text("root: replacement\n", encoding="utf-8")
+    real_fstat = framework.os.fstat
+    attempted = False
+
+    def switch_after_open(descriptor):
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            with suppress(PermissionError):
+                os.replace(replacement, selected)
+        return real_fstat(descriptor)
+
+    with patch.object(framework.os, "fstat", switch_after_open):
+        result = framework.load_yaml_config(str(selected))
+    assert attempted
+    assert result == {"root": "original"}
+
+
+def test_config_bounded_reader_refuses_growth_after_admission(tmp_path):
+    path = tmp_path / "growing.yaml"
+    path.write_bytes(b"root: ok\n")
+    original_read = framework.os.read
+    calls = 0
+
+    def growing_read(descriptor, size):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            with path.open("ab") as output:
+                output.write(b"x" * framework.MAX_CONFIG_BYTES)
+        return original_read(descriptor, size)
+
+    with (
+        patch.object(framework.os, "read", growing_read),
+        pytest.raises(framework.ConfigurationError, match="byte budget"),
+    ):
+        framework.load_yaml_config(str(path))
+    assert calls > 1
+
+
+def test_config_path_symlink_is_rejected_when_supported(tmp_path):
+    target = tmp_path / "target.yaml"
+    link = tmp_path / "link.yaml"
+    target.write_text(framework.SAMPLE_CONFIG, encoding="utf-8")
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlink creation is unavailable on this host")
+    with pytest.raises(framework.ConfigurationError):
+        framework.load_yaml_config(str(link))
+    with (
+        patch.object(
+            framework.boto3, "Session", side_effect=AssertionError("admission bypassed")
+        ),
+        pytest.raises(framework.ConfigurationError),
+    ):
+        framework.ChaosOrchestrator(str(link))
+    assert framework.main(["--validate-config", str(link)]) == 2
+
+
+def test_config_directory_reparse_or_symlink_is_rejected_when_supported(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "config.yaml").write_text(framework.SAMPLE_CONFIG, encoding="utf-8")
+    link = tmp_path / "directory-link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Directory link creation is unavailable on this host")
+    with pytest.raises(framework.ConfigurationError):
+        framework.load_yaml_config(str(link / "config.yaml"))
+    assert framework.main(["--validate-config", str(link / "config.yaml")]) == 2
+
+
+def test_config_ancestor_rebinding_during_acquisition_reads_pinned_tree(tmp_path):
+    selected = tmp_path / "selected"
+    moved = tmp_path / "moved"
+    attacker = tmp_path / "attacker"
+    selected.mkdir()
+    attacker.mkdir()
+    (selected / "config.yaml").write_text("root: original\n", encoding="utf-8")
+    (attacker / "config.yaml").write_text("root: replacement\n", encoding="utf-8")
+    attempted = False
+    if os.name == "posix":
+        real_open = framework.os.open
+
+        def switch_before_file_open(name, flags, *args, **kwargs):
+            nonlocal attempted
+            if name == "config.yaml" and kwargs.get("dir_fd") is not None:
+                attempted = True
+                selected.rename(moved)
+                selected.symlink_to(attacker, target_is_directory=True)
+            return real_open(name, flags, *args, **kwargs)
+
+        with patch.object(framework.os, "open", switch_before_file_open):
+            config = framework.load_yaml_config(str(selected / "config.yaml"))
+    else:
+        real_fstat = framework.os.fstat
+
+        def switch_after_file_open(descriptor):
+            nonlocal attempted
+            if not attempted:
+                attempted = True
+                with suppress(PermissionError):
+                    selected.rename(moved)
+                    selected.symlink_to(attacker, target_is_directory=True)
+            return real_fstat(descriptor)
+
+        with patch.object(framework.os, "fstat", switch_after_file_open):
+            config = framework.load_yaml_config(str(selected / "config.yaml"))
+    assert attempted
+    assert config == {"root": "original"}
