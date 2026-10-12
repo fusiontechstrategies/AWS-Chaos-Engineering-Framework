@@ -33,7 +33,7 @@ import uuid
 import weakref
 from collections.abc import Iterable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -67,6 +67,12 @@ BOTO3_CREDENTIALS_METHOD = boto3.Session.get_credentials
 __version__ = "2.0.4"
 TOOL_NAME = "AWS Chaos Engineering Framework"
 MAX_CONFIG_BYTES = 1_048_576
+MAX_CONFIG_PATH_COMPONENTS = 128
+MAX_CONFIG_DEPTH = 64
+MAX_CONFIG_NODES = 10_000
+MAX_CONFIG_COLLECTION_WIDTH = 1_024
+MAX_CONFIG_SCALAR_CHARS = 65_536
+MAX_CONFIG_NUMERIC_CHARS = 128
 DEFAULT_REGION = "us-gov-west-1"
 GOVCLOUD_REGIONS = frozenset({"us-gov-west-1", "us-gov-east-1"})
 # SDK names are not an effect classification: TestState/TestFailover and even
@@ -3354,13 +3360,51 @@ logger.addFilter(RedactingLogFilter())
 class StrictConfigLoader(yaml.SafeLoader):
     """Reject ambiguous configuration mappings and alias/merge expansion."""
 
+    def __init__(self, stream: Any) -> None:
+        super().__init__(stream)
+        self._composition_depth = 0
+        self._composition_nodes = 0
+        self._composition_widths: dict[int, int] = {}
+
     def compose_node(self, parent: Any, index: Any) -> Any:
         if self.check_event(yaml.AliasEvent):
             event = self.peek_event()
             raise yaml.constructor.ConstructorError(
                 None, None, "Configuration aliases are forbidden", event.start_mark
             )
-        return super().compose_node(parent, index)
+        if self._composition_depth >= MAX_CONFIG_DEPTH:
+            raise ConfigurationError("Configuration nesting exceeds its budget.")
+        self._composition_nodes += 1
+        if self._composition_nodes > MAX_CONFIG_NODES:
+            raise ConfigurationError("Configuration node count exceeds its budget.")
+        if parent is not None:
+            parent_id = id(parent)
+            width = self._composition_widths.get(parent_id, 0) + 1
+            limit = MAX_CONFIG_COLLECTION_WIDTH * (
+                2 if isinstance(parent, yaml.MappingNode) else 1
+            )
+            if width > limit:
+                raise ConfigurationError("Configuration collection exceeds its budget.")
+            self._composition_widths[parent_id] = width
+        event = self.peek_event()
+        if isinstance(event, yaml.ScalarEvent):
+            if len(event.value) > MAX_CONFIG_SCALAR_CHARS:
+                raise ConfigurationError("Configuration scalar exceeds its budget.")
+            tag = (
+                self.resolve(yaml.ScalarNode, event.value, event.implicit)
+                if event.tag in {None, "!"}
+                else event.tag
+            )
+            if (
+                tag in {"tag:yaml.org,2002:int", "tag:yaml.org,2002:float"}
+                and len(event.value) > MAX_CONFIG_NUMERIC_CHARS
+            ):
+                raise ConfigurationError("Configuration number exceeds its budget.")
+        self._composition_depth += 1
+        try:
+            return super().compose_node(parent, index)
+        finally:
+            self._composition_depth -= 1
 
     def construct_mapping(self, node: Any, deep: bool = False) -> dict[str, Any]:
         mapping: dict[str, Any] = {}
@@ -3384,24 +3428,165 @@ class StrictConfigLoader(yaml.SafeLoader):
         return mapping
 
 
+@contextmanager
+def _config_descriptor(path: Path):
+    """Retain a regular config file and its no-follow ancestry during reading."""
+    if (
+        sys.platform == "darwin"
+        and len(path.parts) > 1
+        and path.parts[1] in {"var", "tmp", "etc"}
+    ):
+        # macOS exposes these root-owned system directories through /private.
+        # Resolve only that fixed system alias; later config components still
+        # require descriptor-relative, no-follow traversal.
+        alias = Path(path.anchor) / path.parts[1]
+        alias_stat = alias.lstat()
+        if (
+            stat.S_ISLNK(alias_stat.st_mode)
+            and alias_stat.st_uid == 0
+            and os.readlink(alias)
+            in {f"private/{path.parts[1]}", f"/private/{path.parts[1]}"}
+        ):
+            path = Path("/private") / path.parts[1] / Path(*path.parts[2:])
+    if os.name == "nt":
+        import ctypes
+        import ctypes.wintypes as wintypes
+        import msvcrt
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.GetFileType.argtypes = (wintypes.HANDLE,)
+        kernel.GetFileType.restype = wintypes.DWORD
+        kernel.GetFileInformationByHandleEx.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+
+        def checked_handle(component: Path, directory: bool) -> int:
+            handle = kernel.CreateFileW(
+                str(component),
+                0x80000000,  # GENERIC_READ
+                0x00000003,  # Share reads/writes, never deletion or rebinding.
+                None,
+                3,  # OPEN_EXISTING
+                0x00200000 | (0x02000000 if directory else 0),
+                None,
+            )
+            if handle == wintypes.HANDLE(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            attributes = (wintypes.DWORD * 2)()
+            if kernel.GetFileType(
+                handle
+            ) != 1 or not kernel.GetFileInformationByHandleEx(
+                handle, 9, attributes, ctypes.sizeof(attributes)
+            ):
+                kernel.CloseHandle(handle)
+                raise ConfigurationError("Configuration path is not an ordinary file.")
+            if bool(attributes[0] & 0x10) != directory or attributes[0] & 0x400:
+                kernel.CloseHandle(handle)
+                raise ConfigurationError("Configuration path contains a reparse point.")
+            return handle
+
+        with ExitStack() as stack:
+            for ancestor in reversed((path.parent, *path.parent.parents)):
+                stack.callback(kernel.CloseHandle, checked_handle(ancestor, True))
+            handle = checked_handle(path, False)
+            try:
+                descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+            except BaseException:
+                kernel.CloseHandle(handle)
+                raise
+            stack.callback(os.close, descriptor)
+            yield descriptor
+    else:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        components = path.parts[1:-1]
+        if len(components) > MAX_CONFIG_PATH_COMPONENTS:
+            raise OSError("Configuration path exceeds its component budget")
+
+        @contextmanager
+        def opened_below(parent_fd: int, depth: int):
+            # Each no-follow ancestor stays open until the config file is released.
+            if depth == len(components):
+                descriptor = os.open(path.name, file_flags, dir_fd=parent_fd)
+                try:
+                    yield descriptor
+                finally:
+                    os.close(descriptor)
+                return
+            directory = os.open(components[depth], directory_flags, dir_fd=parent_fd)
+            try:
+                with opened_below(directory, depth + 1) as descriptor:
+                    yield descriptor
+            finally:
+                os.close(directory)
+
+        anchor = os.open(path.anchor, directory_flags)
+        try:
+            with opened_below(anchor, 0) as descriptor:
+                yield descriptor
+        finally:
+            os.close(anchor)
+
+
+def _read_config_bytes(path: Path) -> bytes:
+    with _config_descriptor(path) as descriptor:
+        admitted = os.fstat(descriptor)
+        if not stat.S_ISREG(admitted.st_mode):
+            raise ConfigurationError("Configuration must be a regular file.")
+        if admitted.st_size > MAX_CONFIG_BYTES:
+            raise ConfigurationError(
+                f"Configuration file is {admitted.st_size} bytes; maximum is {MAX_CONFIG_BYTES}."
+            )
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65_536, MAX_CONFIG_BYTES - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_CONFIG_BYTES:
+                raise ConfigurationError("Configuration exceeds its byte budget.")
+            chunks.append(chunk)
+        if total != admitted.st_size:
+            raise ConfigurationError("Configuration changed during bounded reading.")
+        return b"".join(chunks)
+
+
 def load_yaml_config(config_file: str) -> dict[str, Any]:
     """Load one bounded, unambiguous YAML mapping without source diagnostics."""
-    path = Path(config_file).expanduser().resolve()
-    if not path.is_file():
-        raise ConfigurationError(f"Configuration file not found: {path}")
-    size = path.stat().st_size
-    if size > MAX_CONFIG_BYTES:
-        raise ConfigurationError(
-            f"Configuration file is {size} bytes; maximum is {MAX_CONFIG_BYTES}."
-        )
+    path = Path(config_file).expanduser().absolute()
     try:
-        loader = StrictConfigLoader(path.read_text(encoding="utf-8"))
+        loader = StrictConfigLoader(_read_config_bytes(path).decode("utf-8"))
         try:
             config = loader.get_single_data()
         finally:
             loader.dispose()
     except UnicodeDecodeError as exc:
         raise ConfigurationError("Configuration must be UTF-8 encoded.") from exc
+    except OSError:
+        raise ConfigurationError("Configuration file could not be read.") from None
+    except RecursionError as exc:
+        raise ConfigurationError("Configuration nesting exceeds its budget.") from exc
+    except ConfigurationError:
+        raise
+    except (ValueError, OverflowError, IndexError):
+        raise ConfigurationError("Invalid YAML configuration.") from None
     except yaml.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         location = (
@@ -12989,7 +13174,7 @@ class ChaosOrchestrator:
     ):
         if live and dry_run_flag:
             raise ConfigurationError("--live and --dry-run cannot be used together")
-        self.config_file = str(Path(config_file).expanduser().resolve())
+        self.config_file = str(Path(config_file).expanduser().absolute())
         self.config = load_yaml_config(self.config_file)
         validate_config_data(self.config)
         global_config = self.config.setdefault("global", {})

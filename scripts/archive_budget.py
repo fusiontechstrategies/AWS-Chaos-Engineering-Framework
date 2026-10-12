@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import io
 import os
 import secrets
@@ -15,6 +16,7 @@ import traceback
 import zipfile
 import zlib
 from contextlib import contextmanager
+from pathlib import Path
 
 CHUNK_BYTES = 64 * 1024
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
@@ -31,6 +33,78 @@ MAX_RATIO = 200
 
 class ArchiveBudgetError(ValueError):
     """An archive exceeds the reviewed resource or format boundary."""
+
+
+class RetainedStage:
+    """Expose the serialized file to existing validators without reopening its name."""
+
+    def __init__(self, handle):
+        self.handle = handle
+
+    def lstat(self):
+        return os.fstat(self.handle.fileno())
+
+    @contextmanager
+    def open(self, mode):
+        if mode != "rb":
+            raise ValueError("Retained stage is read-only during verification")
+        descriptor = os.dup(self.handle.fileno())
+        with os.fdopen(descriptor, "rb") as reader:
+            reader.seek(0)
+            yield reader
+
+
+@contextmanager
+def pinned_staging(path):
+    """Pin a private stage and its parent through write, verification and cleanup."""
+    helper_path = Path(__file__).resolve().with_name("release_output.py")
+    spec = importlib.util.spec_from_file_location("trusted_release_output", helper_path)
+    if spec is None or spec.loader is None:
+        raise ArchiveBudgetError("Trusted output pinning is unavailable")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    marker = path.parent / f".{path.name}.pin-{secrets.token_hex(12)}"
+    with helper.OwnedOutput(marker) as owner:
+        private = owner.create_private(f".{path.name}.stage-", restricted=True)
+        temporary_path = None
+        try:
+            temporary_path = private / f"{secrets.token_hex(12)}.tmp"
+            descriptor = owner.open_member(private, temporary_path.name, readwrite=True)
+            try:
+                staged_file = os.fdopen(descriptor, "w+b")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with staged_file:
+                yield staged_file, temporary_path, owner, private
+        finally:
+            owner.cleanup_private(
+                private, [temporary_path.name] if temporary_path is not None else []
+            )
+
+
+def replace_staged(temporary_path, path, owner, private, identity):
+    """Replace the intended archive relative to retained stage/parent identities."""
+    if os.name == "posix":
+        os.replace(
+            temporary_path.name,
+            path.name,
+            src_dir_fd=owner.private_fds[private.name],
+            dst_dir_fd=owner.parent_fd,
+        )
+    else:
+        owner.replace_member(private, temporary_path.name, path.name, identity)
+
+
+def stage_stat(temporary_path, owner, private):
+    """Check the staging entry relative to its retained directory on POSIX."""
+    if os.name == "posix":
+        return os.stat(
+            temporary_path.name,
+            dir_fd=owner.private_fds[private.name],
+            follow_symlinks=False,
+        )
+    return owner.stat_member(private, temporary_path.name)
 
 
 def run_with_actions_command_guard(run):

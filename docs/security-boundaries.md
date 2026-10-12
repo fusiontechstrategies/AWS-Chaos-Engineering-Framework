@@ -391,6 +391,23 @@ a claim about arbitrary filesystems. See Python's [ZIP](https://docs.python.org/
 [TAR](https://docs.python.org/3/library/tarfile.html) and [gzip](https://docs.python.org/3/library/gzip.html)
 interfaces.
 
+The wheel and sdist normalizers pin the output parent and a private staging
+directory through creation, verification, replacement, and nonrecursive cleanup.
+They fail closed if the output parent permits another principal to write. The
+archive is written through its retained staging descriptor, then flushed and
+fsynced before verification through that same descriptor. POSIX creation,
+entry checks, replacement, and cleanup use retained directory descriptors;
+Windows requires a private output parent and a restricted stage created with
+an explicit owner-only ACL; stage checks and replacement use retained native
+directory handles. The stage identity is checked again immediately before
+atomic replacement of the original archive.
+
+YAML configuration is read from one retained, regular-file handle with no-follow
+path checks, a 1 MiB byte budget, and a bound on the actual bytes read. Composition
+permits at most 64 nested nodes, 10,000 total nodes, 1,024 members per sequence
+or mapping, 65,536 characters per scalar, and 128 characters per numeric scalar.
+Budget failures and parser recursion become source-free configuration errors.
+
 Console target registries are scoped to a run and worker, bounded to 4,096 values,
 and include identifiers of every length. Exact identifier boundaries preserve
 unrelated words. CR, LF, tabs, terminal escapes, and Unicode control characters

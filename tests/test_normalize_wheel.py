@@ -4,11 +4,17 @@ import base64
 import csv
 import hashlib
 import io
+import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from scripts import normalize_wheel as normalizer
 
@@ -58,6 +64,206 @@ class NormalizeWheelTests(unittest.TestCase):
                 member.create_system = creator_system
                 member.external_attr = (stat.S_IFREG | 0o600) << 16
                 archive.writestr(member, value)
+
+    def test_staging_identity_change_fails_before_archive_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / "synthetic.whl"
+            unrelated = root / "unrelated.txt"
+            unrelated.write_bytes(b"unchanged")
+            self.make_wheel(wheel, b"\n", zipfile.ZIP_STORED, 3)
+            original = wheel.read_bytes()
+            real_stage_stat = normalizer.archive_budget.stage_stat
+
+            def substituted_stat(path, owner, private):
+                found = real_stage_stat(path, owner, private)
+                if path.suffix == ".tmp":
+                    return SimpleNamespace(
+                        st_mode=stat.S_IFLNK, st_dev=found.st_dev, st_ino=found.st_ino
+                    )
+                return found
+
+            with (
+                patch.object(normalizer.archive_budget, "stage_stat", substituted_stat),
+                self.assertRaisesRegex(
+                    normalizer.WheelNormalizationError, "staging file changed"
+                ),
+            ):
+                normalizer.normalize_wheel(wheel, SOURCE_DATE_EPOCH)
+            self.assertEqual(wheel.read_bytes(), original)
+            self.assertEqual(unrelated.read_bytes(), b"unchanged")
+
+    def test_retained_staging_descriptor_is_fsynced_before_replace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wheel = Path(directory) / "synthetic.whl"
+            self.make_wheel(wheel, b"\n", zipfile.ZIP_STORED, 3)
+            real_fsync = os.fsync
+            real_replace = normalizer.archive_budget.replace_staged
+            events = []
+
+            def fsync(descriptor):
+                events.append("fsync")
+                return real_fsync(descriptor)
+
+            def replace(source, target, owner, private, identity):
+                events.append("replace")
+                return real_replace(source, target, owner, private, identity)
+
+            with (
+                patch.object(normalizer.os, "fsync", fsync),
+                patch.object(normalizer.archive_budget, "replace_staged", replace),
+            ):
+                normalizer.normalize_wheel(wheel, SOURCE_DATE_EPOCH)
+            self.assertEqual(events, ["fsync", "replace"])
+
+    def test_staging_substitution_never_writes_an_unrelated_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / "synthetic.whl"
+            unrelated = root / "unrelated.txt"
+            unrelated.write_bytes(b"unchanged")
+            self.make_wheel(wheel, b"\n", zipfile.ZIP_STORED, 3)
+            original = wheel.read_bytes()
+            real_stage = normalizer.archive_budget.pinned_staging
+            removed = False
+
+            @contextmanager
+            def captured_stage(path):
+                nonlocal removed
+                with real_stage(path) as state:
+                    try:
+                        state[1].unlink()
+                        removed = True
+                        state[1].symlink_to(unrelated)
+                    except OSError:
+                        pass  # A retained Windows handle may prevent replacement.
+                    yield state
+
+            with patch.object(
+                normalizer.archive_budget, "pinned_staging", captured_stage
+            ):
+                try:
+                    normalizer.normalize_wheel(wheel, SOURCE_DATE_EPOCH)
+                    aborted = False
+                except (normalizer.WheelNormalizationError, OSError):
+                    aborted = True
+            if removed:
+                self.assertTrue(aborted)
+                self.assertEqual(wheel.read_bytes(), original)
+            else:
+                self.assertFalse(aborted)
+            self.assertEqual(unrelated.read_bytes(), b"unchanged")
+
+    def test_post_verification_substitution_never_writes_an_unrelated_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / "synthetic.whl"
+            unrelated = root / "unrelated.txt"
+            unrelated.write_bytes(b"unchanged")
+            self.make_wheel(wheel, b"\n", zipfile.ZIP_STORED, 3)
+            original = wheel.read_bytes()
+            real_stage = normalizer.archive_budget.pinned_staging
+            real_digest = normalizer.archive_budget.file_digest
+            stage = []
+            removed = False
+
+            @contextmanager
+            def captured_stage(path):
+                with real_stage(path) as state:
+                    stage.append(state[1])
+                    yield state
+
+            def substitute_after_verification(path):
+                nonlocal removed
+                digest = real_digest(path)
+                try:
+                    stage[0].unlink()
+                    removed = True
+                    stage[0].symlink_to(unrelated)
+                except OSError:
+                    # Symlinks can be unavailable on this host; the test still verifies the original file.
+                    pass
+                return digest
+
+            with (
+                patch.object(
+                    normalizer.archive_budget, "pinned_staging", captured_stage
+                ),
+                patch.object(
+                    normalizer.archive_budget,
+                    "file_digest",
+                    substitute_after_verification,
+                ),
+            ):
+                try:
+                    normalizer.normalize_wheel(wheel, SOURCE_DATE_EPOCH)
+                    aborted = False
+                except (normalizer.WheelNormalizationError, OSError):
+                    aborted = True
+            if removed:
+                self.assertTrue(aborted)
+                self.assertEqual(wheel.read_bytes(), original)
+            else:
+                self.assertFalse(aborted)
+            self.assertEqual(unrelated.read_bytes(), b"unchanged")
+
+    def test_parent_rebinding_during_normalization_uses_pinned_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            admitted = root / "admitted"
+            moved = root / "moved"
+            attacker = root / "attacker"
+            admitted.mkdir()
+            attacker.mkdir()
+            wheel = admitted / "synthetic.whl"
+            unrelated = attacker / wheel.name
+            unrelated.write_bytes(b"unrelated bytes")
+            self.make_wheel(wheel, b"\n", zipfile.ZIP_STORED, 3)
+            real_stage = normalizer.archive_budget.pinned_staging
+            rebound = False
+
+            @contextmanager
+            def rebind_after_stage(path):
+                nonlocal rebound
+                with real_stage(path) as state:
+                    attempt = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            (
+                                "import pathlib,sys; "
+                                "pathlib.Path(sys.argv[1]).rename(sys.argv[2]); "
+                                "pathlib.Path(sys.argv[1]).symlink_to("
+                                "sys.argv[3], target_is_directory=True)"
+                            ),
+                            str(admitted),
+                            str(moved),
+                            str(attacker),
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    rebound = attempt.returncode == 0
+                    if not rebound:
+                        self.assertEqual(os.name, "nt")
+                        self.assertIn("PermissionError", attempt.stderr)
+                    yield state
+
+            try:
+                with patch.object(
+                    normalizer.archive_budget, "pinned_staging", rebind_after_stage
+                ):
+                    digest = normalizer.normalize_wheel(wheel, SOURCE_DATE_EPOCH)
+                published = (moved if rebound else admitted) / wheel.name
+                self.assertEqual(
+                    hashlib.sha256(published.read_bytes()).hexdigest(), digest
+                )
+                self.assertEqual(unrelated.read_bytes(), b"unrelated bytes")
+            finally:
+                if admitted.is_symlink():
+                    admitted.unlink()
+                if moved.exists():
+                    moved.rename(admitted)
 
     def test_platform_specific_wheels_normalize_to_identical_bytes(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -6,7 +6,8 @@ import os
 import secrets
 import stat
 import sys
-from contextlib import suppress
+from contextlib import ExitStack, contextmanager, suppress
+from functools import partial
 from pathlib import Path
 
 
@@ -93,7 +94,15 @@ def _windows_api():
 
 
 def _windows_open_relative(
-    root: int, name: str, *, directory: bool, create: bool, write: bool = False
+    root: int,
+    name: str,
+    *,
+    directory: bool,
+    create: bool,
+    write: bool = False,
+    readwrite: bool = False,
+    security_descriptor: int | None = None,
+    share_delete: bool = True,
 ) -> int:
     """Open one child of a retained Windows directory handle, without reparse."""
     ctypes, wintypes, _, _ = _windows_api()
@@ -147,13 +156,15 @@ def _windows_open_relative(
         root,
         ctypes.pointer(unicode_name),
         0x40 | 0x1000,  # OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE
-        None,
+        security_descriptor,
         None,
     )
     result = wintypes.HANDLE()
     status = IoStatus()
     access = 0x120080 | (0x10000 if directory and create else 0)
-    if write:
+    if readwrite:
+        access = 0xC0000000 | 0x10000 | 0x100000 | 0x80
+    elif write:
         access = 0x40000000 | 0x10000 | 0x100000 | 0x80
     options = (0x1 if directory else 0x40) | 0x200000 | 0x20
     code = ntdll.NtCreateFile(
@@ -163,7 +174,7 @@ def _windows_open_relative(
         ctypes.byref(status),
         None,
         0,
-        0x7,
+        0x7 if share_delete else 0x3,
         2 if create else 1,
         options,
         None,
@@ -172,6 +183,30 @@ def _windows_open_relative(
     if code < 0:
         raise ctypes.WinError(ntdll.RtlNtStatusToDosError(code))
     return result.value
+
+
+@contextmanager
+def _windows_private_descriptor(user_sid: str):
+    """Create an owner-only DACL before a shared-parent child becomes visible."""
+    ctypes, wintypes, kernel, advapi = _windows_api()
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = (ctypes.c_void_p,)
+    descriptor = ctypes.c_void_p()
+    sddl = f"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{user_sid})"
+    if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, ctypes.byref(descriptor), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        yield descriptor.value
+    finally:
+        kernel.LocalFree(descriptor)
 
 
 def _windows_token_sid(information_class: int) -> str:
@@ -380,8 +415,10 @@ def _windows_close(handle: int) -> None:
         raise OSError("Could not close release-output directory handle")
 
 
-def _windows_rename_relative(handle: int, parent: int, destination: str) -> None:
-    """Publish the open directory relative to its pinned parent, no replacement."""
+def _windows_rename_relative(
+    handle: int, parent: int, destination: str, *, replace: bool = False
+) -> None:
+    """Rename an open object relative to its pinned parent."""
     ctypes, wintypes, _, _ = _windows_api()
     ntdll = ctypes.WinDLL("ntdll")
 
@@ -410,7 +447,7 @@ def _windows_rename_relative(handle: int, parent: int, destination: str) -> None
     size = RenameInfo.name.offset + len(encoded) + 2
     buffer = ctypes.create_string_buffer(size)
     info = ctypes.cast(buffer, ctypes.POINTER(RenameInfo)).contents
-    info.replace = 0
+    info.replace = int(replace)
     info.root = parent
     info.length = len(encoded)
     ctypes.memmove(
@@ -439,6 +476,29 @@ def _windows_mark_delete(handle: int) -> None:
         handle, 4, ctypes.byref(flag), ctypes.sizeof(flag)
     ):
         raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _release_all(releases) -> BaseException | None:
+    """Attempt every release and return the first ordinary failure.
+
+    Interrupts and other non-``Exception`` errors are never swallowed:
+    ``ExitStack`` iteratively runs the remaining releases, then re-raises the
+    most recent such error. Earlier interrupts are not guaranteed to be chained.
+    """
+    failure = None
+
+    def attempt(release) -> None:
+        nonlocal failure
+        try:
+            release()
+        except Exception as error:
+            if failure is None:
+                failure = error
+
+    with ExitStack() as stack:
+        for release in reversed(releases):
+            stack.callback(attempt, release)
+    return failure
 
 
 class OwnedOutput:
@@ -504,7 +564,11 @@ class OwnedOutput:
             self.parent_handles.append(root)
             for component in self.path.parent.parts[1:]:
                 handle = _windows_open_relative(
-                    self.parent_handles[-1], component, directory=True, create=False
+                    self.parent_handles[-1],
+                    component,
+                    directory=True,
+                    create=False,
+                    share_delete=False,
                 )
                 self.parent_handles.append(handle)
                 _windows_directory_identity(handle)
@@ -513,7 +577,7 @@ class OwnedOutput:
             self.__exit__(None, None, None)
             raise
 
-    def create_private(self, prefix: str) -> Path:
+    def create_private(self, prefix: str, *, restricted: bool = False) -> Path:
         """Create a new private sibling under the pinned parent."""
         if os.name == "posix":
             if self.parent_fd is None:
@@ -574,39 +638,58 @@ class OwnedOutput:
         for _ in range(8):
             name = prefix + secrets.token_hex(12)
             try:
-                handle = _windows_open_relative(
-                    self.parent_handles[-1], name, directory=True, create=True
-                )
+                if restricted:
+                    with _windows_private_descriptor(self.user_sid) as descriptor:
+                        handle = _windows_open_relative(
+                            self.parent_handles[-1],
+                            name,
+                            directory=True,
+                            create=True,
+                            security_descriptor=descriptor,
+                            share_delete=False,
+                        )
+                else:
+                    handle = _windows_open_relative(
+                        self.parent_handles[-1], name, directory=True, create=True
+                    )
             except FileExistsError:
                 continue
             try:
                 _windows_directory_identity(handle)
                 _windows_acl_private(handle, self.user_sid)
             except BaseException:
-                _windows_mark_delete(handle)
-                _windows_close(handle)
+                try:
+                    _windows_mark_delete(handle)
+                finally:
+                    _windows_close(handle)
                 raise
             self.private_handles[name] = handle
             return self.path.parent / name
         raise FileExistsError("Could not allocate private release directory")
 
-    def open_member(self, private: Path, name: str) -> int:
+    def open_member(self, private: Path, name: str, *, readwrite: bool = False) -> int:
         """Create a fixed-name member relative to the retained stage handle."""
         if os.name == "nt":
             import msvcrt
 
             handle = self.private_handles[private.name]
             child = _windows_open_relative(
-                handle, name, directory=False, create=True, write=True
+                handle,
+                name,
+                directory=False,
+                create=True,
+                write=not readwrite,
+                readwrite=readwrite,
             )
             try:
-                return msvcrt.open_osfhandle(child, os.O_WRONLY | os.O_BINARY)
+                mode = os.O_RDWR if readwrite else os.O_WRONLY
+                return msvcrt.open_osfhandle(child, mode | os.O_BINARY)
             except BaseException:
                 _windows_close(child)
                 raise
         return os.open(
             name,
-            os.O_WRONLY
+            (os.O_RDWR if readwrite else os.O_WRONLY)
             | os.O_CREAT
             | os.O_EXCL
             | getattr(os, "O_NOFOLLOW", 0)
@@ -615,24 +698,113 @@ class OwnedOutput:
             dir_fd=self.private_fds[private.name],
         )
 
+    def stat_member(self, private: Path, name: str):
+        """Read member identity relative to the retained Windows stage handle."""
+        import msvcrt
+
+        handle = _windows_open_relative(
+            self.private_handles[private.name],
+            name,
+            directory=False,
+            create=False,
+        )
+        try:
+            descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        except BaseException:
+            _windows_close(handle)
+            raise
+        try:
+            return os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def replace_member(
+        self, private: Path, name: str, destination: str, identity: tuple[int, int]
+    ) -> None:
+        """Publish the checked stage file through retained Windows directory handles."""
+        import msvcrt
+
+        handle = _windows_open_relative(
+            self.private_handles[private.name],
+            name,
+            directory=False,
+            create=False,
+            write=True,
+            share_delete=False,
+        )
+        try:
+            descriptor = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+        except BaseException:
+            _windows_close(handle)
+            raise
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != identity
+            ):
+                raise PermissionError("Private release member changed")
+            _windows_rename_relative(
+                msvcrt.get_osfhandle(descriptor),
+                self.parent_handles[-1],
+                destination,
+                replace=True,
+            )
+            published = _windows_open_relative(
+                self.parent_handles[-1],
+                destination,
+                directory=False,
+                create=False,
+            )
+            try:
+                published_descriptor = msvcrt.open_osfhandle(
+                    published, os.O_RDONLY | os.O_BINARY
+                )
+            except BaseException:
+                _windows_close(published)
+                raise
+            try:
+                actual = os.fstat(published_descriptor)
+                if (
+                    not stat.S_ISREG(actual.st_mode)
+                    or (actual.st_dev, actual.st_ino) != identity
+                ):
+                    raise PermissionError("Published release member changed")
+            finally:
+                os.close(published_descriptor)
+        finally:
+            os.close(descriptor)
+
     def cleanup_private(self, private: Path, names: list[str]) -> None:
         """Remove only members of the retained, still-private stage."""
         if os.name == "nt":
             handle = self.private_handles.pop(private.name, None)
             if handle is None:
                 return
-            try:
-                for name in names:
+
+            def remove(name: str) -> None:
+                with suppress(FileNotFoundError):
                     child = _windows_open_relative(
                         handle, name, directory=False, create=False, write=True
                     )
-                    try:
-                        _windows_mark_delete(child)
-                    finally:
-                        _windows_close(child)
-                _windows_mark_delete(handle)
-            finally:
-                _windows_close(handle)
+                    failure = _release_all(
+                        [
+                            partial(_windows_mark_delete, child),
+                            partial(_windows_close, child),
+                        ]
+                    )
+                    if failure is not None:
+                        raise failure
+
+            failure = _release_all(
+                [partial(remove, name) for name in names]
+                + [
+                    partial(_windows_mark_delete, handle),
+                    partial(_windows_close, handle),
+                ]
+            )
+            if failure is not None:
+                raise failure
             return
         fd = self.private_fds.pop(private.name, None)
         if fd is None:
@@ -707,15 +879,19 @@ class OwnedOutput:
                 _windows_close(published)
 
     def __exit__(self, exc_type, exc, traceback):
-        for fd in self.private_fds.values():
-            os.close(fd)
-        self.private_fds.clear()
-        for handle in self.private_handles.values():
-            _windows_close(handle)
-        self.private_handles.clear()
+        releases = [partial(os.close, fd) for fd in self.private_fds.values()]
+        releases += [
+            partial(_windows_close, handle) for handle in self.private_handles.values()
+        ]
         if self.parent_fd is not None:
-            os.close(self.parent_fd)
-            self.parent_fd = None
-        for handle in reversed(self.parent_handles):
-            _windows_close(handle)
+            releases.append(partial(os.close, self.parent_fd))
+        releases += [
+            partial(_windows_close, handle) for handle in reversed(self.parent_handles)
+        ]
+        self.private_fds.clear()
+        self.private_handles.clear()
+        self.parent_fd = None
         self.parent_handles.clear()
+        failure = _release_all(releases)
+        if failure is not None and exc_type is None:
+            raise failure
