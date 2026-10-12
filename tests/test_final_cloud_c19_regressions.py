@@ -7,7 +7,7 @@ a real botocore-backed session that ``harden_session_origin`` has not marked,
 before any credential or token is resolved, and ``harden_session_origin``
 refuses a session whose credential or token provider was already built with an
 unwrapped client creator. Session objects without a botocore core (test
-doubles) keep their direct-library behaviour.
+doubles) use the explicit internal injection path.
 
 Every provider profile below also configures attacker endpoint overrides
 (profile ``endpoint_url`` and ``AWS_ENDPOINT_URL*``). Every AWS answer is an
@@ -17,11 +17,10 @@ offline botocore before-send response; no network is contacted.
 from __future__ import annotations
 
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
 from botocore.config import Config
-from test_aws_chaos_framework import ACCOUNT_ID
+from test_aws_chaos_framework import ACCOUNT_ID, FakeAWS
 from test_final_cloud_c13_regressions import (
     ASSUME_ROLE_CHAIN,
     ASSUME_ROLE_CREDENTIALS,
@@ -254,17 +253,9 @@ def test_session_whose_component_store_cannot_be_inspected_is_refused(
     assert sent == []
 
 
-def test_sessions_without_a_botocore_core_keep_direct_library_compatibility():
-    created: list[tuple[str, str]] = []
-    raw = framework.boto3.Session(
-        aws_access_key_id="synthetic", aws_secret_access_key="synthetic"
-    ).client("lambda", region_name=PROFILE_REGION)
-
-    def client(service, **kwargs):
-        created.append((service, kwargs["region_name"]))
-        return raw
-
-    fake = SimpleNamespace(client=client)
+def test_static_provider_free_session_keeps_direct_library_compatibility():
+    raw = FakeAWS().client("lambda")
+    fake = framework._ProviderFreeSession({"lambda": raw})
     assert not framework.is_origin_hardened(fake)
     controller = controller_for(fake)
     assert controller.session is fake
@@ -272,5 +263,5 @@ def test_sessions_without_a_botocore_core_keep_direct_library_compatibility():
         {"region": PROFILE_REGION, "dry_run": True}, controller
     )
     assert experiment.safety_controller is controller
-    assert created == [("lambda", PROFILE_REGION)]
+    assert fake.client("lambda", region_name=PROFILE_REGION) is raw
     assert framework.harden_session_origin(fake) is fake

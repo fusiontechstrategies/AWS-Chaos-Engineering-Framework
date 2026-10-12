@@ -24,11 +24,24 @@ from test_aws_chaos_framework import (
     make_orchestrator,
     planning_only_experiment,
     prepare_lambda_memory,
+    provider_free_session,
 )
 
 import aws_chaos_framework as f
 from scripts import normalize_sdist
 from scripts import verify_distribution as verifier
+
+
+def hardened_client(service, *, region_name, aws_access_key_id, aws_secret_access_key):
+    session = f.harden_session_origin(
+        boto3.Session(
+            region_name=region_name,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+        )
+    )
+    return session.client(service, region_name=region_name)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BUCKET = ACCOUNT_ID + "private-bucket"
@@ -37,7 +50,9 @@ PREFIX = "chaos-test/"
 
 def native_controller(aws=None):
     aws = aws or FakeAWS(reject_writes=False)
-    session = SimpleNamespace(client=lambda service, **_kwargs: aws.client(service))
+    session = provider_free_session(
+        client=lambda service, **_kwargs: aws.client(service)
+    )
     controller = f.SafetyController(
         {}, session, REGION, True, expected_account=ACCOUNT_ID
     )
@@ -78,7 +93,7 @@ def instance_response(state="running"):
 def assert_confirmed_ec2_sdk_dispatch_is_tracked():
     """Preserve admitted SDK tracking through a supported public handler."""
     owner, controller, aws = live_ec2()
-    raw = boto3.client(
+    raw = hardened_client(
         "ec2",
         region_name=REGION,
         aws_access_key_id="offline",
@@ -184,7 +199,7 @@ def test_plan_owner_cannot_dispatch_direct_mutation_even_as_recovery(
 def test_raw_s3_delegates_and_unreviewed_bucket_methods_refuse(
     owned, operation, arguments
 ):
-    raw = boto3.client(
+    raw = hardened_client(
         "s3",
         region_name=REGION,
         aws_access_key_id="offline",
@@ -192,7 +207,7 @@ def test_raw_s3_delegates_and_unreviewed_bucket_methods_refuse(
     )
     controller = f.SafetyController(
         {},
-        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        provider_free_session(client=lambda *args, **kwargs: raw),
         REGION,
         True,
         expected_account=ACCOUNT_ID,
@@ -207,7 +222,7 @@ def test_raw_s3_delegates_and_unreviewed_bucket_methods_refuse(
 
 
 def test_ec2_readonly_approval_inventory_paginator_remains_supported():
-    raw = boto3.client(
+    raw = hardened_client(
         "ec2",
         region_name=REGION,
         aws_access_key_id="offline",
@@ -215,7 +230,7 @@ def test_ec2_readonly_approval_inventory_paginator_remains_supported():
     )
     controller = f.SafetyController(
         {},
-        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        provider_free_session(client=lambda *args, **kwargs: raw),
         REGION,
         True,
         expected_account=ACCOUNT_ID,
@@ -283,7 +298,7 @@ EFFECTFUL_READLIKE_CASES = [
 
 
 def stub_controller(service):
-    raw = boto3.client(
+    raw = hardened_client(
         service,
         region_name=REGION,
         aws_access_key_id="offline",
@@ -291,7 +306,7 @@ def stub_controller(service):
     )
     controller = f.SafetyController(
         {},
-        SimpleNamespace(client=lambda *args, **kwargs: raw),
+        provider_free_session(client=lambda *args, **kwargs: raw),
         REGION,
         True,
         expected_account=ACCOUNT_ID,
@@ -898,7 +913,7 @@ def test_experiment_account_override_is_refused_and_owner_changes_confirmation()
 
 @pytest.mark.parametrize("failure", [None, "list", "delete"])
 def test_real_botocore_owner_mismatch_refuses_delete_and_valid_owner_succeeds(failure):
-    client = boto3.client(
+    client = hardened_client(
         "s3",
         region_name=REGION,
         aws_access_key_id="offline",
@@ -906,7 +921,7 @@ def test_real_botocore_owner_mismatch_refuses_delete_and_valid_owner_succeeds(fa
     )
     controller = f.SafetyController(
         {},
-        SimpleNamespace(client=lambda *args, **kwargs: client),
+        provider_free_session(client=lambda *args, **kwargs: client),
         REGION,
         True,
         expected_account=ACCOUNT_ID,

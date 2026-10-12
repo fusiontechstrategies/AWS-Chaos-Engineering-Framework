@@ -37,6 +37,23 @@ TEST_ACCESS_KEY = "ASIA" + "ABCDEFGHIJKLMNOP"
 OTHER_ACCESS_KEY = "ASIA" + ("Z" * 16)
 
 
+def provider_free_session(client, get_credentials=None, *, services=None):
+    """Materialize test clients before entering the production session boundary."""
+    selected = (
+        services if services is not None else (*framework.READ_ONLY_OPERATIONS, "ssm")
+    )
+    clients = {service: client(service) for service in selected}
+    credentials = get_credentials() if get_credentials is not None else None
+    if credentials is not None and not isinstance(
+        credentials, framework.BotocoreCredentials
+    ):
+        frozen = credentials.get_frozen_credentials()
+        credentials = framework.BotocoreCredentials(
+            frozen.access_key, frozen.secret_key, frozen.token
+        )
+    return framework._ProviderFreeSession(clients, credentials)
+
+
 class FakeClientError(Exception):
     """Minimal stand-in for botocore client exceptions."""
 
@@ -532,7 +549,8 @@ class FakeAWS:
                     {
                         "GrantId": "0123456789abcdef0123456789abcdef",
                         "KeyId": f"arn:aws-us-gov:kms:{REGION}:{ACCOUNT_ID}:key/01234567-89ab-cdef-0123-456789abcdef",
-                        "GranteePrincipal": BREAK_GLASS_ARN,
+                        "GranteePrincipal": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ReviewedGrantee",
+                        "RetiringPrincipal": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ReviewedRetirer",
                         "Operations": ["Decrypt"],
                     }
                 ]
@@ -698,8 +716,17 @@ class FakeClient:
 class FakeSafetyController:
     """Safety controller with no network-capable state."""
 
-    def __init__(self, aws: FakeAWS, *, live: bool = False):
+    def __init__(
+        self, aws: FakeAWS | framework._ProviderFreeSession, *, live: bool = False
+    ):
         self.aws = aws
+        self.session = (
+            aws
+            if isinstance(aws, framework._ProviderFreeSession)
+            else provider_free_session(
+                client=lambda service, **kwargs: aws.client(service)
+            )
+        )
         self.live = live
         self.expected_account = ACCOUNT_ID
         self.region = REGION
@@ -972,6 +999,8 @@ def action_configs() -> dict[framework.ChaosType, dict[str, Any]]:
         framework.ChaosType.KMS_GRANT_REVOKE: {
             "key_id": f"arn:aws-us-gov:kms:{REGION}:{ACCOUNT_ID}:key/01234567-89ab-cdef-0123-456789abcdef",
             "grant_id": "0123456789abcdef0123456789abcdef",
+            "grantee_principal_arn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ReviewedGrantee",
+            "retiring_principal_arn": f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/ReviewedRetirer",
         },
         framework.ChaosType.IAM_POLICY_DETACH: {
             "role_name": "ChaosTestRole",
@@ -1065,11 +1094,14 @@ def make_orchestrator(
         get_caller_identity=lambda: {"Account": ACCOUNT_ID, "Arn": principal},
         meta=fake_client_meta("sts"),
     )
-    session = SimpleNamespace(
+    session = provider_free_session(
         client=lambda service, **kwargs: (
             identity if service == "sts" else fake_aws.client(service)
         ),
         get_credentials=lambda: SimpleNamespace(get_frozen_credentials=lambda: frozen),
+        services=("sts", *fake_aws._clients)
+        if isinstance(fake_aws, framework._ProviderFreeSession)
+        else None,
     )
     fixture = tempfile.TemporaryDirectory(prefix="chaos-confirmed-current-")
     config_path = Path(fixture.name) / "config.yaml"

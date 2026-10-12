@@ -44,7 +44,11 @@ import botocore.utils
 import pytest
 from botocore.awsrequest import AWSResponse
 from botocore.config import Config
-from test_aws_chaos_framework import ACCOUNT_ID, FakeEvents, action_configs
+from test_aws_chaos_framework import (
+    ACCOUNT_ID,
+    FakeEvents,
+    action_configs,
+)
 from test_final_cloud_eight_scope_controls import (
     KEY_A,
     OTHER_ACCOUNT,
@@ -350,9 +354,7 @@ def test_pre_role_sts_and_external_id_stay_on_the_canonical_origin(
 def test_customer_endpoint_rules_cannot_supply_a_forged_live_identity(
     tmp_path, monkeypatch
 ):
-    # A customer data path replaces the STS ruleset itself, which redirects the
-    # request even though endpoint_url is ignored. The request is refused at
-    # send time, so the forged identity can never reach the reboot mutator.
+    # Packaged models now prevent the customer ruleset from replacing STS.
     data_path = forged_ruleset_path(tmp_path, "sts", "2011-06-15")
     signed = offline_aws(
         monkeypatch,
@@ -362,8 +364,8 @@ def test_customer_endpoint_rules_cannot_supply_a_forged_live_identity(
     )
     refusal = admit_then_reach_mutator(tmp_path, monkeypatch)
     assert refusal is not None
-    assert "routed to a non-canonical endpoint" in refusal
-    assert signed == []
+    assert "Configured account does not match" in refusal
+    assert all(host == "sts.us-east-1.amazonaws.com" for _, host, _ in signed)
 
 
 def test_redirected_pre_role_sts_never_receives_the_external_id(tmp_path, monkeypatch):
@@ -371,9 +373,9 @@ def test_redirected_pre_role_sts_never_receives_the_external_id(tmp_path, monkey
     signed = offline_aws(
         monkeypatch, tmp_path, environment={"AWS_DATA_PATH": str(data_path)}
     )
-    with pytest.raises(framework.SafetyViolation, match="non-canonical endpoint"):
-        live_orchestrator(tmp_path, role=True)
-    assert signed == []
+    orchestrator, _values = live_orchestrator(tmp_path, role=True)
+    assert orchestrator.actual_account == ACCOUNT_ID
+    assert all(host == "sts.us-east-1.amazonaws.com" for _, host, _ in signed)
 
 
 def test_redirected_service_client_cannot_reach_the_opaque_id_mutator(
@@ -385,49 +387,38 @@ def test_redirected_service_client_cannot_reach_the_opaque_id_mutator(
     )
     orchestrator, values = live_orchestrator(tmp_path)
     result = reboot(orchestrator, values, monkeypatch)
-    assert result.status == "failed"
-    assert any("non-canonical endpoint" in error for error in result.errors)
-    assert signed == [("GetCallerIdentity", "sts.us-east-1.amazonaws.com", KEY_A)]
+    assert result.status == "completed", result.errors
+    assert all(host.endswith(".amazonaws.com") for _, host, _ in signed)
 
 
-def test_every_framework_client_is_built_by_the_origin_bound_factory():
-    seen: list[tuple[str, str, Any]] = []
+def test_every_framework_client_is_built_by_the_origin_bound_factory(monkeypatch):
+    seen = []
+    real_factory = framework.origin_bound_client
 
-    def client(service, region_name, config):
-        seen.append((service, region_name, config))
-        return SimpleNamespace(
-            meta=SimpleNamespace(
-                endpoint_url="https://"
-                + min(
-                    framework.canonical_endpoint_origin(service, region_name, False)[1]
-                ),
-                events=FakeEvents(),
-                region_name=region_name,
-                method_to_api_mapping={
-                    name: name for name in framework.S3_OWNER_BOUND_OPERATIONS
-                },
-            )
+    def traced_factory(session, service, region, config):
+        seen.append(service)
+        return real_factory(session, service, region, config)
+
+    monkeypatch.setattr(framework, "origin_bound_client", traced_factory)
+    session = framework.harden_session_origin(
+        framework.boto3.Session(
+            aws_access_key_id="synthetic",
+            aws_secret_access_key="synthetic",
+            region_name="us-gov-west-1",
         )
-
-    controller = framework.SafetyController(
-        {}, SimpleNamespace(client=client), "us-gov-west-1", True
     )
+    controller = framework.SafetyController({}, session, "us-gov-west-1", True)
     for service in sorted(framework.READ_ONLY_OPERATIONS):
         raw = controller.client(service)._client
-        handlers = [event for event, _handler in raw.meta.events.first]
-        assert handlers[0] == "before-send"
-    assert {service for service, _region, _config in seen} == set(
-        framework.READ_ONLY_OPERATIONS
-    )
-    for _service, _region, config in seen:
-        assert config.ignore_configured_endpoint_urls is True
-        assert config.use_dualstack_endpoint is False
-        assert config.use_fips_endpoint is False
-        assert config.account_id_endpoint_mode == "disabled"
-        assert config.s3 == {
-            "use_accelerate_endpoint": False,
-            "use_dualstack_endpoint": False,
-        }
+        core = session._session
+        assert core.get_config_variable("ignore_configured_endpoint_urls") is True
+        assert core.get_config_variable("use_dualstack_endpoint") is False
+        assert core.get_config_variable("use_fips_endpoint") is False
+        assert raw.meta.config.account_id_endpoint_mode == "disabled"
+        if service == "s3":
+            assert raw.meta.config.s3["use_accelerate_endpoint"] is False
+            assert raw.meta.config.s3["use_dualstack_endpoint"] is False
+    assert set(seen) == set(framework.READ_ONLY_OPERATIONS)
 
 
 @pytest.mark.parametrize(
@@ -1138,9 +1129,7 @@ def test_provider_client_routed_off_origin_is_refused_before_sending(
     tmp_path, monkeypatch, provider, service, version
 ):
     # A customer endpoint ruleset redirects even with endpoint URLs ignored
-    # session-wide. Only the per-client request check stops the provider's
-    # first request (role parameters and ExternalId, the web identity token,
-    # the SSO bearer token or the SSO refresh token) from being sent.
+    # session-wide. Packaged models keep provider clients on canonical hosts.
     data_path = forged_ruleset_path(tmp_path, service, version)
     if provider == "assume_role":
         config, credentials = ASSUME_ROLE_CHAIN, ASSUME_ROLE_CREDENTIALS
@@ -1160,9 +1149,17 @@ def test_provider_client_routed_off_origin_is_refused_before_sending(
         expiry = timedelta(minutes=5 if provider == "sso_oidc_refresh" else 480)
         sso_token(tmp_path, expiry)
     monkeypatch.setenv("AWS_DATA_PATH", str(data_path))
-    with pytest.raises(framework.SafetyViolation, match="non-canonical endpoint"):
-        live_orchestrator(tmp_path)
-    assert sent == []
+    orchestrator, _values = live_orchestrator(tmp_path)
+    assert orchestrator.actual_account == ACCOUNT_ID
+    allowed_hosts = (
+        "sts.us-east-1.amazonaws.com",
+        f"portal.sso.{SSO_REGION}.amazonaws.com",
+        f"oidc.{SSO_REGION}.amazonaws.com",
+    )
+    assert sent and all(
+        any(host == expected for expected in allowed_hosts)
+        for _, host in provider_hosts(sent)
+    )
 
 
 def test_hardened_session_binds_every_created_client(tmp_path, monkeypatch):
@@ -1634,23 +1631,27 @@ def test_origin_bound_client_disables_account_endpoints_without_session_hardenin
     with pytest.raises(framework.SafetyViolation, match="origin-hardened"):
         framework.origin_bound_client(session, "kinesis", "us-east-1", Config())
     assert sent == []
-    # The per-client setting alone keeps the host canonical, independent of the
-    # session-wide defence-in-depth settings: a test double without a botocore
-    # core delegates to the same unhardened session, whose session-wide account
-    # endpoint mode is botocore's default.
-    double = SimpleNamespace(client=session.client)
+    # A direct bound-method wrapper must not hide an unhardened Botocore core.
+    double = SimpleNamespace(
+        client=session.client, get_credentials=session.get_credentials
+    )
     assert session._session.get_config_variable("account_id_endpoint_mode") == (
         "preferred"
     )
-    client = framework.origin_bound_client(double, "kinesis", "us-east-1", Config())
-    assert client.meta.config.account_id_endpoint_mode == "disabled"
-    with pytest.raises(Delivered):
-        client.describe_stream(StreamName="chaos-test-stream")
-    assert sent == ["kinesis.us-east-1.amazonaws.com"]
+    with pytest.raises(framework.SafetyViolation, match="origin-hardened"):
+        framework.origin_bound_client(double, "kinesis", "us-east-1", Config())
+    assert sent == []
     # A hardened session produces a client with the same per-client setting.
     hardened, hardened_sent = kinesis_session(monkeypatch, tmp_path)
     framework.harden_session_origin(hardened)
-    client = framework.origin_bound_client(hardened, "kinesis", "us-east-1", Config())
+    client = framework.origin_bound_client(
+        SimpleNamespace(
+            client=hardened.client, get_credentials=hardened.get_credentials
+        ),
+        "kinesis",
+        "us-east-1",
+        Config(),
+    )
     assert client.meta.config.account_id_endpoint_mode == "disabled"
     with pytest.raises(Delivered):
         client.describe_stream(StreamName="chaos-test-stream")
@@ -2088,6 +2089,6 @@ def test_redirected_login_refresh_is_refused_before_sending(tmp_path, monkeypatc
     sent = provider_aws(monkeypatch, tmp_path, LOGIN_PROFILE)
     login_environment(monkeypatch, tmp_path, crt=False)
     monkeypatch.setenv("AWS_DATA_PATH", str(data_path))
-    with pytest.raises(framework.SafetyViolation, match="non-canonical endpoint"):
-        live_orchestrator(tmp_path)
-    assert sent == []
+    orchestrator, _values = live_orchestrator(tmp_path)
+    assert orchestrator.actual_account == ACCOUNT_ID
+    assert provider_hosts(sent)[0][1] == "us-east-1.signin.aws.amazon.com"

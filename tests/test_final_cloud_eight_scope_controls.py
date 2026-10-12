@@ -14,7 +14,6 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 from urllib.parse import urlsplit
@@ -306,7 +305,7 @@ def test_refreshable_profile_cannot_sign_as_another_account_after_admission(
 
 
 def test_live_admission_without_resolvable_credentials_is_refused(tmp_path):
-    session = SimpleNamespace(get_credentials=lambda: None)
+    session = framework._ProviderFreeSession({})
     with (
         patch.object(framework.boto3, "Session", lambda **kwargs: session),
         patch.object(framework.signal, "signal"),

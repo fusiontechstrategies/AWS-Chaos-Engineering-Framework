@@ -2,6 +2,20 @@
 
 ## Unreleased security follow-ups
 
+### Credential origins, read models and KMS grants
+
+- Credential resolution now rejects proxy configuration before plaintext
+  metadata or container credential requests, including system proxies and
+  default Botocore client config. Direct wrappers must expose both client and
+  credential methods bound to the same hardened boto3 session; provider-free
+  tests use a fixed client map and static credentials.
+- Real sessions load packaged Botocore service models only. Reviewed reads
+  check their generated wire operation against a locked manifest at dispatch,
+  including saved callables and every paginator page.
+- KMS grant revocation binds approved grantee and retiring principals, checks
+  both returned identities, and preserves operator and recovery grants even
+  when an experiment overrides globally configured recovery identities.
+
 ### Loopback container credential tokens
 
 - Container credentials configured on a numeric loopback URL over plain HTTP

@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import urllib.request
 import uuid
 import weakref
 from collections.abc import Iterable
@@ -39,13 +40,16 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache, wraps
 from pathlib import Path
+from types import MappingProxyType, MethodType
 from typing import Any
 from urllib.parse import urlsplit
 
 try:
     import boto3
     import yaml
+    from botocore.client import BaseClient
     from botocore.config import Config as BotocoreConfig
+    from botocore.credentials import Credentials as BotocoreCredentials
     from botocore.endpoint_provider import EndpointProvider
     from botocore.exceptions import ClientError, EndpointResolutionError
     from botocore.loaders import Loader as BotocoreLoader
@@ -54,6 +58,10 @@ except ImportError as exc:  # pragma: no cover - exercised by packaging smoke te
     raise SystemExit(
         "Missing dependency. Install boto3, botocore, and PyYAML before running this tool."
     ) from exc
+
+BOTO3_SESSION_TYPE = boto3.Session
+BOTO3_CLIENT_METHOD = boto3.Session.client
+BOTO3_CREDENTIALS_METHOD = boto3.Session.get_credentials
 
 
 __version__ = "2.0.4"
@@ -131,6 +139,720 @@ READ_ONLY_OPERATIONS = {
     "sqs": frozenset({"get_queue_attributes"}),
     "sts": frozenset({"get_caller_identity"}),
     "wafv2": frozenset({"get_ip_set", "get_web_acl"}),
+}
+# Reviewed against the locked Botocore package. Every allowlisted read
+# must retain its API operation, HTTP method/URI, protocol and signing.
+READ_ONLY_WIRE_MANIFEST: dict[str, dict[str, tuple[str | None, ...]]] = {
+    "appstream": {
+        "describe_fleets": (
+            "DescribeFleets",
+            "POST",
+            "/",
+            "smithy-rpc-v2-cbor",
+            "v4",
+            "appstream2",
+            "json",
+            "appstream",
+            "PhotonAdminProxyService",
+        ),
+        "list_associated_fleets": (
+            "ListAssociatedFleets",
+            "POST",
+            "/",
+            "smithy-rpc-v2-cbor",
+            "v4",
+            "appstream2",
+            "json",
+            "appstream",
+            "PhotonAdminProxyService",
+        ),
+    },
+    "cloudfront": {
+        "get_distribution_config": (
+            "GetDistributionConfig",
+            "GET",
+            "/2020-05-31/distribution/{Id}/config",
+            "rest-xml",
+            "v4",
+            "cloudfront",
+            "rest-xml",
+            "cloudfront",
+            None,
+        )
+    },
+    "cloudwatch": {
+        "describe_alarms": (
+            "DescribeAlarms",
+            "POST",
+            "/",
+            "smithy-rpc-v2-cbor",
+            "v4",
+            "monitoring",
+            "json",
+            "monitoring",
+            "GraniteServiceVersion20100801",
+        )
+    },
+    "codecommit": {
+        "get_repository_triggers": (
+            "GetRepositoryTriggers",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "codecommit",
+            "json",
+            "codecommit",
+            "CodeCommit_20150413",
+        )
+    },
+    "ds": {
+        "describe_conditional_forwarders": (
+            "DescribeConditionalForwarders",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "ds",
+            "json",
+            "ds",
+            "DirectoryService_20150416",
+        ),
+        "describe_trusts": (
+            "DescribeTrusts",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "ds",
+            "json",
+            "ds",
+            "DirectoryService_20150416",
+        ),
+    },
+    "ec2": {
+        "describe_instances": (
+            "DescribeInstances",
+            "POST",
+            "/",
+            "ec2",
+            "v4",
+            "ec2",
+            "ec2",
+            "ec2",
+            None,
+        ),
+        "describe_network_acls": (
+            "DescribeNetworkAcls",
+            "POST",
+            "/",
+            "ec2",
+            "v4",
+            "ec2",
+            "ec2",
+            "ec2",
+            None,
+        ),
+        "describe_route_tables": (
+            "DescribeRouteTables",
+            "POST",
+            "/",
+            "ec2",
+            "v4",
+            "ec2",
+            "ec2",
+            "ec2",
+            None,
+        ),
+        "describe_security_groups": (
+            "DescribeSecurityGroups",
+            "POST",
+            "/",
+            "ec2",
+            "v4",
+            "ec2",
+            "ec2",
+            "ec2",
+            None,
+        ),
+        "describe_subnets": (
+            "DescribeSubnets",
+            "POST",
+            "/",
+            "ec2",
+            "v4",
+            "ec2",
+            "ec2",
+            "ec2",
+            None,
+        ),
+        "describe_volumes": (
+            "DescribeVolumes",
+            "POST",
+            "/",
+            "ec2",
+            "v4",
+            "ec2",
+            "ec2",
+            "ec2",
+            None,
+        ),
+        "describe_vpc_endpoints": (
+            "DescribeVpcEndpoints",
+            "POST",
+            "/",
+            "ec2",
+            "v4",
+            "ec2",
+            "ec2",
+            "ec2",
+            None,
+        ),
+        "describe_vpc_peering_connections": (
+            "DescribeVpcPeeringConnections",
+            "POST",
+            "/",
+            "ec2",
+            "v4",
+            "ec2",
+            "ec2",
+            "ec2",
+            None,
+        ),
+        "describe_vpcs": (
+            "DescribeVpcs",
+            "POST",
+            "/",
+            "ec2",
+            "v4",
+            "ec2",
+            "ec2",
+            "ec2",
+            None,
+        ),
+    },
+    "ecr": {
+        "describe_images": (
+            "DescribeImages",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "api.ecr",
+            "json",
+            "ecr",
+            "AmazonEC2ContainerRegistry_V20150921",
+        ),
+        "get_repository_policy": (
+            "GetRepositoryPolicy",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "api.ecr",
+            "json",
+            "ecr",
+            "AmazonEC2ContainerRegistry_V20150921",
+        ),
+    },
+    "ecs": {
+        "describe_container_instances": (
+            "DescribeContainerInstances",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "ecs",
+            "json",
+            "ecs",
+            "AmazonEC2ContainerServiceV20141113",
+        ),
+        "describe_services": (
+            "DescribeServices",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "ecs",
+            "json",
+            "ecs",
+            "AmazonEC2ContainerServiceV20141113",
+        ),
+        "describe_task_definition": (
+            "DescribeTaskDefinition",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "ecs",
+            "json",
+            "ecs",
+            "AmazonEC2ContainerServiceV20141113",
+        ),
+        "describe_tasks": (
+            "DescribeTasks",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "ecs",
+            "json",
+            "ecs",
+            "AmazonEC2ContainerServiceV20141113",
+        ),
+    },
+    "efs": {
+        "describe_file_systems": (
+            "DescribeFileSystems",
+            "GET",
+            "/2015-02-01/file-systems",
+            "rest-json",
+            "v4",
+            "elasticfilesystem",
+            "rest-json",
+            "elasticfilesystem",
+            None,
+        ),
+        "describe_mount_targets": (
+            "DescribeMountTargets",
+            "GET",
+            "/2015-02-01/mount-targets",
+            "rest-json",
+            "v4",
+            "elasticfilesystem",
+            "rest-json",
+            "elasticfilesystem",
+            None,
+        ),
+    },
+    "elbv2": {
+        "describe_rules": (
+            "DescribeRules",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "elasticloadbalancing",
+            "query",
+            "elasticloadbalancing",
+            None,
+        ),
+        "describe_target_group_attributes": (
+            "DescribeTargetGroupAttributes",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "elasticloadbalancing",
+            "query",
+            "elasticloadbalancing",
+            None,
+        ),
+        "describe_target_groups": (
+            "DescribeTargetGroups",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "elasticloadbalancing",
+            "query",
+            "elasticloadbalancing",
+            None,
+        ),
+        "describe_target_health": (
+            "DescribeTargetHealth",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "elasticloadbalancing",
+            "query",
+            "elasticloadbalancing",
+            None,
+        ),
+    },
+    "fis": {
+        "get_experiment": (
+            "GetExperiment",
+            "GET",
+            "/experiments/{id}",
+            "rest-json",
+            "v4",
+            "fis",
+            "rest-json",
+            "fis",
+            None,
+        ),
+        "get_experiment_template": (
+            "GetExperimentTemplate",
+            "GET",
+            "/experimentTemplates/{id}",
+            "rest-json",
+            "v4",
+            "fis",
+            "rest-json",
+            "fis",
+            None,
+        ),
+    },
+    "guardduty": {
+        "list_detectors": (
+            "ListDetectors",
+            "GET",
+            "/detector",
+            "rest-json",
+            "v4",
+            "guardduty",
+            "rest-json",
+            "guardduty",
+            None,
+        ),
+        "list_findings": (
+            "ListFindings",
+            "POST",
+            "/detector/{DetectorId}/findings",
+            "rest-json",
+            "v4",
+            "guardduty",
+            "rest-json",
+            "guardduty",
+            None,
+        ),
+    },
+    "iam": {
+        "get_role": (
+            "GetRole",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "iam",
+            "query",
+            "iam",
+            None,
+        ),
+        "list_access_keys": (
+            "ListAccessKeys",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "iam",
+            "query",
+            "iam",
+            None,
+        ),
+        "list_attached_role_policies": (
+            "ListAttachedRolePolicies",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "iam",
+            "query",
+            "iam",
+            None,
+        ),
+    },
+    "kinesis": {
+        "describe_stream": (
+            "DescribeStream",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "kinesis",
+            "json",
+            "kinesis",
+            "Kinesis_20131202",
+        ),
+        "describe_stream_summary": (
+            "DescribeStreamSummary",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "kinesis",
+            "json",
+            "kinesis",
+            "Kinesis_20131202",
+        ),
+    },
+    "kms": {
+        "describe_key": (
+            "DescribeKey",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "kms",
+            "json",
+            "kms",
+            "TrentService",
+        ),
+        "get_key_policy": (
+            "GetKeyPolicy",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "kms",
+            "json",
+            "kms",
+            "TrentService",
+        ),
+        "list_grants": (
+            "ListGrants",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "kms",
+            "json",
+            "kms",
+            "TrentService",
+        ),
+    },
+    "lambda": {
+        "get_function_concurrency": (
+            "GetFunctionConcurrency",
+            "GET",
+            "/2019-09-30/functions/{FunctionName}/concurrency",
+            "rest-json",
+            "v4",
+            "lambda",
+            "rest-json",
+            "lambda",
+            None,
+        ),
+        "get_function_configuration": (
+            "GetFunctionConfiguration",
+            "GET",
+            "/2015-03-31/functions/{FunctionName}/configuration",
+            "rest-json",
+            "v4",
+            "lambda",
+            "rest-json",
+            "lambda",
+            None,
+        ),
+    },
+    "opensearch": {
+        "describe_domain": (
+            "DescribeDomain",
+            "GET",
+            "/2021-01-01/opensearch/domain/{DomainName}",
+            "rest-json",
+            "v4",
+            "es",
+            "rest-json",
+            "es",
+            None,
+        )
+    },
+    "rds": {
+        "describe_db_clusters": (
+            "DescribeDBClusters",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "rds",
+            "query",
+            "rds",
+            None,
+        ),
+        "describe_db_instances": (
+            "DescribeDBInstances",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "rds",
+            "query",
+            "rds",
+            None,
+        ),
+        "describe_db_parameters": (
+            "DescribeDBParameters",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "rds",
+            "query",
+            "rds",
+            None,
+        ),
+    },
+    "s3": {
+        "get_bucket_encryption": (
+            "GetBucketEncryption",
+            "GET",
+            "/{Bucket}?encryption",
+            "rest-xml",
+            "s3",
+            "s3",
+            "rest-xml",
+            "s3",
+            None,
+        ),
+        "get_bucket_lifecycle_configuration": (
+            "GetBucketLifecycleConfiguration",
+            "GET",
+            "/{Bucket}?lifecycle",
+            "rest-xml",
+            "s3",
+            "s3",
+            "rest-xml",
+            "s3",
+            None,
+        ),
+        "get_bucket_location": (
+            "GetBucketLocation",
+            "GET",
+            "/{Bucket}?location",
+            "rest-xml",
+            "s3",
+            "s3",
+            "rest-xml",
+            "s3",
+            None,
+        ),
+        "get_bucket_policy": (
+            "GetBucketPolicy",
+            "GET",
+            "/{Bucket}?policy",
+            "rest-xml",
+            "s3",
+            "s3",
+            "rest-xml",
+            "s3",
+            None,
+        ),
+        "get_bucket_versioning": (
+            "GetBucketVersioning",
+            "GET",
+            "/{Bucket}?versioning",
+            "rest-xml",
+            "s3",
+            "s3",
+            "rest-xml",
+            "s3",
+            None,
+        ),
+        "list_objects_v2": (
+            "ListObjectsV2",
+            "GET",
+            "/{Bucket}?list-type=2",
+            "rest-xml",
+            "s3",
+            "s3",
+            "rest-xml",
+            "s3",
+            None,
+        ),
+    },
+    "securityhub": {
+        "get_findings": (
+            "GetFindings",
+            "POST",
+            "/findings",
+            "rest-json",
+            "v4",
+            "securityhub",
+            "rest-json",
+            "securityhub",
+            None,
+        )
+    },
+    "ses": {
+        "describe_configuration_set": (
+            "DescribeConfigurationSet",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "email",
+            "query",
+            "ses",
+            None,
+        )
+    },
+    "sns": {
+        "get_subscription_attributes": (
+            "GetSubscriptionAttributes",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "sns",
+            "query",
+            "sns",
+            None,
+        ),
+        "get_topic_attributes": (
+            "GetTopicAttributes",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "sns",
+            "query",
+            "sns",
+            None,
+        ),
+    },
+    "sqs": {
+        "get_queue_attributes": (
+            "GetQueueAttributes",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "sqs",
+            "json",
+            "sqs",
+            "AmazonSQS",
+        )
+    },
+    "sts": {
+        "get_caller_identity": (
+            "GetCallerIdentity",
+            "POST",
+            "/",
+            "query",
+            "v4",
+            "sts",
+            "query",
+            "sts",
+            None,
+        )
+    },
+    "wafv2": {
+        "get_ip_set": (
+            "GetIPSet",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "wafv2",
+            "json",
+            "wafv2",
+            "AWSWAF_20190729",
+        ),
+        "get_web_acl": (
+            "GetWebACL",
+            "POST",
+            "/",
+            "json",
+            "v4",
+            "wafv2",
+            "json",
+            "wafv2",
+            "AWSWAF_20190729",
+        ),
+    },
 }
 EC2_INVENTORY_PAGINATOR_OPERATIONS = frozenset(
     {
@@ -749,7 +1471,12 @@ REQUIRED_PARAMETERS: dict[ChaosType, tuple[str, ...]] = {
     ChaosType.WAF_IP_SET_MODIFY: ("ip_set_id", "ip_set_name", "addresses_to_add"),
     ChaosType.KMS_KEY_DISABLE: ("key_id",),
     ChaosType.KMS_KEY_POLICY_RESTRICT: ("key_id", "break_glass_principal_arn"),
-    ChaosType.KMS_GRANT_REVOKE: ("key_id", "grant_id"),
+    ChaosType.KMS_GRANT_REVOKE: (
+        "key_id",
+        "grant_id",
+        "grantee_principal_arn",
+        "retiring_principal_arn",
+    ),
     ChaosType.IAM_POLICY_DETACH: ("role_name", "policy_arn"),
     ChaosType.IAM_ROLE_MODIFY: ("role_name",),
     ChaosType.IAM_USER_ACCESS_KEY_DEACTIVATE: ("user_name", "access_key_id"),
@@ -1739,10 +2466,12 @@ def pin_session_credentials(
     session, so the profile's provider chain is never consulted and nothing
     refreshes them.
     """
-    require_origin_hardened_session(session)
-    # Resolution may reach the raw IMDS or container provider transports.
-    require_credential_transport_policy(session)
-    credentials = session.get_credentials()
+    owner = _checked_origin_session(session)
+    credentials = (
+        owner.get_credentials()
+        if type(owner) is _ProviderFreeSession
+        else BOTO3_CREDENTIALS_METHOD(owner)
+    )
     frozen = credentials.get_frozen_credentials() if credentials else None
     if frozen is None or not frozen.access_key or not frozen.secret_key:
         raise SafetyViolation(
@@ -1802,6 +2531,11 @@ def _bundled_endpoint_loader() -> Any:
     and so redirect requests without any endpoint_url setting. The packaged data
     is immutable, so one loader (and its parsed-file cache) is shared.
     """
+    return _new_bundled_loader()
+
+
+def _new_bundled_loader() -> Any:
+    """Give each session its own packaged loader and mutable model cache."""
     return BotocoreLoader(
         extra_search_paths=[BotocoreLoader.BUILTIN_DATA_PATH],
         include_default_search_paths=False,
@@ -2041,16 +2775,26 @@ def origin_bound_client(session: Any, service: str, region: str, config: Any) ->
     # bound only on an origin-hardened session, so any other botocore-backed
     # session is refused first, for every caller including direct library
     # construction of a SafetyController or experiment.
-    require_origin_hardened_session(session)
-    # Resolution may also reach the raw IMDS or container provider transports.
-    require_credential_transport_policy(session)
-    use_fips = configured_fips_endpoint(session)
+    owner = _checked_origin_session(session, config)
+    use_fips = configured_fips_endpoint(owner)
     parents, hosts = canonical_endpoint_origin(service, region, use_fips)
-    client = session.client(
-        service,
-        region_name=region,
-        config=config.merge(endpoint_origin_config(use_fips)),
+    options = {
+        "region_name": region,
+        "config": config.merge(endpoint_origin_config(use_fips)),
+    }
+    client = (
+        owner.client(service, **options)
+        if type(owner) is _ProviderFreeSession
+        else BOTO3_CLIENT_METHOD(owner, service, **options)
     )
+    if (
+        type(session) is _ProviderFreeSession
+        and isinstance(client, BaseClient)
+        and client not in _HARDENED_CLIENTS
+    ):
+        raise SafetyViolation(
+            "Provider-free test sessions require hardened SDK clients"
+        )
     bind_endpoint_origin(client, service, parents, hosts)
     return client
 
@@ -2063,34 +2807,192 @@ SESSION_ORIGIN_SETTINGS = (
 )
 
 
+class _ProviderFreeSession(tuple):
+    """Internal static injection point with no client or credential factory."""
+
+    __slots__ = ()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise TypeError("Provider-free session adapter cannot be subclassed")
+
+    def __new__(cls, clients: dict[str, Any], credentials: Any = None):
+        if type(clients) is not dict or not all(
+            type(service) is str and service and client is not None
+            for service, client in clients.items()
+        ):
+            raise SafetyViolation("Provider-free clients must be a fixed service map")
+        if credentials is not None and type(credentials) is not BotocoreCredentials:
+            raise SafetyViolation("Provider-free credentials must be static")
+        credential_values = None
+        if credentials is not None:
+            # Read only exact scalar fields. A Credentials instance can shadow
+            # get_frozen_credentials with a caller-owned provider delegate.
+            fields = object.__getattribute__(credentials, "__dict__")
+            if type(fields) is not dict:
+                raise SafetyViolation("Provider-free credentials must be static")
+            credential_values = tuple(
+                dict.get(fields, name)
+                for name in ("access_key", "secret_key", "token", "account_id")
+            )
+            if not _static_credential_values(credential_values):
+                raise SafetyViolation("Provider-free credentials must be static")
+        if any(
+            isinstance(client, BaseClient) and client not in _HARDENED_CLIENTS
+            for client in clients.values()
+        ):
+            raise SafetyViolation("Provider-free clients require hardened SDK clients")
+        return tuple.__new__(cls, (tuple(clients.items()), credential_values))
+
+    @property
+    def _clients(self) -> MappingProxyType:
+        """Expose a read-only copy; client dispatch uses only immutable entries."""
+        return MappingProxyType(dict(tuple.__getitem__(self, 0)))
+
+    @property
+    def _credentials(self) -> Any:
+        values = tuple.__getitem__(self, 1)
+        return (
+            BotocoreCredentials(*values[:3], account_id=values[3]) if values else None
+        )
+
+    def client(self, service: str, **kwargs: Any) -> Any:
+        for fixed_service, client in tuple.__getitem__(self, 0):
+            if fixed_service == service:
+                return client
+        raise SafetyViolation("Provider-free service has no fixed client")
+
+    def get_credentials(self) -> Any:
+        return self._credentials
+
+
+def _static_credential_values(values: Any) -> bool:
+    return (
+        type(values) is tuple
+        and len(values) == 4
+        and type(values[0]) is str
+        and bool(values[0])
+        and type(values[1]) is str
+        and bool(values[1])
+        and (values[2] is None or type(values[2]) is str)
+        and (values[3] is None or type(values[3]) is str)
+    )
+
+
+def _valid_provider_free_session(session: Any) -> bool:
+    """Validate even exact adapters allocated through the tuple base constructor."""
+    if type(session) is not _ProviderFreeSession or tuple.__len__(session) != 2:
+        return False
+    clients, credentials = tuple.__getitem__(session, 0), tuple.__getitem__(session, 1)
+    return (
+        type(clients) is tuple
+        and all(
+            type(entry) is tuple
+            and len(entry) == 2
+            and type(entry[0]) is str
+            and bool(entry[0])
+            and entry[1] is not None
+            and (not isinstance(entry[1], BaseClient) or entry[1] in _HARDENED_CLIENTS)
+            for entry in clients
+        )
+        and len({entry[0] for entry in clients}) == len(clients)
+        and (credentials is None or _static_credential_values(credentials))
+    )
+
+
+def _verified_boto3_owner(session: Any) -> Any:
+    """Capture the sole owner of two genuine, canonical boto3 bound methods."""
+    if type(session) is _ProviderFreeSession:
+        return None
+    client = getattr(session, "client", None)
+    if type(client) is not MethodType:
+        return None
+    bound = client.__self__
+    if (
+        type(bound) is not BOTO3_SESSION_TYPE
+        or client.__func__ is not BOTO3_CLIENT_METHOD
+    ):
+        return None
+    credentials = getattr(session, "get_credentials", None)
+    if (
+        type(credentials) is not MethodType
+        or credentials.__self__ is not bound
+        or credentials.__func__ is not BOTO3_CREDENTIALS_METHOD
+    ):
+        return None
+    # The concrete SDK owner stores this as a plain instance attribute. An
+    # isolated native view below keeps subsequent SDK method dereferences on
+    # this exact core even if the caller later swaps its original session.
+    core = vars(bound).get("_session")
+    if type(core) is not BotocoreSession:
+        return None
+    declared = getattr(session, "_session", None)
+    if declared is not None and declared is not core:
+        return None
+    fixed = object.__new__(BOTO3_SESSION_TYPE)
+    object.__setattr__(fixed, "_session", core)
+    return fixed
+
+
 def _botocore_core(session: Any) -> Any:
-    core = getattr(session, "_session", None)
-    return core if isinstance(core, BotocoreSession) else None
+    """Accept only a real session or a same-owner client/credential wrapper."""
+    owner = _verified_boto3_owner(session)
+    return owner._session if owner is not None else None
 
 
 _HARDENED_CORES: weakref.WeakSet[Any] = weakref.WeakSet()
+_HARDENED_CLIENTS: weakref.WeakSet[Any] = weakref.WeakSet()
+_PACKAGED_LOADERS: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
 
 
 def is_origin_hardened(session: Any) -> bool:
     core = _botocore_core(session)
-    return core is not None and core in _HARDENED_CORES
+    if core is None or core not in _HARDENED_CORES:
+        return False
+    try:
+        loader = core.get_component("data_loader")
+        return (
+            loader is _PACKAGED_LOADERS.get(core)
+            and type(loader) is BotocoreLoader
+            and loader.search_paths == [BotocoreLoader.BUILTIN_DATA_PATH]
+        )
+    except Exception:
+        return False
 
 
 def require_origin_hardened_session(session: Any) -> None:
-    """Refuse a botocore-backed session that harden_session_origin has not marked.
+    """Refuse sessions without a provably bound hardened Botocore core.
 
     This is the direct-library session contract. Resolving credentials or
     tokens can create assume-role, web-identity, SSO, SSO-OIDC and login
     provider clients from the session, and only a hardened session binds
     them, so the check runs before the session is stored or used and before
-    any credential is resolved. A session object without a botocore core (a
-    test double) has no provider chain and is admitted; its clients are still
-    bound by origin_bound_client.
+    any credential is resolved. Provider-free tests use a separate internal
+    injection class whose clients cannot be real SDK clients.
     """
-    if _botocore_core(session) is not None and not is_origin_hardened(session):
+    if type(session) is _ProviderFreeSession:
+        if _valid_provider_free_session(session):
+            return
+        raise SafetyViolation("Provider-free session payload is not static")
+    if not is_origin_hardened(session):
         raise SafetyViolation(
             "Credentials must be resolved from an origin-hardened AWS session"
         )
+
+
+def _checked_origin_session(session: Any, config: Any = None) -> Any:
+    """Pin origin and transport checks to the owner that will do the work."""
+    if type(session) is _ProviderFreeSession:
+        require_origin_hardened_session(session)
+        require_credential_transport_policy(session, config)
+        return session
+    owner = _verified_boto3_owner(session)
+    if owner is None:
+        raise SafetyViolation(
+            "Credentials must be resolved from an origin-hardened AWS session"
+        )
+    require_origin_hardened_session(owner)
+    require_credential_transport_policy(owner, config)
+    return owner
 
 
 def _credential_resolver_built(core: Any) -> bool:
@@ -2122,25 +3024,45 @@ def harden_session_origin(session: Any) -> Any:
     actual service and region (explicit ``region_name``, else the config's
     ``region_name``, else the session region, as botocore resolves it), and an
     explicit ``endpoint_url`` is refused. The same settings are also set
-    session-wide as defence in depth. A session object without a botocore core
-    has no provider chain; its clients are still bound by origin_bound_client.
+    session-wide as defence in depth. Provider-free test sessions use a
+    separate internal injection class.
     A session whose credential resolver or token provider was already built
     is refused rather than marked: either can retain an unwrapped provider
     client creator.
     """
-    core = _botocore_core(session)
-    if core is None or is_origin_hardened(session):
+    owner = _verified_boto3_owner(session)
+    core = owner._session if owner is not None else None
+    if type(session) is _ProviderFreeSession:
+        require_origin_hardened_session(session)
+        return session
+    if core is None:
+        raise SafetyViolation(
+            "AWS session core or bound client method cannot be verified"
+        )
+    if is_origin_hardened(owner):
         return session
     if _credential_resolver_built(core):
         raise SafetyViolation(
             "An AWS session must be origin-hardened before its credential or token providers are initialized"
         )
-    use_fips = configured_fips_endpoint(session)
+    # Botocore's default loader searches AWS_DATA_PATH and ~/.aws/models before
+    # its packaged service-2 data. A caller-controlled model can change the
+    # wire request even when endpoint origin and the Python method are fixed.
+    packaged_loader = _new_bundled_loader()
+    core.register_component("data_loader", packaged_loader)
+    use_fips = configured_fips_endpoint(owner)
     for name, value in (*SESSION_ORIGIN_SETTINGS, ("use_fips_endpoint", use_fips)):
         core.set_config_variable(name, value)
     original = core.create_client
 
     def create_client(service_name: str, *args: Any, **kwargs: Any) -> Any:
+        if not is_origin_hardened(owner):
+            raise SafetyViolation("AWS session packaged model loader changed")
+        # A fresh packaged loader prevents a caller from seeding the prior
+        # loader's mutable parsed-model cache before client construction.
+        fresh_loader = _new_bundled_loader()
+        core.register_component("data_loader", fresh_loader)
+        _PACKAGED_LOADERS[core] = fresh_loader
         if args:
             raise SafetyViolation("AWS SDK clients require keyword creation options")
         if kwargs.get("endpoint_url") is not None:
@@ -2157,9 +3079,11 @@ def harden_session_origin(session: Any) -> Any:
         kwargs["config"] = origin if config is None else config.merge(origin)
         client = original(service_name, **kwargs)
         bind_endpoint_origin(client, service_name, parents, hosts)
+        _HARDENED_CLIENTS.add(client)
         return client
 
     core.create_client = create_client
+    _PACKAGED_LOADERS[core] = packaged_loader
     _HARDENED_CORES.add(core)
     return session
 
@@ -2193,7 +3117,7 @@ def _is_numeric_loopback_literal(host: str) -> bool:
     return address == IPV6_LOOPBACK and address.scope_id is None
 
 
-def require_credential_transport_policy(session: Any) -> None:
+def require_credential_transport_policy(session: Any, config: Any = None) -> None:
     """Refuse configured IMDS or container credential addresses in every mode.
 
     These providers use their own plain HTTP transports, not SDK clients, so
@@ -2210,10 +3134,51 @@ def require_credential_transport_policy(session: Any) -> None:
     connection to loopback. Plain HTTP loopback is also refused when either
     container authorization-token setting is present: another local process
     could own that TCP port and receive the bearer token. HTTPS loopback
-    remains subject to botocore's certificate verification. Botocore itself
-    admits ``localhost`` and any HTTPS host for a full URI.
+    remains subject to botocore's certificate verification. Any HTTP, HTTPS,
+    or all-protocol proxy setting fails closed before provider resolution,
+    independent of NO_PROXY, because it could intercept plaintext IMDS.
+    Botocore itself admits ``localhost`` and any HTTPS host for a full URI.
     """
     core = _botocore_core(session)
+    # IMDS and container fetchers use a separate plaintext transport. Refuse
+    # proxy configuration before resolving any provider: NO_PROXY is caller
+    # controlled and cannot prove that the effective route stays local.
+    instance_vars = getattr(core, "_session_instance_vars", None) if core else {}
+    scoped = core.get_scoped_config() if core else {}
+    if not isinstance(instance_vars, dict) or not isinstance(scoped, dict):
+        raise SafetyViolation("Credential proxy absence cannot be proven")
+    try:
+        system_proxies = urllib.request.getproxies()
+        default_config = core.get_default_client_config() if core else None
+    except Exception as exc:
+        raise SafetyViolation("Credential proxy absence cannot be proven") from exc
+    if not isinstance(system_proxies, dict):
+        raise SafetyViolation("Credential proxy absence cannot be proven")
+    if (
+        any(
+            value
+            for name, value in os.environ.items()
+            if name.lower() in {"http_proxy", "https_proxy", "all_proxy"}
+        )
+        or any(
+            source.get(name)
+            for source in (instance_vars, scoped)
+            for name in ("proxies", "proxies_config")
+        )
+        or any(
+            value
+            for name, value in system_proxies.items()
+            if str(name).lower() in {"http", "https", "all"}
+        )
+        or any(
+            getattr(default_config, name, None)
+            for name in ("proxies", "proxies_config")
+        )
+        or any(getattr(config, name, None) for name in ("proxies", "proxies_config"))
+    ):
+        raise SafetyViolation(
+            "Credential resolution refuses a proxy for metadata or container providers"
+        )
     endpoint = (
         core.get_config_variable("ec2_metadata_service_endpoint") if core else None
     )
@@ -2271,6 +3236,49 @@ def canonical_caller_principal(caller_arn: str | None) -> str | None:
         role_name = resource.split("/", 2)[1]
         return f"arn:{parts[1]}:iam::{parts[4]}:role/{role_name}"
     return caller_arn
+
+
+def grant_principal_identity(value: Any) -> tuple[str, str, str, str]:
+    """Normalize IAM roles and their STS sessions for grant protection."""
+    if not isinstance(value, str):
+        raise SafetyViolation("KMS grant principal is missing or malformed")
+    parts = value.split(":", 5)
+    if (
+        len(parts) != 6
+        or parts[0] != "arn"
+        or parts[1] not in {"aws", "aws-us-gov", "aws-cn"}
+        or not ACCOUNT_ID_PATTERN.fullmatch(parts[4])
+    ):
+        raise SafetyViolation("KMS grant principal is missing or malformed")
+    partition, service, region, account, resource = parts[1:]
+    if service == "iam" and region == "":
+        if resource == "root":
+            return partition, account, "root", ""
+        for kind in ("role", "user"):
+            prefix = kind + "/"
+            if resource.startswith(prefix):
+                name = resource[len(prefix) :]
+                if (
+                    name
+                    and not name.startswith("/")
+                    and not name.endswith("/")
+                    and "//" not in name
+                    and re.fullmatch(r"[A-Za-z0-9+=,.@_/-]+", name)
+                ):
+                    # Role names are unique per account regardless of IAM path.
+                    return (
+                        partition,
+                        account,
+                        kind,
+                        (name.rsplit("/", 1)[-1] if kind == "role" else name),
+                    )
+    if service == "sts" and region == "" and resource.startswith("assumed-role/"):
+        segments = resource.split("/")
+        if len(segments) == 3 and all(
+            re.fullmatch(r"[A-Za-z0-9+=,.@_-]+", part) for part in segments[1:]
+        ):
+            return partition, account, "role", segments[1]
+    raise SafetyViolation("KMS grant principal is missing or malformed")
 
 
 class PrivacyFormatter(logging.Formatter):
@@ -3069,6 +4077,73 @@ def bind_s3_signing_region(client: Any) -> None:
     )
 
 
+def validate_read_only_wire_model(client: BaseClient, service: str, name: str) -> None:
+    """Bind an admitted read to its reviewed packaged Botocore wire operation."""
+    expected = READ_ONLY_WIRE_MANIFEST.get(service, {}).get(name)
+    if expected is None:
+        raise SafetyViolation("AWS read operation has no reviewed wire identity")
+    try:
+        meta = client.meta
+        model = meta.service_model
+        api = meta.method_to_api_mapping[name]
+        operation = model.operation_model(api)
+        # Botocore serializers use the cached operation name and wire name for
+        # Query Action and JSON targets. One reviewed CloudFront version suffix
+        # differs from its Python/API name; all other admitted reads match.
+        expected_wire_name = (
+            "GetDistributionConfig2020_05_31"
+            if service == "cloudfront" and name == "get_distribution_config"
+            else api
+        )
+        if operation.name != api or operation.wire_name != expected_wire_name:
+            raise SafetyViolation(
+                "AWS read operation name differs from reviewed package"
+            )
+        wire = (
+            api,
+            operation.http["method"],
+            operation.http["requestUri"],
+            model.metadata.get("protocol"),
+            model.metadata.get("signatureVersion"),
+            model.metadata.get("endpointPrefix"),
+            model.resolved_protocol,
+            model.signing_name,
+            model.metadata.get("targetPrefix"),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise SafetyViolation("AWS read operation model cannot be verified") from exc
+    # Botocore's normal S3 virtual-host path conversion removes the Bucket
+    # label from the URI after the first request; the bucket is in the host.
+    # The API, method, query, protocol, signing and prefix still must match.
+    virtual_host_wire = (
+        expected[:2] + (expected[2].replace("/{Bucket}", ""),) + expected[3:]
+        if service == "s3" and "/{Bucket}" in expected[2]
+        else None
+    )
+    if wire != expected and wire != virtual_host_wire:
+        raise SafetyViolation(
+            f"AWS read operation model differs from reviewed package: {service}.{name}"
+        )
+
+
+class _ReviewedReadPaginator:
+    """Recheck a modeled read immediately before every paginator request."""
+
+    def __init__(self, client: BaseClient, operation: str, paginator: Any):
+        self._client = client
+        self._operation = operation
+        self._paginator = paginator
+
+    def paginate(self, *args: Any, **kwargs: Any) -> Any:
+        pages = iter(self._paginator.paginate(*args, **kwargs))
+        while True:
+            validate_read_only_wire_model(self._client, "ec2", self._operation)
+            try:
+                yield next(pages)
+            except StopIteration:
+                return
+
+
 class AwsClientProxy:
     """Record successful AWS mutations without logging request arguments."""
 
@@ -3078,6 +4153,9 @@ class AwsClientProxy:
         self._owner = owner
 
     def __getattr__(self, name: str) -> Any:
+        read_only = name in READ_ONLY_OPERATIONS.get(self._service, ())
+        if read_only and isinstance(self._client, BaseClient):
+            validate_read_only_wire_model(self._client, self._service, name)
         attribute = getattr(self._client, name)
         if (
             callable(attribute)
@@ -3114,18 +4192,33 @@ class AwsClientProxy:
                     or operation not in EC2_INVENTORY_PAGINATOR_OPERATIONS
                 ):
                     raise SafetyViolation("EC2 paginator operation is not reviewed")
-                return attribute(operation)
+                if isinstance(self._client, BaseClient):
+                    validate_read_only_wire_model(self._client, "ec2", operation)
+                paginator = attribute(operation)
+                return (
+                    _ReviewedReadPaginator(self._client, operation, paginator)
+                    if isinstance(self._client, BaseClient)
+                    else paginator
+                )
 
             return reviewed_paginator
-        read_only = name in READ_ONLY_OPERATIONS.get(self._service, ())
         bind_s3_owner = self._service == "s3" and name in S3_OWNER_BOUND_OPERATIONS
         bind_lambda_identity = self._service == "lambda" and read_only
-        if not callable(attribute) or (
-            read_only and not bind_s3_owner and not bind_lambda_identity
-        ):
+        if not callable(attribute):
             return attribute
+        if read_only and not bind_s3_owner and not bind_lambda_identity:
+            if not isinstance(self._client, BaseClient):
+                return attribute
+
+            def reviewed_read(*args: Any, **kwargs: Any) -> Any:
+                validate_read_only_wire_model(self._client, self._service, name)
+                return attribute(*args, **kwargs)
+
+            return reviewed_read
 
         def invoke(*args: Any, **kwargs: Any) -> Any:
+            if read_only and isinstance(self._client, BaseClient):
+                validate_read_only_wire_model(self._client, self._service, name)
             if self._owner is None:
                 # Controller-only clients support safety/identity reads. They do
                 # not carry experiment approval, tracking or recovery ownership.
@@ -3372,6 +4465,7 @@ class SafetyController:
     ):
         # Direct-library callers pass harden_session_origin(boto3.Session(...)).
         require_origin_hardened_session(session)
+        require_credential_transport_policy(session)
         self.config = config
         self.expected_account = expected_account
         self.session = session
@@ -3944,7 +5038,12 @@ AUTHORIZED_HANDLER_CALLS = {
     ),
     ChaosType.KMS_GRANT_REVOKE: (
         "revoke_grant",
-        (("key_id", False, None), ("grant_id", False, None)),
+        (
+            ("key_id", False, None),
+            ("grant_id", False, None),
+            ("grantee_principal_arn", False, None),
+            ("retiring_principal_arn", False, None),
+        ),
     ),
     ChaosType.IAM_POLICY_DETACH: (
         "detach_policy",
@@ -10470,7 +11569,13 @@ class KMSChaosExperiment(ChaosExperiment):
 
         return result
 
-    def revoke_grant(self, key_id: str, grant_id: str) -> ExperimentResult:
+    def revoke_grant(
+        self,
+        key_id: str,
+        grant_id: str,
+        grantee_principal_arn: str,
+        retiring_principal_arn: str,
+    ) -> ExperimentResult:
         """Revoke KMS grant"""
         experiment_id = _experiment_id("kms-grant-revoke")
         result = ExperimentResult(
@@ -10480,6 +11585,37 @@ class KMSChaosExperiment(ChaosExperiment):
         )
 
         try:
+            expected_grantee = grant_principal_identity(grantee_principal_arn)
+            expected_retiring = grant_principal_identity(retiring_principal_arn)
+            if expected_grantee != grant_principal_identity(
+                self.config.get("grantee_principal_arn")
+            ) or expected_retiring != grant_principal_identity(
+                self.config.get("retiring_principal_arn")
+            ):
+                raise SafetyViolation(
+                    "KMS grant principals differ from the approved plan"
+                )
+            protected = {
+                grant_principal_identity(value)
+                for value in (
+                    *(
+                        self.config.get(key)
+                        for key in (
+                            "operator_principal_arn",
+                            "role_arn",
+                            "break_glass_principal_arn",
+                            "recovery_principal_arn",
+                            "recovery_role_arn",
+                        )
+                    ),
+                    *getattr(self, "_global_grant_protected_principals", ()),
+                )
+                if value is not None
+            }
+            if expected_grantee in protected or expected_retiring in protected:
+                raise SafetyViolation(
+                    "Refusing to revoke a grant held by a protected principal"
+                )
             if not self.dry_run:
                 validate_kms_key_arn(
                     key_id, self.expected_account, self.expected_region
@@ -10497,6 +11633,17 @@ class KMSChaosExperiment(ChaosExperiment):
                 or (not self.dry_run and grants[0].get("KeyId") != key_id)
             ):
                 raise ConfigurationError("The selected KMS grant does not exist")
+            grantee = grant_principal_identity(grants[0].get("GranteePrincipal"))
+            retiring = grant_principal_identity(grants[0].get("RetiringPrincipal"))
+            if (
+                grantee != expected_grantee
+                or retiring != expected_retiring
+                or grantee in protected
+                or retiring in protected
+            ):
+                raise SafetyViolation(
+                    "KMS grant principals differ from the approved non-protected principals"
+                )
             if not self.dry_run:
                 with self._approved_sdk_request(
                     "kms", "revoke_grant", {"KeyId": key_id, "GrantId": grant_id}
@@ -11888,7 +13035,12 @@ class ChaosOrchestrator:
                 raise SafetyViolation(
                     "The active AWS identity partition does not match the configured region"
                 )
-            credentials = self.session.get_credentials()
+            owner = _checked_origin_session(self.session)
+            credentials = (
+                owner.get_credentials()
+                if type(owner) is _ProviderFreeSession
+                else BOTO3_CREDENTIALS_METHOD(owner)
+            )
             frozen = credentials.get_frozen_credentials() if credentials else None
             self.active_access_key_id = frozen.access_key if frozen else None
             long_term_approved = bool(
@@ -12631,6 +13783,17 @@ class ChaosOrchestrator:
     ) -> ExperimentResult:
         """Run a single experiment"""
         runtime_config = dict(self.config.get("global", {}))
+        global_grant_protected = tuple(
+            runtime_config[key]
+            for key in (
+                "operator_principal_arn",
+                "role_arn",
+                "break_glass_principal_arn",
+                "recovery_principal_arn",
+                "recovery_role_arn",
+            )
+            if runtime_config.get(key) is not None
+        )
         expected_account = getattr(
             self, "expected_account", runtime_config.get("account_id", "")
         )
@@ -12675,6 +13838,10 @@ class ChaosOrchestrator:
             self._blast_radius(experiment_type, experiment_config),
         )
         experiment = self._create_experiment(experiment_type, experiment_config)
+        if experiment_type == ChaosType.KMS_GRANT_REVOKE:
+            # Keep inherited protection outside the mutable plan configuration.
+            # A per-experiment null or replacement cannot erase it.
+            experiment._global_grant_protected_principals = global_grant_protected
         experiment.rollback_mode = metadata.rollback
         with self._active_experiments_lock:
             self.active_experiments.append(experiment)
@@ -13125,7 +14292,12 @@ class ChaosOrchestrator:
                 config["break_glass_principal_arn"],
             )
         elif experiment_type == ChaosType.KMS_GRANT_REVOKE:
-            return experiment.revoke_grant(config["key_id"], config["grant_id"])
+            return experiment.revoke_grant(
+                config["key_id"],
+                config["grant_id"],
+                config["grantee_principal_arn"],
+                config["retiring_principal_arn"],
+            )
 
         # IAM experiments
         elif experiment_type == ChaosType.IAM_POLICY_DETACH:

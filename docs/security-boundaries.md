@@ -605,9 +605,10 @@ SDK client involved in a run, in live and plan mode, is origin-bound:
   credential resolver or token provider was already built: SSO and login
   providers can capture an unwrapped `create_client`, while the token provider
   can cache an unwrapped SSO-OIDC client. Such a session cannot be hardened in
-  place, and a new one must be created. A session object
-  without a botocore core (a test double) has no provider chain and is still
-  accepted; its clients are bound by `origin_bound_client`.
+  place, and a new one must be created. A wrapper is admitted only when its
+  `client` method is directly bound to the same hardened boto3 session. An
+  unknown wrapper fails closed. Provider-free test doubles use the separate
+  internal injection class; it cannot return an unmarked SDK client.
 - Configured endpoint URLs are ignored (`ignore_configured_endpoint_urls`):
   profile `endpoint_url`, `services` sections, `AWS_ENDPOINT_URL` and
   `AWS_ENDPOINT_URL_<SERVICE>`. Dual-stack, S3 accelerate and S3 dual-stack are
@@ -629,6 +630,12 @@ SDK client involved in a run, in live and plan mode, is origin-bound:
   `dnsSuffix`, plus a reviewed per-service, per-partition domain where the
   packaged rules use one. An unknown region, partition or service, or a FIPS
   request a ruleset cannot satisfy, fails closed when the client is built.
+- Real sessions also replace Botocore's customer-searching `service-2` loader
+  with a fresh packaged-only loader before creating service or credential
+  provider clients. Every allowlisted read validates the generated operation's
+  API name, HTTP method and URI, protocol, signing version and endpoint prefix
+  against the locked reviewed manifest. S3's documented virtual-host URI form
+  is admitted with the same query, method and signing identity.
 - Reviewed parent domains (`REVIEWED_SERVICE_DOMAINS`). An enumeration of the
   packaged rules for all 434 services with endpoint rules, every packaged region
   and both FIPS choices (dual-stack off, account endpoints disabled) found 396
@@ -679,6 +686,13 @@ applied before every framework SDK client is created (so direct
 `SafetyController` and planning-experiment construction with a caller-supplied
 session are covered) and before `pin_session_credentials` resolves
 credentials:
+
+- Any HTTP, HTTPS or all-protocol proxy environment setting or Botocore proxy
+  configuration, including system-discovered proxies and default client config,
+  fails closed before provider resolution, regardless of
+  `NO_PROXY`. This covers both default IPv4 and IPv6 IMDS endpoints and
+  container credential fetchers; a proxy route whose absence cannot be
+  established is refused.
 
 - A configured IMDS endpoint (`AWS_EC2_METADATA_SERVICE_ENDPOINT` or the
   profile `ec2_metadata_service_endpoint`) is admitted only when it is
