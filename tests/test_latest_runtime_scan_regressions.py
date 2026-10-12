@@ -1208,3 +1208,33 @@ def test_config_ancestor_rebinding_during_acquisition_reads_pinned_tree(tmp_path
             config = framework.load_yaml_config(str(selected / "config.yaml"))
     assert attempted
     assert config == {"root": "original"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative traversal")
+def test_config_path_component_budget_is_enforced_before_any_open(tmp_path):
+    budget = framework.MAX_CONFIG_PATH_COMPONENTS
+    base_components = len(tmp_path.parts) - 1
+    within = tmp_path.joinpath(*["d"] * (budget - base_components))
+    within.mkdir(parents=True)
+    config = within / "config.yaml"
+    config.write_text("root: within\n", encoding="utf-8")
+    assert len(config.parts[1:-1]) == budget
+    assert framework.load_yaml_config(str(config)) == {"root": "within"}
+
+    beyond = within / "d"
+    beyond.mkdir()
+    deep = beyond / "config.yaml"
+    deep.write_text("root: beyond\n", encoding="utf-8")
+    real_open = framework.os.open
+    opened = []
+
+    def recording_open(*args, **kwargs):
+        opened.append(args[0])
+        return real_open(*args, **kwargs)
+
+    with (
+        patch.object(framework.os, "open", recording_open),
+        pytest.raises(framework.ConfigurationError, match="could not be read"),
+    ):
+        framework.load_yaml_config(str(deep))
+    assert opened == []

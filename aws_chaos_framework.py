@@ -67,6 +67,7 @@ BOTO3_CREDENTIALS_METHOD = boto3.Session.get_credentials
 __version__ = "2.0.4"
 TOOL_NAME = "AWS Chaos Engineering Framework"
 MAX_CONFIG_BYTES = 1_048_576
+MAX_CONFIG_PATH_COMPONENTS = 128
 MAX_CONFIG_DEPTH = 64
 MAX_CONFIG_NODES = 10_000
 MAX_CONFIG_COLLECTION_WIDTH = 1_024
@@ -3512,34 +3513,35 @@ def _config_descriptor(path: Path):
             stack.callback(os.close, descriptor)
             yield descriptor
     else:
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        components = path.parts[1:-1]
+        if len(components) > MAX_CONFIG_PATH_COMPONENTS:
+            raise OSError("Configuration path exceeds its component budget")
 
         @contextmanager
-        def opened_component(name: str, *, parent_fd: int | None = None):
-            descriptor = os.open(name, flags, dir_fd=parent_fd)
+        def opened_below(parent_fd: int, depth: int):
+            # Each no-follow ancestor stays open until the config file is released.
+            if depth == len(components):
+                descriptor = os.open(path.name, file_flags, dir_fd=parent_fd)
+                try:
+                    yield descriptor
+                finally:
+                    os.close(descriptor)
+                return
+            directory = os.open(components[depth], directory_flags, dir_fd=parent_fd)
             try:
-                yield descriptor
+                with opened_below(directory, depth + 1) as descriptor:
+                    yield descriptor
             finally:
-                os.close(descriptor)
+                os.close(directory)
 
-        @contextmanager
-        def opened_file(parent_fd: int):
-            descriptor = os.open(
-                path.name,
-                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
-                dir_fd=parent_fd,
-            )
-            try:
+        anchor = os.open(path.anchor, directory_flags)
+        try:
+            with opened_below(anchor, 0) as descriptor:
                 yield descriptor
-            finally:
-                os.close(descriptor)
-
-        with ExitStack() as stack:
-            parent = stack.enter_context(opened_component(path.anchor))
-            for part in path.parts[1:-1]:
-                parent = stack.enter_context(opened_component(part, parent_fd=parent))
-            descriptor = stack.enter_context(opened_file(parent))
-            yield descriptor
+        finally:
+            os.close(anchor)
 
 
 def _read_config_bytes(path: Path) -> bytes:
