@@ -6,7 +6,8 @@ import os
 import secrets
 import stat
 import sys
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
+from functools import partial
 from pathlib import Path
 
 
@@ -477,6 +478,29 @@ def _windows_mark_delete(handle: int) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def _release_all(releases) -> BaseException | None:
+    """Attempt every release and return the first ordinary failure.
+
+    Interrupts and other non-``Exception`` errors are never swallowed:
+    ``ExitStack`` iteratively runs the remaining releases, then re-raises the
+    most recent such error. Earlier interrupts are not guaranteed to be chained.
+    """
+    failure = None
+
+    def attempt(release) -> None:
+        nonlocal failure
+        try:
+            release()
+        except Exception as error:
+            if failure is None:
+                failure = error
+
+    with ExitStack() as stack:
+        for release in reversed(releases):
+            stack.callback(attempt, release)
+    return failure
+
+
 class OwnedOutput:
     """Retain the owned parent through private staging and publication."""
 
@@ -757,28 +781,28 @@ class OwnedOutput:
             handle = self.private_handles.pop(private.name, None)
             if handle is None:
                 return
-            failure = None
-            try:
-                for name in names:
-                    try:
-                        with suppress(FileNotFoundError):
-                            child = _windows_open_relative(
-                                handle, name, directory=False, create=False, write=True
-                            )
-                            try:
-                                _windows_mark_delete(child)
-                            finally:
-                                _windows_close(child)
-                    except BaseException as error:
-                        if failure is None:
-                            failure = error
-                try:
-                    _windows_mark_delete(handle)
-                except BaseException as error:
-                    if failure is None:
-                        failure = error
-            finally:
-                _windows_close(handle)
+
+            def remove(name: str) -> None:
+                with suppress(FileNotFoundError):
+                    child = _windows_open_relative(
+                        handle, name, directory=False, create=False, write=True
+                    )
+                    failure = _release_all(
+                        [
+                            partial(_windows_mark_delete, child),
+                            partial(_windows_close, child),
+                        ]
+                    )
+                    if failure is not None:
+                        raise failure
+
+            failure = _release_all(
+                [partial(remove, name) for name in names]
+                + [
+                    partial(_windows_mark_delete, handle),
+                    partial(_windows_close, handle),
+                ]
+            )
             if failure is not None:
                 raise failure
             return
@@ -855,27 +879,19 @@ class OwnedOutput:
                 _windows_close(published)
 
     def __exit__(self, exc_type, exc, traceback):
-        failure = None
-
-        def release(close, value):
-            nonlocal failure
-            try:
-                close(value)
-            except BaseException as error:
-                if failure is None:
-                    failure = error
-
-        for fd in self.private_fds.values():
-            release(os.close, fd)
-        self.private_fds.clear()
-        for handle in self.private_handles.values():
-            release(_windows_close, handle)
-        self.private_handles.clear()
+        releases = [partial(os.close, fd) for fd in self.private_fds.values()]
+        releases += [
+            partial(_windows_close, handle) for handle in self.private_handles.values()
+        ]
         if self.parent_fd is not None:
-            release(os.close, self.parent_fd)
-            self.parent_fd = None
-        for handle in reversed(self.parent_handles):
-            release(_windows_close, handle)
+            releases.append(partial(os.close, self.parent_fd))
+        releases += [
+            partial(_windows_close, handle) for handle in reversed(self.parent_handles)
+        ]
+        self.private_fds.clear()
+        self.private_handles.clear()
+        self.parent_fd = None
         self.parent_handles.clear()
+        failure = _release_all(releases)
         if failure is not None and exc_type is None:
             raise failure

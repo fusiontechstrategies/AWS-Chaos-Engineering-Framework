@@ -3430,6 +3430,23 @@ class StrictConfigLoader(yaml.SafeLoader):
 @contextmanager
 def _config_descriptor(path: Path):
     """Retain a regular config file and its no-follow ancestry during reading."""
+    if (
+        sys.platform == "darwin"
+        and len(path.parts) > 1
+        and path.parts[1] in {"var", "tmp", "etc"}
+    ):
+        # macOS exposes these root-owned system directories through /private.
+        # Resolve only that fixed system alias; later config components still
+        # require descriptor-relative, no-follow traversal.
+        alias = Path(path.anchor) / path.parts[1]
+        alias_stat = alias.lstat()
+        if (
+            stat.S_ISLNK(alias_stat.st_mode)
+            and alias_stat.st_uid == 0
+            and os.readlink(alias)
+            in {f"private/{path.parts[1]}", f"/private/{path.parts[1]}"}
+        ):
+            path = Path("/private") / path.parts[1] / Path(*path.parts[2:])
     if os.name == "nt":
         import ctypes
         import ctypes.wintypes as wintypes
@@ -3496,18 +3513,32 @@ def _config_descriptor(path: Path):
             yield descriptor
     else:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        with ExitStack() as stack:
-            parent = os.open(path.anchor, flags)
-            stack.callback(os.close, parent)
-            for part in path.parts[1:-1]:
-                parent = os.open(part, flags, dir_fd=parent)
-                stack.callback(os.close, parent)
+
+        @contextmanager
+        def opened_component(name: str, *, parent_fd: int | None = None):
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+            try:
+                yield descriptor
+            finally:
+                os.close(descriptor)
+
+        @contextmanager
+        def opened_file(parent_fd: int):
             descriptor = os.open(
                 path.name,
                 os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
-                dir_fd=parent,
+                dir_fd=parent_fd,
             )
-            stack.callback(os.close, descriptor)
+            try:
+                yield descriptor
+            finally:
+                os.close(descriptor)
+
+        with ExitStack() as stack:
+            parent = stack.enter_context(opened_component(path.anchor))
+            for part in path.parts[1:-1]:
+                parent = stack.enter_context(opened_component(part, parent_fd=parent))
+            descriptor = stack.enter_context(opened_file(parent))
             yield descriptor
 
 

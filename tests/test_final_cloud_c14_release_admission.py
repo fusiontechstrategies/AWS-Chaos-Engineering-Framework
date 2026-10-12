@@ -13,6 +13,7 @@ Offline fakes only: no GitHub, network or credentials.
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import io
 import json
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -1168,3 +1170,195 @@ def test_workflow_helper_commands_reject_oversize_and_unexpected_assets(
         # Metadata admission failed before any asset was requested.
         assert len(transport.requests) == 1
     assert sorted(p.name for p in work.iterdir()) == ["aws_chaos_framework.py"]
+
+
+def _cleanup_recorder(calls, name, error=None):
+    def release():
+        calls.append(name)
+        if error is not None:
+            raise error
+
+    return release
+
+
+def test_release_all_attempts_every_release_and_keeps_first_failure():
+    calls = []
+    first = OSError("first")
+    failure = admission.release_output._release_all(
+        [
+            _cleanup_recorder(calls, "a", first),
+            _cleanup_recorder(calls, "b", OSError("second")),
+            _cleanup_recorder(calls, "c"),
+        ]
+    )
+    assert calls == ["a", "b", "c"]
+    assert failure is first
+
+
+def _cleanup_interrupts():
+    yield KeyboardInterrupt()
+    yield SystemExit(3)
+    group = vars(builtins).get("BaseExceptionGroup")
+    if group is not None:
+        yield group("cleanup", [KeyboardInterrupt()])
+
+
+@pytest.mark.parametrize(
+    "interrupt", list(_cleanup_interrupts()), ids=lambda error: type(error).__name__
+)
+def test_release_all_runs_remaining_releases_then_propagates_interrupt(interrupt):
+    calls = []
+    with pytest.raises(type(interrupt)) as raised:
+        admission.release_output._release_all(
+            [
+                _cleanup_recorder(calls, "a", OSError("ordinary")),
+                _cleanup_recorder(calls, "b", interrupt),
+                _cleanup_recorder(calls, "c", OSError("later")),
+                _cleanup_recorder(calls, "d"),
+            ]
+        )
+    assert raised.value is interrupt
+    assert calls == ["a", "b", "c", "d"]
+
+
+def test_release_all_survives_more_successive_interrupts_than_the_stack():
+    calls = []
+    count = sys.getrecursionlimit() + 100
+    interrupts = [KeyboardInterrupt(position) for position in range(count)]
+    with pytest.raises(KeyboardInterrupt) as raised:
+        admission.release_output._release_all(
+            [
+                _cleanup_recorder(calls, position, interrupts[position])
+                for position in range(count)
+            ]
+        )
+    assert calls == list(range(count))
+    assert raised.value is interrupts[-1]
+
+
+def _cleanup_owned(handles):
+    output = object.__new__(admission.release_output.OwnedOutput)
+    output.private_fds = {}
+    output.private_handles = dict(handles)
+    output.parent_fd = None
+    output.parent_handles = []
+    return output
+
+
+def test_exit_closes_every_handle_and_raises_first_failure(monkeypatch):
+    closed = []
+    first = OSError("first close")
+
+    def close(handle):
+        closed.append(handle)
+        if handle in (1, 2):
+            raise first if handle == 1 else OSError("second close")
+
+    monkeypatch.setattr(admission.release_output, "_windows_close", close)
+    output = _cleanup_owned({"a": 1, "b": 2, "c": 3})
+    with pytest.raises(OSError) as raised:
+        output.__exit__(None, None, None)
+    assert raised.value is first
+    assert closed == [1, 2, 3]
+    assert output.private_handles == {}
+
+
+def test_exit_preserves_body_exception_over_close_failure(monkeypatch):
+    closed = []
+
+    def close(handle):
+        closed.append(handle)
+        raise OSError("close")
+
+    monkeypatch.setattr(admission.release_output, "_windows_close", close)
+    output = _cleanup_owned({"a": 1, "b": 2})
+    body = ValueError("body")
+    assert output.__exit__(ValueError, body, None) is None
+    assert closed == [1, 2]
+
+
+def test_exit_interrupt_still_closes_remaining_handles(monkeypatch):
+    closed = []
+
+    def close(handle):
+        closed.append(handle)
+        if handle == 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(admission.release_output, "_windows_close", close)
+    output = _cleanup_owned({"a": 1, "b": 2, "c": 3})
+    with pytest.raises(KeyboardInterrupt):
+        output.__exit__(None, None, None)
+    assert closed == [1, 2, 3]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle cleanup branch")
+def test_windows_cleanup_outer_close_failure_keeps_first_failure(monkeypatch):
+    events = []
+    first = OSError("child delete")
+
+    def open_relative(handle, name, **_):
+        events.append(("open", name))
+        return f"child-{name}"
+
+    def mark_delete(handle):
+        events.append(("mark", handle))
+        if handle == "child-x":
+            raise first
+
+    def close(handle):
+        events.append(("close", handle))
+        if handle == "stage":
+            raise OSError("outer close")
+
+    monkeypatch.setattr(
+        admission.release_output, "_windows_open_relative", open_relative
+    )
+    monkeypatch.setattr(admission.release_output, "_windows_mark_delete", mark_delete)
+    monkeypatch.setattr(admission.release_output, "_windows_close", close)
+    output = _cleanup_owned({".stage": "stage"})
+    with pytest.raises(OSError) as raised:
+        output.cleanup_private(Path(".stage"), ["x", "y"])
+    assert raised.value is first
+    assert events == [
+        ("open", "x"),
+        ("mark", "child-x"),
+        ("close", "child-x"),
+        ("open", "y"),
+        ("mark", "child-y"),
+        ("close", "child-y"),
+        ("mark", "stage"),
+        ("close", "stage"),
+    ]
+    assert output.private_handles == {}
+
+
+def test_exit_releases_private_then_parent_resources_in_order(monkeypatch):
+    released = []
+
+    def close_fd(fd):
+        released.append(("fd", fd))
+        if fd == 10:
+            raise OSError("private fd")
+
+    def close_handle(handle):
+        released.append(("handle", handle))
+
+    monkeypatch.setattr(admission.release_output, "os", SimpleNamespace(close=close_fd))
+    monkeypatch.setattr(admission.release_output, "_windows_close", close_handle)
+    output = _cleanup_owned({"p": 20})
+    output.private_fds = {"a": 10, "b": 11}
+    output.parent_fd = 12
+    output.parent_handles = [30, 31]
+    with pytest.raises(OSError, match="private fd"):
+        output.__exit__(None, None, None)
+    assert released == [
+        ("fd", 10),
+        ("fd", 11),
+        ("handle", 20),
+        ("fd", 12),
+        ("handle", 31),
+        ("handle", 30),
+    ]
+    assert output.private_fds == {} and output.parent_fd is None
+    assert output.parent_handles == []

@@ -174,6 +174,7 @@ class NormalizeSdistTests(unittest.TestCase):
                     removed = True
                     stage[0].symlink_to(unrelated)
                 except OSError:
+                    # Symlinks can be unavailable on this host; the test still verifies the original file.
                     pass
                 return digest
 
