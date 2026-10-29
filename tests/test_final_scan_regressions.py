@@ -1167,9 +1167,12 @@ def _requirement_inputs(name, environment=None):
             result.update(_requirement_inputs(line[3:].strip(), environment))
         elif line and not line.startswith("#"):
             requirement = Requirement(line)
-            if requirement.marker and environment is not None:
-                if not requirement.marker.evaluate(environment):
-                    continue
+            if (
+                requirement.marker
+                and environment is not None
+                and not requirement.marker.evaluate(environment)
+            ):
+                continue
             specifiers = list(requirement.specifier)
             assert len(specifiers) == 1 and specifiers[0].operator == "==", line
             package = requirement.name.lower().replace("_", "-")
@@ -1487,4 +1490,6 @@ def test_ci_hash_locks_pin_inputs_consistently_and_cover_ci_platforms():
                         assert selected.setdefault(package, pin) == pin, package
             for name in group:
                 source = name.replace("-runtime", "").replace("-lock", "")
-                assert set(_requirement_inputs(source, environment)) <= set(selected), name
+                assert set(_requirement_inputs(source, environment)) <= set(selected), (
+                    name
+                )
