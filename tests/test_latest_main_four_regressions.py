@@ -1093,7 +1093,7 @@ def test_tag_controlled_backend_and_matching_hook_bytes_are_rejected(
             "[build-system]", '[build-system]\nbackend-path = ["."]'
         )
     elif attack == "build_requirement":
-        project = project.replace('"setuptools==84.0.0"', '"unreviewed-backend==1.0.0"')
+        project = project.replace('"setuptools==84.2.1"', '"unreviewed-backend==1.0.0"')
     elif attack == "cmdclass":
         project += (
             '\n[tool.setuptools.cmdclass]\nbuild_py = "scripts.custom_backend.Build"\n'
