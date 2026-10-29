@@ -196,7 +196,7 @@ termination and EBS detach do not create implicit backups. See
 
 The release gate is fully offline and never contacts an AWS account. Deterministic fake clients exercise every advertised executable mode and fail immediately if plan mode attempts a write. Focused simulations also cover planning-only policy/scalar refusal, conditional Lambda/WAF recovery, route restoration and conflict refusal, WAF optimistic locking, IAM self-protection, FIS start guardrails, report no-overwrite behavior, redaction, configuration validation, and Botocore API request shapes.
 
-Run the same checks locally:
+Run the same checks locally. Use Python 3.11 or newer when running `pip_audit`; the CI audit environment uses Python 3.12.
 
 ```powershell
 python -m pip install --require-hashes --only-binary :all: -r requirements-pip-lock.txt

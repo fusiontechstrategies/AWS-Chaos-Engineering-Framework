@@ -109,6 +109,8 @@ Independent hosted Linux, Windows, macOS, CodeQL, Semgrep, Trivy, dependency-rev
 
 ## Local commands
 
+Run the `pip_audit` commands with Python 3.11 or newer. CI uses Python 3.12 for dependency auditing.
+
 ```powershell
 $env:AWS_EC2_METADATA_DISABLED = "true"
 python -m pip install --require-hashes --only-binary :all: -r requirements-pip-lock.txt
