@@ -42,7 +42,7 @@ BLOCKED_SUFFIXES = {".env", ".key", ".p12", ".pem", ".pfx", ".pyc"}
 # This policy belongs to the independently trusted verifier, not the selected
 # tag's MANIFEST.in or artifact SOURCES.txt. Updating it requires verifier review.
 APPROVED_BUILD_SYSTEM = {
-    "requires": ["setuptools==84.0.0", "wheel==0.48.0"],
+    "requires": ["setuptools==84.2.1", "wheel==0.48.0"],
     "build-backend": "setuptools.build_meta",
 }
 APPROVED_MANIFEST = "include .markdownlint-cli2.yaml\nrecursive-include .github/release-notes *.md\ninclude .github/workflows/release.yml\ninclude .github/workflows/release-promotion.yml\ninclude CHANGELOG.md\ninclude CODE_OF_CONDUCT.md\ninclude CONTRIBUTING.md\ninclude LICENSE\ninclude README.md\ninclude RELEASING.md\ninclude SECURITY.md\ninclude TESTING.md\ninclude example-config.yaml\ninclude requirements.txt\ninclude requirements-dev.txt\ninclude requirements-build.txt\ninclude requirements-build-lock.txt\ninclude requirements-runtime-lock.txt\ninclude docs/security-boundaries.md\ninclude docs/runtime-safety-scope.md\nrecursive-include scripts *.py\nrecursive-include tests *.py"

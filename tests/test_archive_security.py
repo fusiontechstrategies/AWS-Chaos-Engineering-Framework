@@ -174,9 +174,10 @@ def test_wheel_record_and_required_metadata_fail_closed(
 
 @pytest.mark.parametrize("document", ["README.md", "CONTRIBUTING.md"])
 def test_documented_audit_uses_committed_lock_without_resolution(document):
+    document_text = (ROOT / document).read_text(encoding="utf-8")
     commands = [
         line.strip()
-        for line in (ROOT / document).read_text(encoding="utf-8").splitlines()
+        for line in document_text.splitlines()
         if line.strip().startswith("python -m pip_audit ")
     ]
     assert len(commands) == 1
@@ -186,6 +187,9 @@ def test_documented_audit_uses_committed_lock_without_resolution(document):
     assert "--require-hashes" in command
     assert "--disable-pip" in command
     assert "--progress-spinner off" in command
+    if sys.version_info < (3, 11):
+        assert "Use Python 3.11 or newer when running `pip_audit`" in document_text
+        return
     arguments = [value.removeprefix(".\\") for value in command.split()[1:]]
     result = subprocess.run(
         [sys.executable, *arguments, "--dry-run"],

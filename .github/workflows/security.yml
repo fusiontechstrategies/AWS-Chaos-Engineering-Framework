@@ -19,4 +19,7 @@ jobs:
       contents: read
       security-events: write
     # Every external revision used by the shared workflow is explicitly allowlisted.
-    uses: fusiontechstrategies/FusionTechStrategies/.github/workflows/reusable-security.yml@f64c8eb98fa6c907e013d158089ea6ab38e91ad7
+    uses: fusiontechstrategies/FusionTechStrategies/.github/workflows/reusable-security.yml@315404828dfc3aec6dbb2629e3b53df21d61b5ee
+    with:
+      # The large framework module needs more than the shared 10-second per-rule default.
+      semgrep_timeout_seconds: 30

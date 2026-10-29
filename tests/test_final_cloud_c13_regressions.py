@@ -741,7 +741,7 @@ def test_clean_deterministic_wheel_is_exactly_source_derived(clean_wheel):
 
 WHEEL_HEADER_MUTATIONS = {
     "wheel_version": (b"Wheel-Version: 1.0", b"Wheel-Version: 9.0"),
-    "generator": (b"Generator: setuptools (84.0.0)", b"Generator: other (1.0)"),
+    "generator": (b"Generator: setuptools (84.2.1)", b"Generator: other (1.0)"),
     "purelib": (b"Root-Is-Purelib: true", b"Root-Is-Purelib: false"),
     "tag": (b"Tag: py3-none-any", b"Tag: py3-none-any\nTag: cp312-cp312-win_amd64"),
     "extra_header": (b"Tag: py3-none-any", b"Tag: py3-none-any\nBuild: 1"),
@@ -863,7 +863,7 @@ def test_metadata_derivation_is_shared_with_the_sdist(tmp_path):
         verifier._verify_package_metadata(
             text.replace("Summary: ", "Summary:  ").encode("utf-8"), project, ROOT
         )
-    assert verifier._pinned_backend_version("setuptools") == "84.0.0"
+    assert verifier._pinned_backend_version("setuptools") == "84.2.1"
     with pytest.raises(ValueError, match="does not pin"):
         verifier._pinned_backend_version("flit-core")
 
