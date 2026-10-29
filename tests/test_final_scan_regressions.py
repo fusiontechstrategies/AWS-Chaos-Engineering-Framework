@@ -1157,16 +1157,23 @@ def _lock_entries(name):
     return entries
 
 
-def _requirement_inputs(name):
+def _requirement_inputs(name, environment=None):
+    from packaging.requirements import Requirement
+
     result = {}
     for raw in (ROOT / name).read_text("utf-8").splitlines():
         line = raw.strip()
         if line.startswith("-r "):
-            result.update(_requirement_inputs(line[3:].strip()))
+            result.update(_requirement_inputs(line[3:].strip(), environment))
         elif line and not line.startswith("#"):
-            package, separator, version = line.partition("==")
-            assert separator, line
-            result[package.lower().replace("_", "-")] = version
+            requirement = Requirement(line)
+            if requirement.marker and environment is not None:
+                if not requirement.marker.evaluate(environment):
+                    continue
+            specifiers = list(requirement.specifier)
+            assert len(specifiers) == 1 and specifiers[0].operator == "==", line
+            package = requirement.name.lower().replace("_", "-")
+            result[package] = specifiers[0].version
     return result
 
 
@@ -1480,4 +1487,4 @@ def test_ci_hash_locks_pin_inputs_consistently_and_cover_ci_platforms():
                         assert selected.setdefault(package, pin) == pin, package
             for name in group:
                 source = name.replace("-runtime", "").replace("-lock", "")
-                assert set(_requirement_inputs(source)) <= set(selected), name
+                assert set(_requirement_inputs(source, environment)) <= set(selected), name
