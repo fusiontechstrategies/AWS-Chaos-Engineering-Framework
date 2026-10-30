@@ -170,10 +170,10 @@ after changing any of them, regenerate every affected lock from the repository
 root and review the complete diff:
 
 ```text
-uv pip compile requirements.txt --generate-hashes --universal --python-version 3.10 --output-file requirements-runtime-lock.txt
-uv pip compile requirements-build.txt --generate-hashes --universal --output-file requirements-build-lock.txt --python-version 3.10
-uv pip compile requirements-pip.txt --generate-hashes --universal --python-version 3.10 --output-file requirements-pip-lock.txt
-uv pip compile requirements-dev.txt --constraint requirements-runtime-lock.txt --constraint requirements-build-lock.txt --generate-hashes --universal --python-version 3.10 --output-file requirements-dev-lock.txt
+uv pip compile requirements.txt --generate-hashes --universal --python-version 3.12 --output-file requirements-runtime-lock.txt
+uv pip compile requirements-build.txt --generate-hashes --universal --output-file requirements-build-lock.txt --python-version 3.12
+uv pip compile requirements-pip.txt --generate-hashes --universal --python-version 3.12 --output-file requirements-pip-lock.txt
+uv pip compile requirements-dev.txt --constraint requirements-runtime-lock.txt --constraint requirements-build-lock.txt --generate-hashes --universal --python-version 3.12 --output-file requirements-dev-lock.txt
 ```
 
 Compile the development lock last: its constraints keep shared packages

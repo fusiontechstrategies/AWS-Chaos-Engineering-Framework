@@ -74,7 +74,7 @@ command never selects an unpinned higher pip.
 
 The 2.0.3 candidate must pass:
 
-- the complete framework regression suite on Python 3.10 through 3.14
+- the complete framework regression suite on Python 3.12 through 3.14
 - Python 3.12 platform tests on Windows and macOS
 - plan-mode coverage for every advertised executable experiment with zero AWS writes
 - live-path simulations using deterministic fake clients for rollback, conflict, alarm, identity, target, FIS, IAM, reporting, and API-model controls
@@ -109,7 +109,7 @@ Independent hosted Linux, Windows, macOS, CodeQL, Semgrep, Trivy, dependency-rev
 
 ## Local commands
 
-Run the `pip_audit` commands with Python 3.11 or newer. CI uses Python 3.12 for dependency auditing.
+Run the `pip_audit` commands with Python 3.12 or newer. CI uses Python 3.12 for dependency auditing.
 
 ```powershell
 $env:AWS_EC2_METADATA_DISABLED = "true"

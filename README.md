@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/ci.yml/badge.svg)](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/codeql.yml/badge.svg)](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/codeql.yml)
-[![Python 3.10-3.14](https://img.shields.io/badge/python-3.10--3.14-3776AB.svg)](https://www.python.org/)
+[![Python 3.12-3.14](https://img.shields.io/badge/python-3.12--3.14-3776AB.svg)](https://www.python.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 An enterprise-minded, one-file chaos engineering orchestrator for AWS Fault Injection Service and carefully guarded service extensions. It combines read-only AWS FIS template planning, strict blast-radius controls, exact account binding, automatic rollback, emergency stops, and privacy-conscious evidence reports in a tool that remains easy to inspect and deploy.
@@ -66,7 +66,7 @@ Safety checks fail closed. Missing alarms, unresolved targets, mismatched identi
 
 ## Requirements
 
-- Python 3.10 through 3.14
+- Python 3.12 through 3.14. Python 3.10 reached end of life on October 1, 2026 and is no longer a supported runtime for repository source or future releases. The already-published v2.0.4 package metadata cannot be changed in place and still records its historical Python 3.10 compatibility.
 - An AWS identity with only the permissions needed by the selected experiments
 - AWS FIS experiment templates for FIS-managed actions
 - CloudWatch safety alarms for live extension runs
@@ -212,7 +212,7 @@ termination and EBS detach do not create implicit backups. See
 
 The release gate is fully offline and never contacts an AWS account. Deterministic fake clients exercise every advertised executable mode and fail immediately if plan mode attempts a write. Focused simulations also cover planning-only policy/scalar refusal, conditional Lambda/WAF recovery, route restoration and conflict refusal, WAF optimistic locking, IAM self-protection, FIS start guardrails, report no-overwrite behavior, redaction, configuration validation, and Botocore API request shapes.
 
-Run the same checks locally. Use Python 3.11 or newer when running `pip_audit`; the CI audit environment uses Python 3.12.
+Run the same checks locally. Use Python 3.12 or newer when running `pip_audit`; the CI audit environment uses Python 3.12.
 
 ```powershell
 python -m pip install --require-hashes --only-binary :all: -r requirements-pip-lock.txt

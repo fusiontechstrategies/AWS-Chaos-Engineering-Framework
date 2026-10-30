@@ -21,7 +21,7 @@ python -m pip install --require-hashes --only-binary :all: -r requirements-pip-l
 python -m pip install --require-hashes --only-binary :all: -r requirements-dev-lock.txt -r requirements-build-lock.txt
 ```
 
-Run the release checks. Use Python 3.11 or newer when running `pip_audit`; the CI audit environment uses Python 3.12.
+Run the release checks. Use Python 3.12 or newer when running `pip_audit`; the CI audit environment uses Python 3.12.
 
 ```powershell
 python -m ruff format --check .

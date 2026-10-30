@@ -9,6 +9,7 @@ import email
 import hashlib
 import importlib.util
 import re
+import tomllib
 from pathlib import Path, PurePosixPath
 
 _budget_path = Path(__file__).resolve().with_name("archive_budget.py")
@@ -28,11 +29,6 @@ if _source_spec is None or _source_spec.loader is None:
     raise ImportError("Trusted bounded source reader is unavailable")
 source_files = importlib.util.module_from_spec(_source_spec)
 _source_spec.loader.exec_module(source_files)
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10; supplied by the pinned build lock.
-    import tomli as tomllib
 
 PROJECT_NAME = "aws-chaos-engineering-framework"
 MODULE_NAME = "aws_chaos_framework.py"
@@ -165,7 +161,7 @@ def _approved_project(repository_root: Path) -> dict:
         project.get("name") != PROJECT_NAME
         or project.get("readme") != "README.md"
         or project.get("license") != "Apache-2.0"
-        or project.get("requires-python") != ">=3.10,<3.15"
+        or project.get("requires-python") != ">=3.12,<3.15"
         or not isinstance(project.get("version"), str)
         or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", project["version"])
         or any(
@@ -247,7 +243,7 @@ def _expected_package_metadata(project: dict, repository_root: Path) -> str:
         ("License-Expression", project["license"]),
         *(("Project-URL", f"{key}, {url}") for key, url in project["urls"].items()),
         *(("Classifier", classifier) for classifier in project["classifiers"]),
-        ("Requires-Python", "<3.15,>=3.10"),
+        ("Requires-Python", "<3.15,>=3.12"),
         ("Description-Content-Type", "text/markdown"),
         ("License-File", "LICENSE"),
         *(("Requires-Dist", requirement) for requirement in project["dependencies"]),
@@ -315,7 +311,7 @@ def _verify_package_metadata(
         "license-expression": ["Apache-2.0"],
         "project-url": [f"{key}, {url}" for key, url in project["urls"].items()],
         "classifier": project["classifiers"],
-        "requires-python": ["<3.15,>=3.10"],
+        "requires-python": ["<3.15,>=3.12"],
         "description-content-type": ["text/markdown"],
         "license-file": ["LICENSE"],
         "requires-dist": project["dependencies"],
@@ -519,7 +515,7 @@ def _verify_wheel(wheel_path: Path, version: str, repository_root: Path) -> None
             for value in (metadata.get("Requires-Python") or "").split(",")
             if value.strip()
         }
-        if python_specifiers != {">=3.10", "<3.15"}:
+        if python_specifiers != {">=3.12", "<3.15"}:
             raise ValueError(
                 f"unexpected Python range: {_one_line(metadata.get('Requires-Python'))}"
             )
