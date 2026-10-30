@@ -11,6 +11,8 @@ An enterprise-minded, one-file chaos engineering orchestrator for AWS Fault Inje
 
 [![Guarded AWS chaos experiment flow](docs/images/aws-chaos-guarded-experiment.png)](docs/images/source/aws-chaos-guarded-experiment.svg)
 
+> **Project status: maintained public release.** Version 2.0.4 has reproducible release evidence and a fully offline validation gate. Plan mode is the safe evaluation path. Live support is declared per extension, and live AWS FIS starts remain disabled because the public API cannot bind the reviewed template version immutably.
+
 > [!WARNING]
 > This software intentionally disrupts AWS resources. Use it only in isolated, non-production environments that you own or are explicitly authorized to test. Review every plan, alarm, target, permission, and rollback path before live use.
 
@@ -30,6 +32,18 @@ AWS FIS can supply managed faults, but this framework currently permits only rea
 - A single Python application file with no framework or database
 
 The framework does not replace AWS FIS. It makes FIS easier to govern and supplies a guarded extension layer for additional AWS services.
+
+### What this adds around AWS FIS
+
+| Native AWS FIS concern | Framework contribution |
+| --- | --- |
+| Target and action selection | Exact account, region, suite, target, tag, and aggregate blast-radius validation before an extension can run. |
+| Stop conditions | Required CloudWatch alarm review for live extensions and read-only validation of FIS template stop conditions. |
+| Approval evidence | A plan-bound confirmation digest plus stronger dual approval for irreversible actions and safety bypasses. |
+| Recovery | Declared rollback contracts, captured prior state, verification, and explicit recovery-failure reporting for supported extensions. |
+| Audit record | Atomic, privacy-conscious local evidence that separates plans, attempted writes, outcomes, and recovery state. |
+
+AWS FIS remains the managed fault-injection service. This project does not claim to make mutable FIS templates immutable, and it refuses to start them live until that boundary can be enforced.
 
 Version 2.0.4 is available on [PyPI](https://pypi.org/project/aws-chaos-engineering-framework/2.0.4/) and as a verified GitHub release. A non-verified convenience install, `python -m pip install aws-chaos-engineering-framework==2.0.4`, installs the package and whatever dependency artifacts your configured index serves, without hash verification. Security-sensitive operators should use the hash-locked [Quick start](#quick-start) or the provenance-verified release assets instead. Then run the read-only `aws-chaos-framework --list-experiments` command. The [release page](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/releases/tag/v2.0.4) provides the standalone runtime, wheel, source distribution, SPDX SBOM, SHA-256 checksums, release evidence, and GitHub provenance attestations.
 
@@ -96,6 +110,8 @@ python .\aws_chaos_framework.py `
 ```
 
 The included [example configuration](example-config.yaml) demonstrates tagged EC2 recovery and read-only FIS template planning. Replace all placeholders before use.
+
+For a review meeting or sandbox rehearsal, follow the [plan-only game-day walkthrough](docs/PLAN_ONLY_GAME_DAY.md). It keeps mutation disabled while the team verifies identity, targets, alarms, blast-radius limits, evidence handling, and the exact boundary before live authorization.
 
 ## Moving from plan to live execution
 
@@ -223,6 +239,11 @@ See [TESTING.md](TESTING.md) for the complete offline gate and [RELEASING.md](RE
 - No swallowed rollback error
 - No secret or target inventory committed to the repository
 - No claim of success when no resource was affected
+
+## Related Fusion projects
+
+- [AWS GovHawk Efficiency Analyzer](https://github.com/fusiontechstrategies/AWS-GovHawk-Efficiency-Analyzer) supplies review-only GovCloud inventory and operational-risk signals; it does not authorize a chaos experiment.
+- Explore the complete [Fusion Technology Strategies public portfolio](https://github.com/fusiontechstrategies/FusionTechStrategies).
 
 ## Contributing
 
