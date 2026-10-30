@@ -1297,7 +1297,7 @@ def test_installer_lines_fail_closed_on_unreviewed_forms():
 # formatting edits. .gitattributes checks *.yml out with LF on every platform,
 # so the bytes are the same on every runner.
 REVIEWED_WORKFLOW_DIGESTS = {
-    ".github/workflows/ci.yml": "f9d2b5d0160a0737fe41ccb68e88a4f42cd1f450686d488793e306319fe74a89",
+    ".github/workflows/ci.yml": "5bc3b6b67989863f201468fb9e1382e2f59f0793d4dd49623cebe243a4d95c77",
     ".github/workflows/release.yml": "0deb2296fced8e48d30bcf197a9efad8cabc97814e1281fb86fd0d7c949b2fe3",
 }
 
@@ -1459,7 +1459,7 @@ def test_ci_hash_locks_pin_inputs_consistently_and_cover_ci_platforms():
         ("linux", "posix", "x86_64", "Linux", version)
         for version in workflow["jobs"]["test"]["strategy"]["matrix"]["python-version"]
     ]
-    assert len(environments) == 5
+    assert len(environments) == 3
     runners = workflow["jobs"]["platform-test"]["strategy"]["matrix"]["os"]
     assert set(runners) == {"windows-latest", "macos-latest"}
     environments += [

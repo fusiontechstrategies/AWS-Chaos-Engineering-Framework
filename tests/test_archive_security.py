@@ -187,9 +187,6 @@ def test_documented_audit_uses_committed_lock_without_resolution(document):
     assert "--require-hashes" in command
     assert "--disable-pip" in command
     assert "--progress-spinner off" in command
-    if sys.version_info < (3, 11):
-        assert "Use Python 3.11 or newer when running `pip_audit`" in document_text
-        return
     arguments = [value.removeprefix(".\\") for value in command.split()[1:]]
     result = subprocess.run(
         [sys.executable, *arguments, "--dry-run"],

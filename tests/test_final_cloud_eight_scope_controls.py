@@ -13,7 +13,7 @@ import itertools
 import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import patch
 from urllib.parse import urlsplit
@@ -60,7 +60,7 @@ KEY_B = "ASIA" + "B" * 16
 
 class SyntheticClock:
     def __init__(self) -> None:
-        self.value = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+        self.value = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 
     def now(self) -> datetime:
         return self.value

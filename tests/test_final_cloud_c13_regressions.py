@@ -29,7 +29,7 @@ import subprocess
 import sys
 import tarfile
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1018,7 +1018,7 @@ def provider_aws(
 
 
 def sso_token(tmp_path: Path, expires_in: timedelta) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     token = {
         "startUrl": SSO_START,
         "region": SSO_REGION,
@@ -2054,9 +2054,7 @@ def login_environment(monkeypatch, tmp_path, crt: bool) -> None:
     cache = tmp_path / "login-cache"
     cache.mkdir()
     monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(cache))
-    expired = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    expired = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     token = {
         "accessToken": {
             "accessKeyId": KEY_A,
