@@ -1,5 +1,9 @@
 # AWS Chaos Engineering Framework
 
+<p align="center">
+  <img src=".github/assets/social-preview.jpg" width="960" alt="AWS Chaos Engineering: Bound. Observe. Rollback.">
+</p>
+
 **Break AWS safely before reality does.**
 
 [![CI](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/ci.yml/badge.svg)](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/ci.yml)
