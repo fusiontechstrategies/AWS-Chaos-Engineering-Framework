@@ -1177,7 +1177,7 @@ def test_generated_sdist_metadata_never_authorizes_new_members_or_hooks(
             )
             value = archive.extractfile(member).read()
         replacements[egg + "PKG-INFO"] = value.replace(
-            b"Requires-Dist: boto3==1.43.102",
+            b"Requires-Dist: boto3==1.43.118",
             b"Requires-Dist: unreviewed-backend==1.0.0",
         )
     elif attack == "entry_points":
