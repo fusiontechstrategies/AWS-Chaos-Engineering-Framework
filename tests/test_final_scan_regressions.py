@@ -1297,8 +1297,8 @@ def test_installer_lines_fail_closed_on_unreviewed_forms():
 # formatting edits. .gitattributes checks *.yml out with LF on every platform,
 # so the bytes are the same on every runner.
 REVIEWED_WORKFLOW_DIGESTS = {
-    ".github/workflows/ci.yml": "5bc3b6b67989863f201468fb9e1382e2f59f0793d4dd49623cebe243a4d95c77",
-    ".github/workflows/release.yml": "0deb2296fced8e48d30bcf197a9efad8cabc97814e1281fb86fd0d7c949b2fe3",
+    ".github/workflows/ci.yml": "ed19b34f8223c4ff2fe8bd4971140276e874604b7b27f1dfd7d14e87025bc21a",
+    ".github/workflows/release.yml": "a252336109e38abaa6dbb50f16161f4abb441ff6c5016f0847a1ce42ff06ca4c",
 }
 
 
