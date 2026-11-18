@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased security follow-ups
+## Unreleased
+
+## 2.0.5 - 2026-11-18
+
+### Package and compatibility
+
+- Aligned the PyPI description and exact install hint with the packaged version.
+- Updated the supported Python range to 3.12 through 3.14.
+- Documented an offline, plan-only evaluation path.
 
 ### Report path and live caller binding
 

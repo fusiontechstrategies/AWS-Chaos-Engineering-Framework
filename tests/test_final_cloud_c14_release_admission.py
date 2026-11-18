@@ -33,7 +33,7 @@ from scripts import publish_payload
 from scripts import release_asset_admission as admission
 
 ROOT = Path(__file__).resolve().parents[1]
-TAG = "v2.0.4"
+TAG = "v2.0.5"
 COMMIT = "a" * 40
 NAMES = tuple(admission.expected_assets(TAG))
 SOURCE, WHEEL, SDIST, SBOM, SUMS, EVIDENCE = NAMES
@@ -234,7 +234,7 @@ def test_evidence_rejects_duplicate_subjects_keys_and_mismatches(tmp_path):
     )
     variants = [
         json.dumps(duplicate),
-        json.dumps(evidence)[:-1] + ', "tag": "v2.0.4"}',
+        json.dumps(evidence)[:-1] + ', "tag": "v2.0.5"}',
         json.dumps(
             dict(
                 evidence,

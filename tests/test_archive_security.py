@@ -286,7 +286,7 @@ def test_unicode_path_extra_is_rejected_before_name_normalization(tmp_path, reco
 @pytest.mark.parametrize("command", ["warning", "add-mask"])
 def test_sdist_control_name_has_one_line_diagnostic(tmp_path, command):
     sdist = tmp_path / "candidate.tar.gz"
-    name = f"aws_chaos_engineering_framework-2.0.4/unexpected\n::{command}::inert"
+    name = f"aws_chaos_engineering_framework-2.0.5/unexpected\n::{command}::inert"
     with tarfile.open(sdist, "w:gz") as archive:
         member = tarfile.TarInfo(name)
         member.mode = 0o644
@@ -302,7 +302,7 @@ def test_sdist_control_name_has_one_line_diagnostic(tmp_path, command):
 def test_sdist_content_mismatch_uses_one_line_member_name(tmp_path):
     sdist = tmp_path / "candidate.tar.gz"
     with tarfile.open(sdist, "w:gz") as archive:
-        member = tarfile.TarInfo("aws_chaos_engineering_framework-2.0.4/README.md")
+        member = tarfile.TarInfo("aws_chaos_engineering_framework-2.0.5/README.md")
         member.mode = 0o644
         member.size = 1
         archive.addfile(member, io.BytesIO(b"x"))

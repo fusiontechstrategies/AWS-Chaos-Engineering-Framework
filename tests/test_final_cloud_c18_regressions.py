@@ -34,7 +34,7 @@ SOURCE = subprocess.check_output(
     ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
 ).strip()
 EPOCH = 315532800
-VERSION = "2.0.4"
+VERSION = "2.0.5"
 WHEEL = f"aws_chaos_engineering_framework-{VERSION}-py3-none-any.whl"
 SDIST = f"aws_chaos_engineering_framework-{VERSION}.tar.gz"
 NOT_REGENERATED = "not byte-identical to its trusted canonical regeneration"

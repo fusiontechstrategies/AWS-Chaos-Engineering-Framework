@@ -69,7 +69,7 @@ class TrustedPromotionTests(unittest.TestCase):
         normalize_sdist.normalize_sdist(next(cls.dist.glob("*.tar.gz")), EPOCH)
         cls.assets = cls.directory / "assets"
         prepare_release.prepare_release(
-            cls.source, cls.dist, cls.assets, "2.0.4", "v2.0.4", SOURCE, EPOCH
+            cls.source, cls.dist, cls.assets, "2.0.5", "v2.0.5", SOURCE, EPOCH
         )
 
     @classmethod
@@ -78,7 +78,7 @@ class TrustedPromotionTests(unittest.TestCase):
 
     def test_exact_frozen_six_asset_handoff(self):
         result = handoff.verify_handoff(self.assets, self.source, SOURCE, EPOCH)
-        self.assertEqual(result["tag"], "v2.0.4")
+        self.assertEqual(result["tag"], "v2.0.5")
         self.assertEqual(len(result["manifest"]), 6)
 
     def test_changed_asset_is_rejected_before_promotion(self):
@@ -102,7 +102,7 @@ class TrustedPromotionTests(unittest.TestCase):
     def test_authenticated_triggering_tag_must_match_candidate_version(self):
         with self.assertRaisesRegex(ValueError, "authenticated triggering tag"):
             handoff.verify_handoff(self.assets, self.source, SOURCE, EPOCH, "v2.0.3")
-        handoff.verify_handoff(self.assets, self.source, SOURCE, EPOCH, "v2.0.4")
+        handoff.verify_handoff(self.assets, self.source, SOURCE, EPOCH, "v2.0.5")
 
     def test_run_identity_rejects_branch_and_checks_all_artifact_pages(self):
         run = {
@@ -112,7 +112,7 @@ class TrustedPromotionTests(unittest.TestCase):
             "conclusion": "success",
             "head_sha": SOURCE,
             "head_repository": {"full_name": "owner/repository"},
-            "head_branch": "v2.0.4",
+            "head_branch": "v2.0.5",
         }
         pages = [
             {"artifacts": [{"id": 456, "name": "release-assets", "expired": False}]}
@@ -121,7 +121,7 @@ class TrustedPromotionTests(unittest.TestCase):
             handoff.verify_run_identity(run, pages, 123, SOURCE, "owner/repository")[
                 "source-tag"
             ],
-            "v2.0.4",
+            "v2.0.5",
         )
         with self.assertRaisesRegex(ValueError, "version-tag push"):
             handoff.verify_run_identity(
@@ -170,11 +170,11 @@ class TrustedPromotionTests(unittest.TestCase):
                         return json.dumps(
                             {
                                 "id": 901,
-                                "tag_name": "v2.0.4",
+                                "tag_name": "v2.0.5",
                                 "draft": True,
                                 "prerelease": False,
                                 "body": (
-                                    self.source / ".github/release-notes/v2.0.4.md"
+                                    self.source / ".github/release-notes/v2.0.5.md"
                                 ).read_text(),
                             }
                         )
@@ -192,11 +192,11 @@ class TrustedPromotionTests(unittest.TestCase):
                         return json.dumps(
                             {
                                 "id": 901,
-                                "tag_name": "v2.0.4",
+                                "tag_name": "v2.0.5",
                                 "draft": True,
                                 "prerelease": False,
                                 "body": (
-                                    self.source / ".github/release-notes/v2.0.4.md"
+                                    self.source / ".github/release-notes/v2.0.5.md"
                                 ).read_text(),
                                 "assets": [{"name": "asset"}],
                             }
@@ -210,9 +210,9 @@ class TrustedPromotionTests(unittest.TestCase):
                 ):
                     draft.create_draft(
                         self.assets,
-                        self.source / ".github/release-notes/v2.0.4.md",
+                        self.source / ".github/release-notes/v2.0.5.md",
                         "owner/repository",
-                        "v2.0.4",
+                        "v2.0.5",
                         SOURCE,
                         {"asset": "digest"},
                     )
@@ -246,9 +246,9 @@ class TrustedPromotionTests(unittest.TestCase):
         ):
             draft.create_draft(
                 self.assets,
-                self.source / ".github/release-notes/v2.0.4.md",
+                self.source / ".github/release-notes/v2.0.5.md",
                 "owner/repository",
-                "v2.0.4",
+                "v2.0.5",
                 SOURCE,
                 {"asset": "digest"},
             )
@@ -278,11 +278,11 @@ class TrustedPromotionTests(unittest.TestCase):
                 return json.dumps(
                     {
                         "id": 901,
-                        "tag_name": "v2.0.4",
+                        "tag_name": "v2.0.5",
                         "draft": True,
                         "prerelease": False,
                         "body": (
-                            self.source / ".github/release-notes/v2.0.4.md"
+                            self.source / ".github/release-notes/v2.0.5.md"
                         ).read_text(),
                     }
                 )
@@ -295,9 +295,9 @@ class TrustedPromotionTests(unittest.TestCase):
         ):
             draft.create_draft(
                 self.assets,
-                self.source / ".github/release-notes/v2.0.4.md",
+                self.source / ".github/release-notes/v2.0.5.md",
                 "owner/repository",
-                "v2.0.4",
+                "v2.0.5",
                 SOURCE,
                 {"asset": "digest"},
             )
@@ -319,11 +319,11 @@ class TrustedPromotionTests(unittest.TestCase):
                             dict(
                                 {
                                     "id": 901,
-                                    "tag_name": "v2.0.4",
+                                    "tag_name": "v2.0.5",
                                     "draft": True,
                                     "prerelease": False,
                                     "body": (
-                                        self.source / ".github/release-notes/v2.0.4.md"
+                                        self.source / ".github/release-notes/v2.0.5.md"
                                     ).read_text(),
                                 },
                                 **fields,
@@ -338,9 +338,9 @@ class TrustedPromotionTests(unittest.TestCase):
                 ):
                     draft.create_draft(
                         self.assets,
-                        self.source / ".github/release-notes/v2.0.4.md",
+                        self.source / ".github/release-notes/v2.0.5.md",
                         "owner/repository",
-                        "v2.0.4",
+                        "v2.0.5",
                         SOURCE,
                         {"asset": "digest"},
                     )
@@ -369,11 +369,11 @@ class TrustedPromotionTests(unittest.TestCase):
                 return json.dumps(
                     {
                         "id": 901,
-                        "tag_name": "v2.0.4",
+                        "tag_name": "v2.0.5",
                         "draft": True,
                         "prerelease": False,
                         "body": (
-                            self.source / ".github/release-notes/v2.0.4.md"
+                            self.source / ".github/release-notes/v2.0.5.md"
                         ).read_text(),
                     }
                 )
@@ -381,11 +381,11 @@ class TrustedPromotionTests(unittest.TestCase):
                 return json.dumps(
                     {
                         "id": 901,
-                        "tag_name": "v2.0.4",
+                        "tag_name": "v2.0.5",
                         "draft": True,
                         "prerelease": False,
                         "body": (
-                            self.source / ".github/release-notes/v2.0.4.md"
+                            self.source / ".github/release-notes/v2.0.5.md"
                         ).read_text(),
                         "assets": [{"name": "asset"}],
                     }
@@ -398,9 +398,9 @@ class TrustedPromotionTests(unittest.TestCase):
         ):
             result = draft.create_draft(
                 self.assets,
-                self.source / ".github/release-notes/v2.0.4.md",
+                self.source / ".github/release-notes/v2.0.5.md",
                 "owner/repository",
-                "v2.0.4",
+                "v2.0.5",
                 SOURCE,
                 {"asset": "digest"},
             )
@@ -422,7 +422,7 @@ class TrustedPromotionTests(unittest.TestCase):
                     self.assets,
                     notes,
                     "owner/repository",
-                    "v2.0.4",
+                    "v2.0.5",
                     SOURCE,
                     {"asset": "digest"},
                 )
@@ -450,7 +450,7 @@ class TrustedPromotionTests(unittest.TestCase):
                     self.assets,
                     link / "notes.md",
                     "owner/repository",
-                    "v2.0.4",
+                    "v2.0.5",
                     SOURCE,
                     {"asset": "digest"},
                 )

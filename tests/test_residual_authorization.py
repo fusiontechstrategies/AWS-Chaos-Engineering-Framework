@@ -329,7 +329,7 @@ def test_draft_notes_remain_literal_strings_in_raw_request(tmp_path, monkeypatch
             return json.dumps(
                 {
                     "id": 903,
-                    "tag_name": "v2.0.4",
+                    "tag_name": "v2.0.5",
                     "draft": True,
                     "prerelease": False,
                     "body": body,
@@ -344,7 +344,7 @@ def test_draft_notes_remain_literal_strings_in_raw_request(tmp_path, monkeypatch
             tmp_path,
             notes,
             "owner/repository",
-            "v2.0.4",
+            "v2.0.5",
             "ordinary-commit",
             {"asset": "digest"},
         )
@@ -372,7 +372,7 @@ def test_draft_body_mismatch_cleans_only_the_returned_immutable_id(
         return json.dumps(
             {
                 "id": 903,
-                "tag_name": "v2.0.4",
+                "tag_name": "v2.0.5",
                 "draft": True,
                 "prerelease": False,
                 "body": body,
@@ -386,7 +386,7 @@ def test_draft_body_mismatch_cleans_only_the_returned_immutable_id(
             tmp_path,
             notes,
             "owner/repository",
-            "v2.0.4",
+            "v2.0.5",
             "ordinary-commit",
             {"asset": "digest"},
         )
