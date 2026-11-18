@@ -154,7 +154,8 @@ jobs:
 
   package-artifact:
     name: Release artifact Python 3.12
-    runs-on: ubuntu-latest
+    # Keep the artifact smoke test on the runner validated with its UID drop.
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
 
     steps:
