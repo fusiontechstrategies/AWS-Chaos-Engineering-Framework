@@ -196,8 +196,8 @@ jobs:
           python -m twine check dist/*
           python scripts/verify_distribution.py dist
           python scripts/prepare_release.py \
-            --version 2.0.4 \
-            --tag v2.0.4 \
+            --version 2.0.5 \
+            --tag v2.0.5 \
             --source-commit "$GITHUB_SHA" \
             --source-date-epoch "$SOURCE_DATE_EPOCH" \
             --dist-directory dist \
@@ -213,8 +213,8 @@ jobs:
           python scripts/normalize_wheel.py --source-date-epoch "$SOURCE_DATE_EPOCH" repeat-dist/*.whl
           python scripts/normalize_sdist.py --source-date-epoch "$SOURCE_DATE_EPOCH" repeat-dist/*.tar.gz
           python scripts/prepare_release.py \
-            --version 2.0.4 \
-            --tag v2.0.4 \
+            --version 2.0.5 \
+            --tag v2.0.5 \
             --source-commit "$GITHUB_SHA" \
             --source-date-epoch "$SOURCE_DATE_EPOCH" \
             --dist-directory repeat-dist \
@@ -235,7 +235,7 @@ jobs:
           python -m venv .wheel-smoke
           .wheel-smoke/bin/python -m pip install --disable-pip-version-check --require-hashes --only-binary :all: -r requirements-runtime-lock.txt
           .wheel-smoke/bin/python -m pip install --disable-pip-version-check --no-deps dist/*.whl
-          test "$(.wheel-smoke/bin/aws-chaos-framework --version)" = "AWS Chaos Engineering Framework 2.0.4"
+          test "$(.wheel-smoke/bin/aws-chaos-framework --version)" = "AWS Chaos Engineering Framework 2.0.5"
           .wheel-smoke/bin/aws-chaos-framework --help >/dev/null
           .wheel-smoke/bin/aws-chaos-framework --list-experiments >/dev/null
           .wheel-smoke/bin/python -m pip check
@@ -250,7 +250,7 @@ jobs:
           .sdist-smoke/bin/python -m pip install --disable-pip-version-check --require-hashes --only-binary :all: -r requirements-build-lock.txt
           .sdist-smoke/bin/python -m pip install --disable-pip-version-check --require-hashes --only-binary :all: -r requirements-runtime-lock.txt
           .sdist-smoke/bin/python -m pip install --disable-pip-version-check --no-build-isolation --no-deps dist/*.tar.gz
-          test "$(.sdist-smoke/bin/aws-chaos-framework --version)" = "AWS Chaos Engineering Framework 2.0.4"
+          test "$(.sdist-smoke/bin/aws-chaos-framework --version)" = "AWS Chaos Engineering Framework 2.0.5"
           .sdist-smoke/bin/aws-chaos-framework --help >/dev/null
           .sdist-smoke/bin/aws-chaos-framework --list-experiments >/dev/null
           .sdist-smoke/bin/python -m pip check
@@ -263,7 +263,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update && sudo apt-get install -y bubblewrap
           sha256sum release-candidate/* > "$RUNNER_TEMP/candidate-before-smoke.sha256"
-          candidate="$GITHUB_WORKSPACE/release-candidate/AWS-Chaos-Engineering-Framework-v2.0.4.py"
+          candidate="$GITHUB_WORKSPACE/release-candidate/AWS-Chaos-Engineering-Framework-v2.0.5.py"
           install -m 0444 "$candidate" "$RUNNER_TEMP/chaos-candidate-smoke.py"
           cmp --silent "$candidate" "$RUNNER_TEMP/chaos-candidate-smoke.py"
           candidate="$RUNNER_TEMP/chaos-candidate-smoke.py"
@@ -271,7 +271,7 @@ jobs:
           "$RUNNER_TEMP/chaos-hashed-runtime/bin/python" -m pip install --disable-pip-version-check --require-hashes --only-binary :all: -r requirements-runtime-lock.txt
           runtime="/tmp/runtime/bin/python"
           isolated=(sudo bwrap --unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try --die-with-parent --new-session --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --ro-bind "$candidate" /tmp/candidate.py --ro-bind "$RUNNER_TEMP/chaos-hashed-runtime" /tmp/runtime --chdir /tmp --clearenv --setenv AWS_EC2_METADATA_DISABLED true --setenv PYTHONDONTWRITEBYTECODE 1 --cap-drop ALL --cap-add CAP_SETUID --cap-add CAP_SETGID --cap-add CAP_SETPCAP /usr/bin/setpriv --reuid=65534 --regid=65534 --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs "$runtime" /tmp/candidate.py)
-          test "$("${isolated[@]}" --version)" = "AWS Chaos Engineering Framework 2.0.4"
+          test "$("${isolated[@]}" --version)" = "AWS Chaos Engineering Framework 2.0.5"
           "${isolated[@]}" --help >/dev/null
           "${isolated[@]}" --list-experiments >/dev/null
           sha256sum --check "$RUNNER_TEMP/candidate-before-smoke.sha256"
@@ -280,7 +280,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: aws-chaos-engineering-framework-v2.0.4-candidate-${{ github.sha }}
+          name: aws-chaos-engineering-framework-v2.0.5-candidate-${{ github.sha }}
           path: release-candidate/
           if-no-files-found: error
           retention-days: 30

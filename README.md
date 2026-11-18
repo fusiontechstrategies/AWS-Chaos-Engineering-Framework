@@ -1,7 +1,7 @@
 # AWS Chaos Engineering Framework
 
 <p align="center">
-  <img src=".github/assets/social-preview.jpg" width="960" alt="AWS Chaos Engineering: Bound. Observe. Rollback.">
+  <img src="https://raw.githubusercontent.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/refs/heads/main/.github/assets/social-preview.jpg" width="960" alt="AWS Chaos Engineering: Bound. Observe. Rollback.">
 </p>
 
 **Break AWS safely before reality does.**
@@ -9,13 +9,13 @@
 [![CI](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/ci.yml/badge.svg)](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/codeql.yml/badge.svg)](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/actions/workflows/codeql.yml)
 [![Python 3.12-3.14](https://img.shields.io/badge/python-3.12--3.14-3776AB.svg)](https://www.python.org/)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/LICENSE)
 
 An enterprise-minded, one-file chaos engineering orchestrator for AWS Fault Injection Service and carefully guarded service extensions. It combines read-only AWS FIS template planning, strict blast-radius controls, exact account binding, automatic rollback, emergency stops, and privacy-conscious evidence reports in a tool that remains easy to inspect and deploy.
 
-[![Guarded AWS chaos experiment flow](docs/images/aws-chaos-guarded-experiment.png)](docs/images/source/aws-chaos-guarded-experiment.svg)
+[![Guarded AWS chaos experiment flow](https://raw.githubusercontent.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/refs/heads/main/docs/images/aws-chaos-guarded-experiment.png)](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/docs/images/source/aws-chaos-guarded-experiment.svg)
 
-Version 2.0.4 is the current verified release, with reproducible release evidence and a fully offline validation gate. Plan mode is the safe evaluation path. Live support is declared per extension, and live AWS FIS starts remain disabled because the public API cannot bind the reviewed template version immutably.
+Version 2.0.5 is the current release version of this source tree. Plan mode is the default evaluation path. Live support is declared per extension, and live AWS FIS starts remain disabled because the public API cannot bind the reviewed template version immutably.
 
 > [!WARNING]
 > This software intentionally disrupts AWS resources. Use it only in isolated, non-production environments that you own or are explicitly authorized to test. Review every plan, alarm, target, permission, and rollback path before live use.
@@ -49,7 +49,7 @@ The framework does not replace AWS FIS. It makes FIS easier to govern and suppli
 
 AWS FIS remains the managed fault-injection service. This project does not claim to make mutable FIS templates immutable, and it refuses to start them live until that boundary can be enforced.
 
-Version 2.0.4 is available on [PyPI](https://pypi.org/project/aws-chaos-engineering-framework/2.0.4/) and as a verified GitHub release. A non-verified convenience install, `python -m pip install aws-chaos-engineering-framework==2.0.4`, installs the package and whatever dependency artifacts your configured index serves, without hash verification. Security-sensitive operators should use the hash-locked [Quick start](#quick-start) or the provenance-verified release assets instead. Then run the read-only `aws-chaos-framework --list-experiments` command. The [release page](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/releases/tag/v2.0.4) provides the standalone runtime, wheel, source distribution, SPDX SBOM, SHA-256 checksums, release evidence, and GitHub provenance attestations.
+Use the hash-locked [Quick start](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework#quick-start) or the [provenance-verified release assets](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/releases) for authenticated downloads. A non-verified convenience install, `python -m pip install aws-chaos-engineering-framework`, uses the configured package index without hash verification. The exact-version command, `python -m pip install aws-chaos-engineering-framework==2.0.5`, is also non-verified without hashes and works once that version appears in the [PyPI release history](https://pypi.org/project/aws-chaos-engineering-framework/#history). The read-only `aws-chaos-framework --list-experiments` command lists supported experiments offline.
 
 ## Safety model
 
@@ -113,9 +113,9 @@ python .\aws_chaos_framework.py `
   --profile chaos-test
 ```
 
-The included [example configuration](example-config.yaml) demonstrates tagged EC2 recovery and read-only FIS template planning. Replace all placeholders before use.
+The included [example configuration](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/example-config.yaml) demonstrates tagged EC2 recovery and read-only FIS template planning. Replace all placeholders before use.
 
-For a review meeting or sandbox rehearsal, follow the [plan-only game-day walkthrough](docs/PLAN_ONLY_GAME_DAY.md). It keeps mutation disabled while the team verifies identity, targets, alarms, blast-radius limits, evidence handling, and the exact boundary before live authorization.
+For a review meeting or sandbox rehearsal, follow the [plan-only game-day walkthrough](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/docs/PLAN_ONLY_GAME_DAY.md). It keeps mutation disabled while the team verifies identity, targets, alarms, blast-radius limits, evidence handling, and the exact boundary before live authorization.
 
 ## Moving from plan to live execution
 
@@ -186,7 +186,7 @@ python .\aws_chaos_framework.py --list-experiments
 
 The catalog intentionally includes some gated entries. An action is not live-supported when it cannot provide a real fault, bounded targeting, or an honest recovery contract. Host-level EC2 faults remain represented through read-only `fis_template` planning until an immutable start boundary is available.
 
-EC2 termination is planning only: AWS cannot bind a termination request to the reviewed block-device relationships. The plan still identifies every volume marked for deletion. EBS detach and route deletion/restoration are planning only. Attachment tuples, observed single-attachment capability, route targets and terminal-state predicates remain read-only evidence; their APIs cannot condition writes on the reviewed mutable capability or captured route generation. Temporary policy, ingress, IOPS, cluster capacity, network, queue, key, credential, and trigger operations retain planning while live execution is refused because their current APIs provide no conditional ownership proof for safe recovery. EC2 stop, EFS throughput, RDS shared parameter groups, Lambda reserved concurrency, S3 key deletion/versioning, S3 lifecycle expiration (whose plans require a nonempty reviewed `prefix` and keep unrelated rules), ELB configuration, ECS updates, AppStream state/associations and Directory Service forwarders also retain planning with live execution disabled. Lambda identifiers must be unqualified local names or exact reviewed full ARNs; route and EBS terminal predicates do not authorize live recovery. SNS subscription deletion is also planning only: live unsubscribe and subscription recreation are unavailable. SQS queue purge and RDS reboot, cluster failover and backup-retention changes are planning only as well: `PurgeQueue` cannot be bounded to an exact message set, and the RDS requests have no conditional generation or lease against changes queued after admission. Kinesis retention decreases and SES configuration-set deletion are planning only for the same reason: both irreversible writes address a reusable name without a generation, condition or lease. ECR digest deletion and VPC endpoint deletion are planning only too: `BatchDeleteImage` also removes every tag alias on the digest, and `DeleteVpcEndpoints` also removes the endpoint's network interfaces and gateway routes, with no condition over that derived set. Historical unsupported recovery needs operator reconciliation. See [runtime approval and recovery boundaries](docs/runtime-safety-scope.md) for the complete capability contract and compatibility changes.
+EC2 termination is planning only: AWS cannot bind a termination request to the reviewed block-device relationships. The plan still identifies every volume marked for deletion. EBS detach and route deletion/restoration are planning only. Attachment tuples, observed single-attachment capability, route targets and terminal-state predicates remain read-only evidence; their APIs cannot condition writes on the reviewed mutable capability or captured route generation. Temporary policy, ingress, IOPS, cluster capacity, network, queue, key, credential, and trigger operations retain planning while live execution is refused because their current APIs provide no conditional ownership proof for safe recovery. EC2 stop, EFS throughput, RDS shared parameter groups, Lambda reserved concurrency, S3 key deletion/versioning, S3 lifecycle expiration (whose plans require a nonempty reviewed `prefix` and keep unrelated rules), ELB configuration, ECS updates, AppStream state/associations and Directory Service forwarders also retain planning with live execution disabled. Lambda identifiers must be unqualified local names or exact reviewed full ARNs; route and EBS terminal predicates do not authorize live recovery. SNS subscription deletion is also planning only: live unsubscribe and subscription recreation are unavailable. SQS queue purge and RDS reboot, cluster failover and backup-retention changes are planning only as well: `PurgeQueue` cannot be bounded to an exact message set, and the RDS requests have no conditional generation or lease against changes queued after admission. Kinesis retention decreases and SES configuration-set deletion are planning only for the same reason: both irreversible writes address a reusable name without a generation, condition or lease. ECR digest deletion and VPC endpoint deletion are planning only too: `BatchDeleteImage` also removes every tag alias on the digest, and `DeleteVpcEndpoints` also removes the endpoint's network interfaces and gateway routes, with no condition over that derived set. Historical unsupported recovery needs operator reconciliation. See [runtime approval and recovery boundaries](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/docs/runtime-safety-scope.md) for the complete capability contract and compatibility changes.
 
 ## Evidence and privacy
 
@@ -210,7 +210,7 @@ Errors and diagnostics remain filtered under every flag combination. Live
 experiments execute serially through recovery; unverified recovery blocks later
 live execution in the process. Retention changes are irreversible, and EC2
 termination and EBS detach do not create implicit backups. See
-[the security boundaries](docs/security-boundaries.md) before preparing approval.
+[the security boundaries](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/docs/security-boundaries.md) before preparing approval.
 
 ## Testing and release assurance
 
@@ -232,7 +232,7 @@ Audit the committed, hashed runtime lock. `requirements.txt` lists direct depend
 
 CI runs the test suite across supported Python versions and validates Python 3.12 on Windows and macOS. The release-candidate job builds normalized wheel and source archives twice, requires byte-identical results, installs each package independently, and preserves the exact six-file candidate as workflow evidence. CodeQL, Semgrep, Trivy, dependency auditing, secret scanning, and Dependabot are configured for the public repository.
 
-See [TESTING.md](TESTING.md) for the complete offline gate and [RELEASING.md](RELEASING.md) for the exact asset contract. Tag automation can create only a draft GitHub release and cannot publish to a package registry.
+See [TESTING.md](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/TESTING.md) for the complete offline gate and [RELEASING.md](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/RELEASING.md) for the exact asset contract. Tag automation can create only a draft GitHub release and cannot publish to a package registry.
 
 ## Design principles
 
@@ -251,13 +251,13 @@ See [TESTING.md](TESTING.md) for the complete offline gate and [RELEASING.md](RE
 
 ## Contributing
 
-Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), keep the runtime application in the single `aws_chaos_framework.py` file, and add offline tests for every behavior change. Pull requests must not require access to a real AWS account.
+Contributions are welcome. Start with [CONTRIBUTING.md](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/CONTRIBUTING.md), keep the runtime application in the single `aws_chaos_framework.py` file, and add offline tests for every behavior change. Pull requests must not require access to a real AWS account.
 
-Security vulnerabilities should be reported privately as described in [SECURITY.md](SECURITY.md).
+Security vulnerabilities should be reported privately as described in [SECURITY.md](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/SECURITY.md).
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [Apache License 2.0](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/LICENSE).
 
 ## Disclaimer
 
@@ -314,4 +314,4 @@ rename the key. Globs match the whole target, case insensitively: `*` matches an
 sequence and `?` one character, while dots are literal. For example, the regex
 `^test-.*$` deliberately migrates to the glob `test-*`. Fixed `prod` and
 `production` name-token denial remains active independently of configured globs.
-See [security boundaries](docs/security-boundaries.md) for bounds and peering scope.
+See [security boundaries](https://github.com/fusiontechstrategies/AWS-Chaos-Engineering-Framework/blob/main/docs/security-boundaries.md) for bounds and peering scope.

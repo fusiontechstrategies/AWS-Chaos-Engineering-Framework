@@ -1099,7 +1099,7 @@ def test_tag_controlled_backend_and_matching_hook_bytes_are_rejected(
             '\n[tool.setuptools.cmdclass]\nbuild_py = "scripts.custom_backend.Build"\n'
         )
     elif attack == "dynamic":
-        project = project.replace('version = "2.0.4"', 'dynamic = ["version"]')
+        project = project.replace('version = "2.0.5"', 'dynamic = ["version"]')
         project += '\n[tool.setuptools.dynamic]\nversion = {attr = "scripts.custom_backend.version"}\n'
     elif attack == "setup_py":
         additions["setup.py"] = (
@@ -1206,4 +1206,4 @@ def test_approved_static_sdist_builds_verify_without_importing_selected_helpers(
     approved_sdist,
 ):
     verifier._verify_sdist(approved_sdist, ROOT)
-    assert verifier._approved_project(ROOT)["version"] == "2.0.4"
+    assert verifier._approved_project(ROOT)["version"] == "2.0.5"

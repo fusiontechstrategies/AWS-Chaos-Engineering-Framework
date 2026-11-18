@@ -64,7 +64,7 @@ BOTO3_CLIENT_METHOD = boto3.Session.client
 BOTO3_CREDENTIALS_METHOD = boto3.Session.get_credentials
 
 
-__version__ = "2.0.4"
+__version__ = "2.0.5"
 TOOL_NAME = "AWS Chaos Engineering Framework"
 MAX_CONFIG_BYTES = 1_048_576
 MAX_CONFIG_PATH_COMPONENTS = 128

@@ -257,7 +257,7 @@ def test_preparse_sources_share_bounded_reader(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="admission"):
             read(tmp_path)
     with pytest.raises(ValueError, match="admission"):
-        prepare_release.read_release_date(tmp_path, "2.0.4")
+        prepare_release.read_release_date(tmp_path, "2.0.5")
     monkeypatch.setattr(verify_distribution.source_files, "read_text", admitted)
     with pytest.raises(ValueError):
         verify_distribution._approved_project(tmp_path)
