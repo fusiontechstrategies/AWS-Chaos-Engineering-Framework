@@ -15,7 +15,8 @@ concurrency:
 jobs:
   build:
     name: Build and verify release assets
-    runs-on: ubuntu-latest
+    # Match the CI artifact smoke test and its validated UID drop.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
