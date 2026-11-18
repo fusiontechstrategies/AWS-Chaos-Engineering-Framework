@@ -15,7 +15,7 @@ An enterprise-minded, one-file chaos engineering orchestrator for AWS Fault Inje
 
 [![Guarded AWS chaos experiment flow](docs/images/aws-chaos-guarded-experiment.png)](docs/images/source/aws-chaos-guarded-experiment.svg)
 
-> **Project status: maintained public release.** Version 2.0.4 has reproducible release evidence and a fully offline validation gate. Plan mode is the safe evaluation path. Live support is declared per extension, and live AWS FIS starts remain disabled because the public API cannot bind the reviewed template version immutably.
+Version 2.0.4 is the current verified release, with reproducible release evidence and a fully offline validation gate. Plan mode is the safe evaluation path. Live support is declared per extension, and live AWS FIS starts remain disabled because the public API cannot bind the reviewed template version immutably.
 
 > [!WARNING]
 > This software intentionally disrupts AWS resources. Use it only in isolated, non-production environments that you own or are explicitly authorized to test. Review every plan, alarm, target, permission, and rollback path before live use.
